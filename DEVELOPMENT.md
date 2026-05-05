@@ -3,15 +3,15 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-05
-**Current Phase:** Phase 1 - Foundation (in progress)
-**Next Task:** Phase 1.4 - OpenBSD build verification
+**Current Phase:** Phase 2 - Cryptographic components (in progress)
+**Next Task:** Phase 2.1 - SHA-256 implementation
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
-| 1 | Foundation | IN PROGRESS | 1.1-1.3 complete | Build system, test harness, skeleton, fault injection infrastructure |
-| 2 | Cryptographic components | NOT STARTED | - | sha256, blake3 against official test vectors |
+| 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
+| 2 | Cryptographic components | IN PROGRESS | 2.1 next | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
@@ -24,7 +24,7 @@
 | ID | Milestone | Status |
 |---|---|---|
 | M1 | Build system works on Linux x86_64 | DONE |
-| M2 | Build system works on OpenBSD | NOT STARTED |
+| M2 | Build system works on OpenBSD | DONE |
 | M3 | SHA-256 NIST vectors all pass | NOT STARTED |
 | M4 | BLAKE3 official vectors all pass | NOT STARTED |
 | M5 | Deflate round-trip: byte-for-byte identity on all test inputs | NOT STARTED |
@@ -194,19 +194,19 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
   `tests/ark_stubs.c`
 - [x] Verify: `make test` compiles with `-DARK_TEST` and the stubs link
 
-**1.4 - OpenBSD build verification**
-- [ ] Verify `make dev` compiles with zero warnings on OpenBSD
-- [ ] Verify `make test` compiles and runs on OpenBSD
-- [ ] Quality milestone M2 confirmed
+**1.4 - OpenBSD build verification** ✓ DONE
+- [x] Verify `make dev` compiles with zero warnings on OpenBSD
+- [x] Verify `make test` compiles and runs on OpenBSD
+- [x] Quality milestone M2 confirmed
 
 ### Phase 1 Completion Criteria
 
-- [ ] All targets in the Makefile work on Linux
-- [ ] All targets (excluding `make valgrind` and `make test-tsan`) work on
+- [x] All targets in the Makefile work on Linux
+- [x] All targets (excluding `make valgrind` and `make test-tsan`) work on
   OpenBSD
-- [ ] `make test` exits 0 (stub tests, no real tests yet)
-- [ ] Zero warnings on both platforms
-- [ ] Quality milestones M1, M2 confirmed
+- [x] `make test` exits 0 (stub tests, no real tests yet)
+- [x] Zero warnings on both platforms
+- [x] Quality milestones M1, M2 confirmed
 
 ---
 

@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y clang clang-tidy cppcheck valgrind
+
+      - name: Build (dev)
+        run: make dev
+
+      - name: Lint
+        run: make lint
+
+      - name: Test (ASan/UBSan)
+        run: make test
+
+      - name: Test (TSan)
+        run: make test-tsan
+
+      - name: Test (Valgrind)
+        run: make valgrind
+
+      - name: Build (release)
+        run: make release
+
+  build-and-test-openbsd-amd64:
+    name: OpenBSD amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test in OpenBSD
+        uses: vmactions/openbsd-vm@v1.3.8
+        with:
+          usesh: true
+          run: |
+            make dev
+            make test || {
+              echo "make test failed; collecting backtrace from build/tests/run_tests"
+              if ! command -v gdb >/dev/null 2>&1; then
+                pkg_add -I gdb || doas pkg_add -I gdb || true
+              fi
+              if command -v gdb >/dev/null 2>&1; then
+                gdb -q -batch \
+                  -ex run \
+                  -ex "thread apply all bt full" \
+                  -ex "info registers" \
+                  -ex "x/16i \$pc" \
+                  --args build/tests/run_tests || true
+              elif command -v lldb >/dev/null 2>&1; then
+                printf '%s\n' \
+                  'settings set interpreter.stop-command-source-on-error false' \
+                  'run' \
+                  'thread backtrace all' \
+                  'register read' \
+                  'disassemble --frame' \
+                  'memory read --format x --size 8 --count 16 $sp' \
+                  'quit' > /tmp/lldb_cmds.txt
+                lldb -b -s /tmp/lldb_cmds.txt -- build/tests/run_tests || true
+              fi
+              exit 1
+            }
+
+  build-and-test-openbsd-arm64:
+    name: OpenBSD arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test in OpenBSD
+        uses: vmactions/openbsd-vm@v1.3.8
+        with:
+          usesh: true
+          arch: aarch64
+          run: |
+            make dev
+            make test || {
+              echo "make test failed; collecting backtrace from build/tests/run_tests"
+              if ! command -v gdb >/dev/null 2>&1; then
+                pkg_add -I gdb || doas pkg_add -I gdb || true
+              fi
+              if command -v gdb >/dev/null 2>&1; then
+                gdb -q -batch \
+                  -ex run \
+                  -ex "thread apply all bt full" \
+                  -ex "info registers" \
+                  -ex "x/16i \$pc" \
+                  --args build/tests/run_tests || true
+              elif command -v lldb >/dev/null 2>&1; then
+                printf '%s\n' \
+                  'settings set interpreter.stop-command-source-on-error false' \
+                  'run' \
+                  'thread backtrace all' \
+                  'register read' \
+                  'disassemble --frame' \
+                  'memory read --format x --size 8 --count 16 $sp' \
+                  'quit' > /tmp/lldb_cmds.txt
+                lldb -b -s /tmp/lldb_cmds.txt -- build/tests/run_tests || true
+              fi
+              exit 1
+            }
+
