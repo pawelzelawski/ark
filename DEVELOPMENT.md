@@ -3,14 +3,14 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-05
-**Current Phase:** Not started
-**Next Task:** Phase 1.1 - Repository skeleton
+**Current Phase:** Phase 1 - Foundation (in progress)
+**Next Task:** Phase 1.2 - Build system
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
-| 1 | Foundation | NOT STARTED | - | Build system, test harness, skeleton, fault injection infrastructure |
+| 1 | Foundation | IN PROGRESS | 1.1 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | NOT STARTED | - | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
@@ -136,27 +136,27 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
 ### Tasks
 
 **1.1 - Repository skeleton**
-- [ ] Create directory structure: `src/`, `vendor/`, `tests/`, `man/`
-- [ ] Create `vendor/libchevron/` and populate with the pinned libchevron
+- [x] Create directory structure: `src/`, `vendor/`, `tests/`, `man/`
+- [x] Create `vendor/libchevron/` and populate with the pinned libchevron
   commit; create `vendor/libchevron/COMMIT` containing the full commit SHA-1
-- [ ] Create `src/sha256.h`, `src/sha256.c`, `src/blake3.h`, `src/blake3.c`,
+- [x] Create `src/sha256.h`, `src/sha256.c`, `src/blake3.h`, `src/blake3.c`,
   `src/deflate.h`, `src/deflate.c`, `src/archive.h`, `src/archive.c`,
   `src/main.c`, `src/recovery_template.c` as empty skeletons with include
   guards, correct includes, and no implementation
-- [ ] Create `src/ark_internal.h` with include guards and `ARK_*` wrapper
+- [x] Create `src/ark_internal.h` with include guards and `ARK_*` wrapper
   macro definitions (production path - direct syscall names); the
   `#ifdef ARK_TEST` stub block is a placeholder at this stage
-- [ ] Create `tests/run_tests.c` stub: `main()` that prints `0/0 tests passed`
+- [x] Create `tests/run_tests.c` stub: `main()` that prints `0/0 tests passed`
   and exits 0
-- [ ] Create `tests/ark_stubs.c` stub: empty file, compiled only with
+- [x] Create `tests/ark_stubs.c` stub: empty file, compiled only with
   `-DARK_TEST`
-- [ ] Create stub test files: `tests/test_sha256.c`, `tests/test_blake3.c`,
+- [x] Create stub test files: `tests/test_sha256.c`, `tests/test_blake3.c`,
   `tests/test_deflate.c`, `tests/test_archive.c`, `tests/test_thread.c`,
   `tests/test_extract.c`, `tests/test_fault.c`, `tests/test_edge.c`,
   `tests/test_integration.c` - each defines one empty test function
   returning 0 and registers it in `run_tests.c`
-- [ ] Create `.clang-format` (KNF-based, consistent with ecosystem)
-- [ ] Create `.clang-tidy` configuration
+- [x] Create `.clang-format` (KNF-based, consistent with ecosystem)
+- [x] Create `.clang-tidy` configuration
 
 **1.2 - Build system**
 - [ ] Create top-level `Makefile` with all targets per TECH_STACK.md §5.1:

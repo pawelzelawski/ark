@@ -1,0 +1,9 @@
+Checks: >
+  clang-analyzer-*,
+  cert-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -cert-err33-c,
+  -bugprone-easily-swappable-parameters
+

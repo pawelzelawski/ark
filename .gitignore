@@ -1,0 +1,25 @@
+# Build outputs
+/build/
+
+# Generic C/C++ build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Test and coverage artifacts
+*.gcno
+*.gcda
+*.gcov
+
+# Editor/IDE metadata
+.idea/
+.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
