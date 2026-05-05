@@ -4,13 +4,13 @@
 
 **Last Updated:** 2026-05-05
 **Current Phase:** Phase 1 - Foundation (in progress)
-**Next Task:** Phase 1.2 - Build system
+**Next Task:** Phase 1.3 - Fault injection infrastructure
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
-| 1 | Foundation | IN PROGRESS | 1.1 complete | Build system, test harness, skeleton, fault injection infrastructure |
+| 1 | Foundation | IN PROGRESS | 1.1-1.2 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | NOT STARTED | - | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
@@ -23,7 +23,7 @@
 
 | ID | Milestone | Status |
 |---|---|---|
-| M1 | Build system works on Linux x86_64 | NOT STARTED |
+| M1 | Build system works on Linux x86_64 | DONE |
 | M2 | Build system works on OpenBSD | NOT STARTED |
 | M3 | SHA-256 NIST vectors all pass | NOT STARTED |
 | M4 | BLAKE3 official vectors all pass | NOT STARTED |
@@ -159,20 +159,20 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
 - [x] Create `.clang-tidy` configuration
 
 **1.2 - Build system**
-- [ ] Create top-level `Makefile` with all targets per TECH_STACK.md §5.1:
+- [x] Create top-level `Makefile` with all targets per TECH_STACK.md §5.1:
   `dev`, `release`, `test`, `test-tsan`, `valgrind`, `lint`, `format`,
   `clean`, `install`
-- [ ] Platform detection via `OS != uname -s`; all flag sets per
+- [x] Platform detection via `OS != uname -s`; all flag sets per
   TECH_STACK.md §4.3; `-DARK_TEST` defined in test builds
-- [ ] `-lpthread` linked on Linux; omitted on OpenBSD
-- [ ] Add the recovery template embedding rule to the Makefile:
+- [x] `-lpthread` linked on Linux; omitted on OpenBSD
+- [x] Add the recovery template embedding rule to the Makefile:
   `build/recovery_template_data.h` generated from `src/recovery_template.c`
   via a portable awk one-liner; `src/main.c` includes this generated header
   (the include is a forward declaration at this stage)
-- [ ] Verify `make dev` compiles with zero warnings on Linux x86_64
-- [ ] Verify `make release` compiles with zero warnings on Linux x86_64
-- [ ] Verify `make test` compiles and runs with `0/0 tests passed`
-- [ ] Quality milestone M1 confirmed
+- [x] Verify `make dev` compiles with zero warnings on Linux x86_64
+- [x] Verify `make release` compiles with zero warnings on Linux x86_64
+- [x] Verify `make test` compiles and runs with `0/0 tests passed`
+- [x] Quality milestone M1 confirmed
 
 **1.3 - Fault injection infrastructure**
 - [ ] Define all `ARK_*` wrapper macros in `ark_internal.h`:
