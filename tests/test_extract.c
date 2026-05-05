@@ -1,6 +1,4 @@
-int
-test_extract_stub(void)
+int test_extract_stub(void)
 {
 	return 0;
 }
-

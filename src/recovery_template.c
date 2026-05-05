@@ -5,4 +5,3 @@
  */
 
 int ark_recovery_template_placeholder;
-

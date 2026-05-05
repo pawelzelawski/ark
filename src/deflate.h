@@ -8,4 +8,3 @@
 /* API declarations are added in Phase 3. */
 
 #endif /* ARK_DEFLATE_H */
-

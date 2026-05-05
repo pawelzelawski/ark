@@ -1,6 +1,4 @@
-int
-test_deflate_stub(void)
+int test_deflate_stub(void)
 {
 	return 0;
 }
-

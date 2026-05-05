@@ -4,13 +4,13 @@
 
 **Last Updated:** 2026-05-05
 **Current Phase:** Phase 1 - Foundation (in progress)
-**Next Task:** Phase 1.3 - Fault injection infrastructure
+**Next Task:** Phase 1.4 - OpenBSD build verification
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
-| 1 | Foundation | IN PROGRESS | 1.1-1.2 complete | Build system, test harness, skeleton, fault injection infrastructure |
+| 1 | Foundation | IN PROGRESS | 1.1-1.3 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | NOT STARTED | - | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
@@ -135,7 +135,7 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
 
 ### Tasks
 
-**1.1 - Repository skeleton**
+**1.1 - Repository skeleton** ✓ DONE
 - [x] Create directory structure: `src/`, `vendor/`, `tests/`, `man/`
 - [x] Create `vendor/libchevron/` and populate with the pinned libchevron
   commit; create `vendor/libchevron/COMMIT` containing the full commit SHA-1
@@ -158,7 +158,7 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
 - [x] Create `.clang-format` (KNF-based, consistent with ecosystem)
 - [x] Create `.clang-tidy` configuration
 
-**1.2 - Build system**
+**1.2 - Build system** ✓ DONE
 - [x] Create top-level `Makefile` with all targets per TECH_STACK.md §5.1:
   `dev`, `release`, `test`, `test-tsan`, `valgrind`, `lint`, `format`,
   `clean`, `install`
@@ -174,25 +174,25 @@ infrastructure is defined and verified. Code compiles clean with zero warnings.
 - [x] Verify `make test` compiles and runs with `0/0 tests passed`
 - [x] Quality milestone M1 confirmed
 
-**1.3 - Fault injection infrastructure**
-- [ ] Define all `ARK_*` wrapper macros in `ark_internal.h`:
+**1.3 - Fault injection infrastructure** ✓ DONE
+- [x] Define all `ARK_*` wrapper macros in `ark_internal.h`:
   `ARK_READ`, `ARK_WRITE`, `ARK_OPEN`, `ARK_CLOSE`, `ARK_LSTAT`,
   `ARK_UNLINK`, `ARK_RMDIR`, `ARK_LINK`, `ARK_MKDIR`, `ARK_LCHOWN`,
   `ARK_CHMOD`, `ARK_UTIMENSAT`, `ARK_OPENDIR`, `ARK_READDIR`,
   `ARK_CLOSEDIR`, `ARK_REALPATH`
-- [ ] In production builds: each macro expands to the real syscall name
-- [ ] Define `ark_fault_t` struct in `ark_internal.h` under `#ifdef ARK_TEST`:
+- [x] In production builds: each macro expands to the real syscall name
+- [x] Define `ark_fault_t` struct in `ark_internal.h` under `#ifdef ARK_TEST`:
   `which` (int enum), `fail_on_call_n` (int), `errno_value` (int), and
   call counters per syscall (one int per `ARK_*` macro)
-- [ ] Declare `extern ark_fault_t ark_fault` in test builds
-- [ ] In test builds: each macro expands to a stub function that increments
+- [x] Declare `extern ark_fault_t ark_fault` in test builds
+- [x] In test builds: each macro expands to a stub function that increments
   its call counter, checks whether this is the `n`th call to fail, and
   either injects `errno_value` and returns -1 (or NULL for pointer-returning
   syscalls) or calls the real syscall
-- [ ] Implement stubs in `tests/ark_stubs.c`; define `ark_fault_t ark_fault`
-- [ ] Implement `fault_reset()` and `fault_inject()` helpers in
+- [x] Implement stubs in `tests/ark_stubs.c`; define `ark_fault_t ark_fault`
+- [x] Implement `fault_reset()` and `fault_inject()` helpers in
   `tests/ark_stubs.c`
-- [ ] Verify: `make test` compiles with `-DARK_TEST` and the stubs link
+- [x] Verify: `make test` compiles with `-DARK_TEST` and the stubs link
 
 **1.4 - OpenBSD build verification**
 - [ ] Verify `make dev` compiles with zero warnings on OpenBSD

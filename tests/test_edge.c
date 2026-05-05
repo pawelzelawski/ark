@@ -1,6 +1,4 @@
-int
-test_edge_stub(void)
+int test_edge_stub(void)
 {
 	return 0;
 }
-

@@ -8,4 +8,3 @@
 /* Public archive API declarations are added in Phase 4. */
 
 #endif /* ARK_ARCHIVE_H */
-

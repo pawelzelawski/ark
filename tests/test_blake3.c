@@ -1,6 +1,4 @@
-int
-test_blake3_stub(void)
+int test_blake3_stub(void)
 {
 	return 0;
 }
-

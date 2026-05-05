@@ -134,6 +134,9 @@ lint:
 		cppcheck --enable=all --error-exitcode=1 \
 			 --suppress=missingIncludeSystem \
 			 --suppress=unusedFunction \
+			 --suppress=checkersReport \
+			 --suppress=unmatchedSuppression \
+			 -I src -I build -I vendor/libchevron/include \
 			 src/ tests/; \
 	else \
 		echo "cppcheck not found; skipping"; \

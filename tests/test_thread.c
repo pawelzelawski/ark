@@ -1,6 +1,4 @@
-int
-test_thread_stub(void)
+int test_thread_stub(void)
 {
 	return 0;
 }
-
