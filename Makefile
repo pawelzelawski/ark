@@ -135,6 +135,7 @@ lint:
 			 --suppress=missingIncludeSystem \
 			 --suppress=unusedFunction \
 			 --suppress=checkersReport \
+			 --suppress=normalCheckLevelMaxBranches \
 			 --suppress=unmatchedSuppression \
 			 -I src -I build -I vendor/libchevron/include \
 			 src/ tests/; \

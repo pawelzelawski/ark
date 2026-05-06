@@ -9,7 +9,15 @@ typedef struct {
 } test_case_t;
 
 int test_archive_stub(void);
-int test_blake3_stub(void);
+int test_blake3_vectors_all(void);
+int test_blake3_empty(void);
+int test_blake3_single_chunk(void);
+int test_blake3_multi_chunk(void);
+int test_blake3_large(void);
+int test_blake3_output_fixed_32(void);
+int test_blake3_single_shot_matches_streaming(void);
+int test_blake3_independent_contexts(void);
+int test_blake3_incremental_updates(void);
 int test_deflate_stub(void);
 int test_edge_stub(void);
 int test_extract_stub(void);
@@ -42,7 +50,16 @@ static const test_case_t g_tests[] = {
      test_sha256_single_shot_matches_streaming},
     {"test_sha256_output_length", test_sha256_output_length},
     {"test_sha256_independent_contexts", test_sha256_independent_contexts},
-    {"test_blake3_stub", test_blake3_stub},
+    {"test_blake3_vectors_all", test_blake3_vectors_all},
+    {"test_blake3_empty", test_blake3_empty},
+    {"test_blake3_single_chunk", test_blake3_single_chunk},
+    {"test_blake3_multi_chunk", test_blake3_multi_chunk},
+    {"test_blake3_large", test_blake3_large},
+    {"test_blake3_output_fixed_32", test_blake3_output_fixed_32},
+    {"test_blake3_single_shot_matches_streaming",
+     test_blake3_single_shot_matches_streaming},
+    {"test_blake3_independent_contexts", test_blake3_independent_contexts},
+    {"test_blake3_incremental_updates", test_blake3_incremental_updates},
     {"test_deflate_stub", test_deflate_stub},
     {"test_archive_stub", test_archive_stub},
     {"test_thread_stub", test_thread_stub},

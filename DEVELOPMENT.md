@@ -3,15 +3,15 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-06
-**Current Phase:** Phase 2 - Cryptographic components (in progress)
-**Next Task:** Phase 2.3 - BLAKE3 implementation
+**Current Phase:** Phase 3 - Deflate component (next)
+**Next Task:** Phase 3.1 - Deflate API definition
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
 | 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
-| 2 | Cryptographic components | IN PROGRESS | 2.3 next | sha256, blake3 against official test vectors |
+| 2 | Cryptographic components | DONE | 2.1-2.4 complete | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
@@ -26,7 +26,7 @@
 | M1 | Build system works on Linux x86_64 | DONE |
 | M2 | Build system works on OpenBSD | DONE |
 | M3 | SHA-256 NIST vectors all pass | DONE |
-| M4 | BLAKE3 official vectors all pass | NOT STARTED |
+| M4 | BLAKE3 official vectors all pass | DONE |
 | M5 | Deflate round-trip: byte-for-byte identity on all test inputs | NOT STARTED |
 | M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | NOT STARTED |
 | M7 | Archive format: all twelve §8.3 checks individually reject crafted malformed archives | NOT STARTED |
@@ -251,34 +251,34 @@ components are self-contained and have no dependencies beyond libc.
 - [x] All SHA-256 tests pass; Valgrind clean; ASan clean
 - [x] Quality milestone M3 confirmed
 
-**2.3 - BLAKE3 implementation**
-- [ ] Define `ark_blake3_ctx_t` struct in `blake3.h`; internal state per the
+**2.3 - BLAKE3 implementation** ✓ DONE
+- [x] Define `ark_blake3_ctx_t` struct in `blake3.h`; internal state per the
   BLAKE3 specification (chaining values, input buffer, block state, chunk
   counter, stack)
-- [ ] Implement `ark_blake3_init`, `ark_blake3_update`, `ark_blake3_final`
+- [x] Implement `ark_blake3_init`, `ark_blake3_update`, `ark_blake3_final`
   in `blake3.c`; sequential mode only; output fixed to 32 bytes
-- [ ] Implement `ark_blake3` single-shot wrapper
-- [ ] Verify `blake3.h` is self-contained:
+- [x] Implement `ark_blake3` single-shot wrapper
+- [x] Verify `blake3.h` is self-contained:
   `cc -std=c11 -fsyntax-only src/blake3.h`
 
-**2.4 - BLAKE3 tests**
-- [ ] Obtain official BLAKE3 test vectors from the reference repository
-- [ ] Implement `test_blake3_vectors_all`: loop over all official vectors
-- [ ] Implement `test_blake3_empty`, `test_blake3_single_chunk`,
+**2.4 - BLAKE3 tests** ✓ DONE
+- [x] Obtain official BLAKE3 test vectors from the reference repository
+- [x] Implement `test_blake3_vectors_all`: loop over all official vectors
+- [x] Implement `test_blake3_empty`, `test_blake3_single_chunk`,
   `test_blake3_multi_chunk`, `test_blake3_large`
-- [ ] Implement `test_blake3_output_fixed_32`
-- [ ] Implement `test_blake3_single_shot_matches_streaming`
-- [ ] Implement `test_blake3_independent_contexts`
-- [ ] Implement `test_blake3_incremental_updates`
-- [ ] All BLAKE3 tests pass; Valgrind clean; ASan clean
-- [ ] Quality milestone M4 confirmed
+- [x] Implement `test_blake3_output_fixed_32`
+- [x] Implement `test_blake3_single_shot_matches_streaming`
+- [x] Implement `test_blake3_independent_contexts`
+- [x] Implement `test_blake3_incremental_updates`
+- [x] All BLAKE3 tests pass; Valgrind clean; ASan clean
+- [x] Quality milestone M4 confirmed
 
 ### Phase 2 Completion Criteria
 
-- [ ] All SHA-256 tests pass on Linux and OpenBSD
-- [ ] All BLAKE3 tests pass on Linux and OpenBSD
-- [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M3, M4 confirmed
+- [x] All SHA-256 tests pass on Linux and OpenBSD
+- [x] All BLAKE3 tests pass on Linux and OpenBSD
+- [x] Valgrind clean; ASan/UBSan clean on Linux
+- [x] Quality milestones M3, M4 confirmed
 
 ---
 

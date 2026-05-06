@@ -199,22 +199,33 @@ void ark_sha256_update(ark_sha256_ctx_t *ctx, const uint8_t *data, size_t len)
 /* cppcheck-suppress staticFunction */
 void ark_sha256_final(ark_sha256_ctx_t *ctx, uint8_t digest[32])
 {
-	uint8_t pad[64];
+	uint8_t zeros[64];
+	uint8_t one;
 	uint8_t len_be[8];
 	uint64_t bit_count;
-	size_t pad_len;
+	size_t pad_zero_len;
 	size_t i;
 
 	bit_count = ctx->byte_count * 8U;
-	zero_bytes(pad, sizeof(pad));
-	pad[0] = 0x80U;
+	zero_bytes(zeros, sizeof(zeros));
+	one = 0x80U;
+	ark_sha256_update(ctx, &one, 1);
 
-	if (ctx->block_len < 56)
-		pad_len = 56 - ctx->block_len;
+	if (ctx->block_len <= 56)
+		pad_zero_len = 56 - ctx->block_len;
 	else
-		pad_len = (64 - ctx->block_len) + 56;
-	/* Pad so the final 64-bit length occupies the last 8 bytes. */
-	ark_sha256_update(ctx, pad, pad_len);
+		pad_zero_len = (64 - ctx->block_len) + 56;
+	/* Pad with zeros so the final 64-bit length occupies the last 8 bytes.
+	 */
+	while (pad_zero_len > 0) {
+		size_t n;
+
+		n = pad_zero_len;
+		if (n > sizeof(zeros))
+			n = sizeof(zeros);
+		ark_sha256_update(ctx, zeros, n);
+		pad_zero_len -= n;
+	}
 
 	/* Append message length in bits as required by FIPS 180-4. */
 	store_be64(len_be, bit_count);
