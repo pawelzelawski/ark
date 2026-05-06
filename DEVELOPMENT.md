@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-05
 **Current Phase:** Phase 2 - Cryptographic components (in progress)
-**Next Task:** Phase 2.1 - SHA-256 implementation
+**Next Task:** Phase 2.2 - SHA-256 tests
 
 ### Phase Summary
 
@@ -225,14 +225,14 @@ components are self-contained and have no dependencies beyond libc.
 
 ### Tasks
 
-**2.1 - SHA-256 implementation**
-- [ ] Define `ark_sha256_ctx_t` struct in `sha256.h`: internal state fields
+**2.1 - SHA-256 implementation** ✓ DONE
+- [x] Define `ark_sha256_ctx_t` struct in `sha256.h`: internal state fields
   per FIPS 180-4 (eight 32-bit state words, message schedule buffer, byte
   count)
-- [ ] Implement `ark_sha256_init`, `ark_sha256_update`, `ark_sha256_final`
+- [x] Implement `ark_sha256_init`, `ark_sha256_update`, `ark_sha256_final`
   in `sha256.c` per FIPS 180-4; no platform intrinsics, pure portable C
-- [ ] Implement `ark_sha256` single-shot wrapper
-- [ ] Verify `sha256.h` is self-contained:
+- [x] Implement `ark_sha256` single-shot wrapper
+- [x] Verify `sha256.h` is self-contained:
   `cc -std=c11 -fsyntax-only src/sha256.h`
 
 **2.2 - SHA-256 tests**
