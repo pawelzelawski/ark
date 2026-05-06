@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 
 typedef int (*test_fn_t)(void);
@@ -14,11 +15,33 @@ int test_edge_stub(void);
 int test_extract_stub(void);
 int test_fault_stub(void);
 int test_integration_stub(void);
-int test_sha256_stub(void);
 int test_thread_stub(void);
 
+int test_sha256_empty(void);
+int test_sha256_abc(void);
+int test_sha256_448_bits(void);
+int test_sha256_one_block(void);
+int test_sha256_exact_block(void);
+int test_sha256_block_boundary(void);
+int test_sha256_two_blocks(void);
+int test_sha256_multiblock(void);
+int test_sha256_single_shot_matches_streaming(void);
+int test_sha256_output_length(void);
+int test_sha256_independent_contexts(void);
+
 static const test_case_t g_tests[] = {
-    {"test_sha256_stub", test_sha256_stub},
+    {"test_sha256_empty", test_sha256_empty},
+    {"test_sha256_abc", test_sha256_abc},
+    {"test_sha256_448_bits", test_sha256_448_bits},
+    {"test_sha256_one_block", test_sha256_one_block},
+    {"test_sha256_exact_block", test_sha256_exact_block},
+    {"test_sha256_block_boundary", test_sha256_block_boundary},
+    {"test_sha256_two_blocks", test_sha256_two_blocks},
+    {"test_sha256_multiblock", test_sha256_multiblock},
+    {"test_sha256_single_shot_matches_streaming",
+     test_sha256_single_shot_matches_streaming},
+    {"test_sha256_output_length", test_sha256_output_length},
+    {"test_sha256_independent_contexts", test_sha256_independent_contexts},
     {"test_blake3_stub", test_blake3_stub},
     {"test_deflate_stub", test_deflate_stub},
     {"test_archive_stub", test_archive_stub},
@@ -32,11 +55,18 @@ static const test_case_t g_tests[] = {
 int main(void)
 {
 	size_t i;
+	size_t passed;
+	size_t total;
 
-	for (i = 0; i < (sizeof(g_tests) / sizeof(g_tests[0])); i++) {
-		(void)g_tests[i].name;
-		(void)g_tests[i].fn;
+	passed = 0;
+	total = sizeof(g_tests) / sizeof(g_tests[0]);
+	for (i = 0; i < total; i++) {
+		if (g_tests[i].fn() == 0) {
+			passed++;
+			continue;
+		}
+		fprintf(stderr, "FAIL: %s\n", g_tests[i].name);
 	}
-	printf("0/0 tests passed\n");
-	return (0);
+	printf("%zu/%zu tests passed\n", passed, total);
+	return passed == total ? 0 : 1;
 }

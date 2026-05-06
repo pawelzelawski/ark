@@ -2,16 +2,16 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-05
+**Last Updated:** 2026-05-06
 **Current Phase:** Phase 2 - Cryptographic components (in progress)
-**Next Task:** Phase 2.2 - SHA-256 tests
+**Next Task:** Phase 2.3 - BLAKE3 implementation
 
 ### Phase Summary
 
 | Phase | Name | Status | Tests | Notes |
 |---|---|---|---|---|
 | 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
-| 2 | Cryptographic components | IN PROGRESS | 2.1 next | sha256, blake3 against official test vectors |
+| 2 | Cryptographic components | IN PROGRESS | 2.3 next | sha256, blake3 against official test vectors |
 | 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
@@ -25,7 +25,7 @@
 |---|---|---|
 | M1 | Build system works on Linux x86_64 | DONE |
 | M2 | Build system works on OpenBSD | DONE |
-| M3 | SHA-256 NIST vectors all pass | NOT STARTED |
+| M3 | SHA-256 NIST vectors all pass | DONE |
 | M4 | BLAKE3 official vectors all pass | NOT STARTED |
 | M5 | Deflate round-trip: byte-for-byte identity on all test inputs | NOT STARTED |
 | M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | NOT STARTED |
@@ -235,21 +235,21 @@ components are self-contained and have no dependencies beyond libc.
 - [x] Verify `sha256.h` is self-contained:
   `cc -std=c11 -fsyntax-only src/sha256.h`
 
-**2.2 - SHA-256 tests**
-- [ ] Implement `test_sha256_empty`: NIST vector for zero bytes
-- [ ] Implement `test_sha256_abc`: NIST vector for "abc"
-- [ ] Implement `test_sha256_448_bits`: NIST vector for 448-bit message
-- [ ] Implement `test_sha256_one_block`: 55-byte input
-- [ ] Implement `test_sha256_exact_block`: 64-byte input
-- [ ] Implement `test_sha256_block_boundary`: 56-byte input split across two
+**2.2 - SHA-256 tests** ✓ DONE
+- [x] Implement `test_sha256_empty`: NIST vector for zero bytes
+- [x] Implement `test_sha256_abc`: NIST vector for "abc"
+- [x] Implement `test_sha256_448_bits`: NIST vector for 448-bit message
+- [x] Implement `test_sha256_one_block`: 55-byte input
+- [x] Implement `test_sha256_exact_block`: 64-byte input
+- [x] Implement `test_sha256_block_boundary`: 56-byte input split across two
   `ark_sha256_update` calls
-- [ ] Implement `test_sha256_two_blocks`: 65-byte input
-- [ ] Implement `test_sha256_multiblock`: 1KB input
-- [ ] Implement `test_sha256_single_shot_matches_streaming`
-- [ ] Implement `test_sha256_output_length`
-- [ ] Implement `test_sha256_independent_contexts`
-- [ ] All SHA-256 tests pass; Valgrind clean; ASan clean
-- [ ] Quality milestone M3 confirmed
+- [x] Implement `test_sha256_two_blocks`: 65-byte input
+- [x] Implement `test_sha256_multiblock`: 1KB input
+- [x] Implement `test_sha256_single_shot_matches_streaming`
+- [x] Implement `test_sha256_output_length`
+- [x] Implement `test_sha256_independent_contexts`
+- [x] All SHA-256 tests pass; Valgrind clean; ASan clean
+- [x] Quality milestone M3 confirmed
 
 **2.3 - BLAKE3 implementation**
 - [ ] Define `ark_blake3_ctx_t` struct in `blake3.h`; internal state per the
