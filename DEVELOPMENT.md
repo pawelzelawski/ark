@@ -3,8 +3,8 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-07
-**Current Phase:** Phase 3 - Deflate component (next)
-**Next Task:** Phase 3.2 - Deflate compressor
+**Current Phase:** Phase 4 - Archive format (next)
+**Next Task:** Phase 4.1 - archive.h public types
 
 ### Phase Summary
 
@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | DONE | 2.1-2.4 complete | sha256, blake3 against official test vectors |
-| 3 | Deflate component | IN PROGRESS | 3.1 complete | Compress, decompress, bound; round-trip correctness |
+| 3 | Deflate component | DONE | 3.1-3.4 complete | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | NOT STARTED | - | Ring buffer, workers, cancellation, error propagation; TSan required |
@@ -27,8 +27,8 @@
 | M2 | Build system works on OpenBSD | DONE |
 | M3 | SHA-256 NIST vectors all pass | DONE |
 | M4 | BLAKE3 official vectors all pass | DONE |
-| M5 | Deflate round-trip: byte-for-byte identity on all test inputs | NOT STARTED |
-| M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | NOT STARTED |
+| M5 | Deflate round-trip: byte-for-byte identity on all test inputs | DONE |
+| M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | DONE |
 | M7 | Archive format: all twelve §8.3 checks individually reject crafted malformed archives | NOT STARTED |
 | M8 | Archive format: write state machine enforced; all invalid transitions return ARK_ERR_USAGE | NOT STARTED |
 | M9 | Single-threaded create produces valid, verifiable archive | NOT STARTED |
@@ -309,41 +309,41 @@ data. Round-trip produces byte-for-byte identical output.
 - [x] Verify `deflate.h` is self-contained
 
 **3.2 - Deflate compressor**
-- [ ] Implement `ark_deflate_bound`: returns an upper bound on compressed
+- [x] Implement `ark_deflate_bound`: returns an upper bound on compressed
   output size for a given input size; must hold for all inputs including
   incompressible (stored block framing overhead)
-- [ ] Implement `ark_deflate_compress`: RFC 1951 Deflate compressor targeting
+- [x] Implement `ark_deflate_compress`: RFC 1951 Deflate compressor targeting
   near-optimal parsing with aggressive block boundary decisions; handles
   incompressible content via stored blocks; deterministic: same input always
   produces same output
 
 **3.3 - Deflate decompressor**
-- [ ] Implement `ark_deflate_decompress`: strict RFC 1951 Deflate
+- [x] Implement `ark_deflate_decompress`: strict RFC 1951 Deflate
   decompressor; validates decompressed length against `expected_len`;
   returns `ARK_ERR_FMT_DATA` on any invalid stream or length mismatch
 
 **3.4 - Deflate tests**
-- [ ] Implement `test_deflate_round_trip_text`
-- [ ] Implement `test_deflate_round_trip_binary`
-- [ ] Implement `test_deflate_round_trip_empty`
-- [ ] Implement `test_deflate_round_trip_single_byte`
-- [ ] Implement `test_deflate_round_trip_exact_chunk`
-- [ ] Implement `test_deflate_round_trip_sub_chunk`
-- [ ] Implement `test_deflate_incompressible_within_bound`
-- [ ] Implement `test_deflate_bound_non_zero`
-- [ ] Implement `test_deflate_stored_block_valid`
-- [ ] Implement `test_deflate_invalid_stream`
-- [ ] Implement `test_deflate_truncated_stream`
-- [ ] Implement `test_deflate_length_mismatch`
-- [ ] Implement `test_deflate_output_buffer_exact`
-- [ ] All deflate tests pass; Valgrind clean; ASan clean
-- [ ] Quality milestones M5, M6 confirmed
+- [x] Implement `test_deflate_round_trip_text`
+- [x] Implement `test_deflate_round_trip_binary`
+- [x] Implement `test_deflate_round_trip_empty`
+- [x] Implement `test_deflate_round_trip_single_byte`
+- [x] Implement `test_deflate_round_trip_exact_chunk`
+- [x] Implement `test_deflate_round_trip_sub_chunk`
+- [x] Implement `test_deflate_incompressible_within_bound`
+- [x] Implement `test_deflate_bound_non_zero`
+- [x] Implement `test_deflate_stored_block_valid`
+- [x] Implement `test_deflate_invalid_stream`
+- [x] Implement `test_deflate_truncated_stream`
+- [x] Implement `test_deflate_length_mismatch`
+- [x] Implement `test_deflate_output_buffer_exact`
+- [x] All deflate tests pass; Valgrind clean; ASan clean
+- [x] Quality milestones M5, M6 confirmed
 
 ### Phase 3 Completion Criteria
 
-- [ ] All deflate tests pass on Linux and OpenBSD
-- [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M5, M6 confirmed
+- [x] All deflate tests pass on Linux and OpenBSD
+- [x] Valgrind clean; ASan/UBSan clean on Linux
+- [x] Quality milestones M5, M6 confirmed
 
 ---
 

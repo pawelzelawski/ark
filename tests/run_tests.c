@@ -18,7 +18,19 @@ int test_blake3_output_fixed_32(void);
 int test_blake3_single_shot_matches_streaming(void);
 int test_blake3_independent_contexts(void);
 int test_blake3_incremental_updates(void);
-int test_deflate_stub(void);
+int test_deflate_round_trip_text(void);
+int test_deflate_round_trip_binary(void);
+int test_deflate_round_trip_empty(void);
+int test_deflate_round_trip_single_byte(void);
+int test_deflate_round_trip_exact_chunk(void);
+int test_deflate_round_trip_sub_chunk(void);
+int test_deflate_incompressible_within_bound(void);
+int test_deflate_bound_non_zero(void);
+int test_deflate_stored_block_valid(void);
+int test_deflate_invalid_stream(void);
+int test_deflate_truncated_stream(void);
+int test_deflate_length_mismatch(void);
+int test_deflate_output_buffer_exact(void);
 int test_edge_stub(void);
 int test_extract_stub(void);
 int test_fault_stub(void);
@@ -60,7 +72,22 @@ static const test_case_t g_tests[] = {
      test_blake3_single_shot_matches_streaming},
     {"test_blake3_independent_contexts", test_blake3_independent_contexts},
     {"test_blake3_incremental_updates", test_blake3_incremental_updates},
-    {"test_deflate_stub", test_deflate_stub},
+    {"test_deflate_round_trip_text", test_deflate_round_trip_text},
+    {"test_deflate_round_trip_binary", test_deflate_round_trip_binary},
+    {"test_deflate_round_trip_empty", test_deflate_round_trip_empty},
+    {"test_deflate_round_trip_single_byte",
+     test_deflate_round_trip_single_byte},
+    {"test_deflate_round_trip_exact_chunk",
+     test_deflate_round_trip_exact_chunk},
+    {"test_deflate_round_trip_sub_chunk", test_deflate_round_trip_sub_chunk},
+    {"test_deflate_incompressible_within_bound",
+     test_deflate_incompressible_within_bound},
+    {"test_deflate_bound_non_zero", test_deflate_bound_non_zero},
+    {"test_deflate_stored_block_valid", test_deflate_stored_block_valid},
+    {"test_deflate_invalid_stream", test_deflate_invalid_stream},
+    {"test_deflate_truncated_stream", test_deflate_truncated_stream},
+    {"test_deflate_length_mismatch", test_deflate_length_mismatch},
+    {"test_deflate_output_buffer_exact", test_deflate_output_buffer_exact},
     {"test_archive_stub", test_archive_stub},
     {"test_thread_stub", test_thread_stub},
     {"test_extract_stub", test_extract_stub},
