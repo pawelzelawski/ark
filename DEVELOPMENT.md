@@ -2,9 +2,9 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-06
+**Last Updated:** 2026-05-07
 **Current Phase:** Phase 3 - Deflate component (next)
-**Next Task:** Phase 3.1 - Deflate API definition
+**Next Task:** Phase 3.2 - Deflate compressor
 
 ### Phase Summary
 
@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | DONE | 2.1-2.4 complete | sha256, blake3 against official test vectors |
-| 3 | Deflate component | NOT STARTED | - | Compress, decompress, bound; round-trip correctness |
+| 3 | Deflate component | IN PROGRESS | 3.1 complete | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | NOT STARTED | - | Ring buffer, workers, cancellation, error propagation; TSan required |
@@ -297,16 +297,16 @@ data. Round-trip produces byte-for-byte identical output.
 
 ### Tasks
 
-**3.1 - Deflate API definition**
-- [ ] Define public API in `deflate.h`:
+**3.1 - Deflate API definition** ✓ DONE
+- [x] Define public API in `deflate.h`:
   `ark_deflate_compress(src, src_len, dst, dst_cap, err)` → `ssize_t`;
   `ark_deflate_decompress(src, src_len, dst, dst_cap, expected_len, err)`
   → `ssize_t`;
   `ark_deflate_bound(src_len)` → `size_t`
-- [ ] Document: `ark_deflate_compress` receives at most `ARK_CHUNK_SIZE`
+- [x] Document: `ark_deflate_compress` receives at most `ARK_CHUNK_SIZE`
   (1048576) bytes; `ark_deflate_decompress` returns `ARK_ERR_FMT_DATA` on
   invalid stream or decompressed length != `expected_len`
-- [ ] Verify `deflate.h` is self-contained
+- [x] Verify `deflate.h` is self-contained
 
 **3.2 - Deflate compressor**
 - [ ] Implement `ark_deflate_bound`: returns an upper bound on compressed
