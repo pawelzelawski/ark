@@ -299,28 +299,33 @@ data. Round-trip produces byte-for-byte identical output.
 
 **3.1 - Deflate API definition** ✓ DONE
 - [x] Define public API in `deflate.h`:
-  `ark_deflate_compress(src, src_len, dst, dst_cap, err)` → `ssize_t`;
-  `ark_deflate_decompress(src, src_len, dst, dst_cap, expected_len, err)`
-  → `ssize_t`;
+  `ark_deflate_compress(src, src_len, dst, dst_cap, mode)` → `ssize_t`;
+  `ark_deflate_decompress(src, src_len, dst, dst_cap)` → `ssize_t`;
   `ark_deflate_bound(src_len)` → `size_t`
 - [x] Document: `ark_deflate_compress` receives at most `ARK_CHUNK_SIZE`
-  (1048576) bytes; `ark_deflate_decompress` returns `ARK_ERR_FMT_DATA` on
-  invalid stream or decompressed length != `expected_len`
+  (1048576) bytes; `ark_deflate_decompress` returns -1 on invalid stream
+  or output buffer overflow; `archive.c` maps -1 to `ARK_ERR_FMT_DATA`
+- [x] Expose `ARK_CHUNK_SIZE` as a named constant in `deflate.h`
 - [x] Verify `deflate.h` is self-contained
 
 **3.2 - Deflate compressor**
 - [x] Implement `ark_deflate_bound`: returns an upper bound on compressed
   output size for a given input size; must hold for all inputs including
   incompressible (stored block framing overhead)
-- [x] Implement `ark_deflate_compress`: RFC 1951 Deflate compressor targeting
-  near-optimal parsing with aggressive block boundary decisions; handles
-  incompressible content via stored blocks; deterministic: same input always
-  produces same output
+- [x] Implement `ark_deflate_compress`: RFC 1951 Deflate compressor with
+  hash-chain match finding and lazy matching; handles incompressible content
+  via stored blocks (fallback when compressed size >= input size);
+  deterministic: same input always produces same output
+- NOTE: Compressor currently emits fixed-Huffman blocks only. Dynamic-Huffman
+  block generation and block-boundary optimization (ARCHITECTURE.md §7.2
+  "near-optimal parsing" and "aggressive block boundary decisions") are
+  explicitly deferred to a future optimization pass.
 
 **3.3 - Deflate decompressor**
 - [x] Implement `ark_deflate_decompress`: strict RFC 1951 Deflate
-  decompressor; validates decompressed length against `expected_len`;
-  returns `ARK_ERR_FMT_DATA` on any invalid stream or length mismatch
+  decompressor; supports stored, fixed-Huffman, and dynamic-Huffman blocks;
+  validates all block headers and back-references; returns -1 on any invalid
+  stream or output buffer overflow
 
 **3.4 - Deflate tests**
 - [x] Implement `test_deflate_round_trip_text`
@@ -334,7 +339,7 @@ data. Round-trip produces byte-for-byte identical output.
 - [x] Implement `test_deflate_stored_block_valid`
 - [x] Implement `test_deflate_invalid_stream`
 - [x] Implement `test_deflate_truncated_stream`
-- [x] Implement `test_deflate_length_mismatch`
+- [x] Implement `test_deflate_output_buffer_too_small`
 - [x] Implement `test_deflate_output_buffer_exact`
 - [x] All deflate tests pass; Valgrind clean; ASan clean
 - [x] Quality milestones M5, M6 confirmed

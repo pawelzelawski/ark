@@ -14,6 +14,13 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+/*
+ * ARK_CHUNK_SIZE - Maximum input size in bytes for one ark_deflate_compress
+ * call.  The caller must split larger payloads into chunks of this size.
+ * See ARCHITECTURE.md section 7.4.
+ */
+#define ARK_CHUNK_SIZE 1048576U
+
 typedef enum { ARK_DEFLATE_DEFAULT, ARK_DEFLATE_FAST } ark_deflate_mode_t;
 
 /*

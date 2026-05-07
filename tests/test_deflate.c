@@ -5,7 +5,6 @@
 
 #include "deflate.h"
 
-#define ARK_CHUNK_SIZE 1048576U
 
 static void fill_pattern(uint8_t *buf, size_t len)
 {
@@ -220,7 +219,25 @@ int test_deflate_stored_block_valid(void)
 		return 1;
 	}
 
-	if ((comp[0] & 0x06U) != 0U) {
+	/*
+	 * Verify first stored block structure (RFC 1951 §3.2.4):
+	 *   byte 0: BFINAL=0 | BTYPE=00 | 5 padding zeros → 0x00
+	 *   bytes 1-2: LEN little-endian (65535 = 0xFFFF for first block)
+	 *   bytes 3-4: NLEN = one's complement of LEN (0x0000)
+	 */
+	if (comp[0] != 0x00U) {
+		free(out);
+		free(comp);
+		free(data);
+		return 1;
+	}
+	if (comp[1] != 0xFFU || comp[2] != 0xFFU) {
+		free(out);
+		free(comp);
+		free(data);
+		return 1;
+	}
+	if (comp[3] != 0x00U || comp[4] != 0x00U) {
 		free(out);
 		free(comp);
 		free(data);
@@ -277,7 +294,7 @@ int test_deflate_truncated_stream(void)
 	return 0;
 }
 
-int test_deflate_length_mismatch(void)
+int test_deflate_output_buffer_too_small(void)
 {
 	uint8_t in[1024];
 	uint8_t *comp;

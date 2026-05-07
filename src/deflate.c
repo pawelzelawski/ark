@@ -13,8 +13,6 @@
 
 #include "deflate.h"
 
-#define ARK_CHUNK_SIZE 1048576U
-
 #define ARK_DEFLATE_MIN_MATCH 3U
 #define ARK_DEFLATE_MAX_MATCH 258U
 #define ARK_DEFLATE_WINDOW_SIZE 32768U
@@ -915,8 +913,9 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
 /*
  * ark_deflate_decompress - Decompress one raw RFC 1951 Deflate stream.
  *
- * Supports stored and fixed-Huffman blocks and rejects malformed input.
- * Dynamic-Huffman blocks are currently rejected.
+ * Supports stored blocks (BTYPE 00), fixed-Huffman blocks (BTYPE 01), and
+ * dynamic-Huffman blocks (BTYPE 10). Reserved BTYPE 11 and all malformed
+ * input are rejected.
  *
  * Returns decompressed byte count on success, -1 on error.
  */

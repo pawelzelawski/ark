@@ -29,7 +29,7 @@ int test_deflate_bound_non_zero(void);
 int test_deflate_stored_block_valid(void);
 int test_deflate_invalid_stream(void);
 int test_deflate_truncated_stream(void);
-int test_deflate_length_mismatch(void);
+int test_deflate_output_buffer_too_small(void);
 int test_deflate_output_buffer_exact(void);
 int test_edge_stub(void);
 int test_extract_stub(void);
@@ -86,7 +86,8 @@ static const test_case_t g_tests[] = {
     {"test_deflate_stored_block_valid", test_deflate_stored_block_valid},
     {"test_deflate_invalid_stream", test_deflate_invalid_stream},
     {"test_deflate_truncated_stream", test_deflate_truncated_stream},
-    {"test_deflate_length_mismatch", test_deflate_length_mismatch},
+    {"test_deflate_output_buffer_too_small",
+     test_deflate_output_buffer_too_small},
     {"test_deflate_output_buffer_exact", test_deflate_output_buffer_exact},
     {"test_archive_stub", test_archive_stub},
     {"test_thread_stub", test_thread_stub},
