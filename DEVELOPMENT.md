@@ -2,9 +2,9 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-07
-**Current Phase:** Phase 4 - Archive format (next)
-**Next Task:** Phase 4.4 - Read path implementation
+**Last Updated:** 2026-05-08
+**Current Phase:** Phase 5 - CLI: core operations (next)
+**Next Task:** Phase 5.1 - Argument parsing
 
 ### Phase Summary
 
@@ -13,7 +13,7 @@
 | 1 | Foundation | DONE | 1.1-1.4 complete | Build system, test harness, skeleton, fault injection infrastructure |
 | 2 | Cryptographic components | DONE | 2.1-2.4 complete | sha256, blake3 against official test vectors |
 | 3 | Deflate component | DONE | 3.1-3.4 complete | Compress, decompress, bound; round-trip correctness |
-| 4 | Archive format | NOT STARTED | - | archive.h write path, read path, all §8.3 validation checks |
+| 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
 | 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | NOT STARTED | - | Ring buffer, workers, cancellation, error propagation; TSan required |
 | 7 | Test suite completion | NOT STARTED | - | Integration tests, coverage verification |
@@ -29,8 +29,8 @@
 | M4 | BLAKE3 official vectors all pass | DONE |
 | M5 | Deflate round-trip: byte-for-byte identity on all test inputs | DONE |
 | M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | DONE |
-| M7 | Archive format: all twelve §8.3 checks individually reject crafted malformed archives | NOT STARTED |
-| M8 | Archive format: write state machine enforced; all invalid transitions return ARK_ERR_USAGE | NOT STARTED |
+| M7 | Archive format: all twelve §8.3 checks individually reject crafted malformed archives | DONE |
+| M8 | Archive format: write state machine enforced; all invalid transitions return ARK_ERR_USAGE | DONE |
 | M9 | Single-threaded create produces valid, verifiable archive | NOT STARTED |
 | M10 | Single-threaded extract round-trip: extracted content byte-identical to source | NOT STARTED |
 | M11 | Sandboxing: all subcommands operate correctly under pledge/unveil on OpenBSD | NOT STARTED |
@@ -42,8 +42,8 @@
 | M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
 | M18 | All twelve §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
 | M19 | Pre-epoch mtime: stored and restored; tv_nsec normalised to [0, 999999999] | NOT STARTED |
-| M20 | Empty file: chunk_count=0 accepted; empty file extracted correctly | NOT STARTED |
-| M21 | Non-file member types: hash of empty byte sequence stored and verified | NOT STARTED |
+| M20 | Empty file: chunk_count=0 accepted; empty file extracted correctly | DONE |
+| M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
 | M22 | --overwrite: existing target unlinked before open; no stale tail bytes | NOT STARTED |
 | M23 | Cleanup: all filesystem objects removed after any fatal extraction error, including implicitly created dirs | NOT STARTED |
 | M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly | NOT STARTED |
@@ -414,53 +414,53 @@ enforced. Per-member and index hash verification correct.
 - [x] Implement empty member type tests: directory, symlink, hardlink hash
   equals hash of empty byte sequence
 
-**4.4 - Read path implementation**
-- [ ] Implement `ark_read_header`: validate state is UNINIT; parse and
+**4.4 - Read path implementation** ✓ DONE
+- [x] Implement `ark_read_header`: validate state is UNINIT; parse and
   validate all header fields per §3; populate `comp_alg`, `hash_alg`,
   `ver_major`, `ver_minor` into context; set state to HEADER_DONE
-- [ ] Implement `ark_read_init`: validate state is HEADER_DONE; parse and
+- [x] Implement `ark_read_init`: validate state is HEADER_DONE; parse and
   validate footer per §4; populate `index_offset`, `index_size`,
   `member_count`, `index_hash` into context; set state to FOOTER_DONE
-- [ ] Implement `ark_read_index`: validate state is FOOTER_DONE; apply
+- [x] Implement `ark_read_index`: validate state is FOOTER_DONE; apply
   member_count pre-allocation bound (`member_count > index_size / 86` →
   `ARK_ERR_FMT_INDEX`); verify index hash before parsing; implement all
   twelve §8.3 checks in order; allocate and populate member entry array;
   verify bytes consumed equals `index_size`; set state to INDEX_DONE
-- [ ] Implement all twelve §8.3 checks explicitly; each check is a distinct
+- [x] Implement all twelve §8.3 checks explicitly; each check is a distinct
   validation step with its specific error code; see ARCHITECTURE.md §8.3
-- [ ] Implement `ark_read_member_meta`: validate state is INDEX_DONE; return
+- [x] Implement `ark_read_member_meta`: validate state is INDEX_DONE; return
   pointer to entry at position `pos`; NULL if out of range
-- [ ] Implement `ark_read_chunk`: validate expected decompressed length; call
+- [x] Implement `ark_read_chunk`: validate expected decompressed length; call
   `ark_deflate_decompress`; return `ARK_ERR_FMT_DATA` on invalid stream or
   length mismatch
-- [ ] Implement `ark_read_verify_member_begin`: reset per-member hash context
+- [x] Implement `ark_read_verify_member_begin`: reset per-member hash context
   and expected chunk index counter to 0
-- [ ] Implement `ark_read_verify_member_update`: validate chunk index is the
+- [x] Implement `ark_read_verify_member_update`: validate chunk index is the
   expected next in sequence (`ARK_ERR_FMT_INDEX` on out-of-order); feed
   compressed bytes into hash context; increment expected chunk index
-- [ ] Implement `ark_read_verify_member_final`: compare computed hash against
+- [x] Implement `ark_read_verify_member_final`: compare computed hash against
   `meta->hash`; return `ARK_ERR_HASH_MEMBER` on mismatch
-- [ ] Implement `ark_read_free`: release all context-owned memory
+- [x] Implement `ark_read_free`: release all context-owned memory
 
-**4.5 - Read path tests**
-- [ ] Implement all header validation tests per TESTING.md §3.5
-- [ ] Implement all twelve §8.3 per-check tests: each test crafts a binary
+**4.5 - Read path tests** ✓ DONE
+- [x] Implement all header validation tests per TESTING.md §3.5
+- [x] Implement all twelve §8.3 per-check tests: each test crafts a binary
   archive that passes all prior checks and fails exactly at check N
-- [ ] Implement `test_read_member_count_too_large`
-- [ ] Implement all per-member verification tests
-- [ ] All archive tests pass; Valgrind clean; ASan clean
-- [ ] Quality milestones M7, M8 confirmed
+- [x] Implement `test_read_member_count_too_large`
+- [x] Implement all per-member verification tests
+- [x] All archive tests pass; Valgrind clean; ASan clean
+- [x] Quality milestones M7, M8 confirmed
 
 ### Phase 4 Completion Criteria
 
-- [ ] All archive unit tests pass on Linux and OpenBSD
-- [ ] All twelve §8.3 checks individually verified by crafted malformed
+- [x] All archive unit tests pass on Linux and OpenBSD
+- [x] All twelve §8.3 checks individually verified by crafted malformed
   archive tests
-- [ ] Write state machine enforced: all invalid transitions tested
-- [ ] Per-member hash mismatch detected and reported correctly
-- [ ] Out-of-order chunk update returns `ARK_ERR_FMT_INDEX` immediately
-- [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M7, M8, M20 (hash of empty byte sequence), M21
+- [x] Write state machine enforced: all invalid transitions tested
+- [x] Per-member hash mismatch detected and reported correctly
+- [x] Out-of-order chunk update returns `ARK_ERR_FMT_INDEX` immediately
+- [x] Valgrind clean; ASan/UBSan clean on Linux
+- [x] Quality milestones M7, M8, M20 (hash of empty byte sequence), M21
   (empty file chunk_count=0) confirmed
 
 ---

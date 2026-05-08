@@ -283,7 +283,7 @@ const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
  *
  * See ARCHITECTURE.md section 16.4.
  */
-ssize_t ark_read_chunk(ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
+ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
                        uint32_t chunk_index, const uint8_t *src, size_t src_len,
                        uint8_t *dst, size_t dst_cap, ark_error_t *err);
 

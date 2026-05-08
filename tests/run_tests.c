@@ -34,6 +34,40 @@ int test_write_empty_file_chunk_count_zero(void);
 int test_write_member_hash_non_file_types(void);
 int test_write_index_hash_matches_footer(void);
 int test_write_member_hash_matches_compressed_bytes(void);
+int test_read_header_bad_magic(void);
+int test_read_header_bad_version(void);
+int test_read_header_unknown_comp_alg(void);
+int test_read_header_unknown_hash_alg(void);
+int test_read_header_nonzero_flags(void);
+int test_read_header_nonzero_reserved(void);
+int test_read_header_before_init(void);
+int test_read_check1_bad_footer_magic(void);
+int test_read_check2_index_hash_mismatch(void);
+int test_read_check3_path_absolute(void);
+int test_read_check3_path_dotdot(void);
+int test_read_check3_path_empty_component_fmt(void);
+int test_read_check4_path_too_long(void);
+int test_read_check5_link_absolute(void);
+int test_read_check5_link_dotdot(void);
+int test_read_check6_hardlink_missing_target(void);
+int test_read_check6_hardlink_forward_reference(void);
+int test_read_check7_duplicate_path(void);
+int test_read_check8_missing_ancestor(void);
+int test_read_check9_present_ancestor_non_directory(void);
+int test_read_check10_size_mismatch(void);
+int test_read_check11_data_offset_low(void);
+int test_read_check12_overlapping_ranges(void);
+int test_read_check13_hardlink_targets_dir(void);
+int test_read_check14_structural_gap(void);
+int test_read_check15_zero_data_hash_mismatch(void);
+int test_read_check16_zero_data_hash_mismatch(void);
+int test_read_member_count_too_large(void);
+int test_read_verify_hash_match(void);
+int test_read_verify_hash_mismatch(void);
+int test_read_verify_out_of_order_chunk(void);
+int test_read_chunk_invalid_deflate(void);
+int test_read_chunk_length_mismatch(void);
+int test_read_empty_file_chunk_count_zero(void);
 int test_blake3_vectors_all(void);
 int test_blake3_empty(void);
 int test_blake3_single_chunk(void);
@@ -152,6 +186,51 @@ static const test_case_t g_tests[] = {
      test_write_index_hash_matches_footer},
     {"test_write_member_hash_matches_compressed_bytes",
      test_write_member_hash_matches_compressed_bytes},
+    {"test_read_header_bad_magic", test_read_header_bad_magic},
+    {"test_read_header_bad_version", test_read_header_bad_version},
+    {"test_read_header_unknown_comp_alg", test_read_header_unknown_comp_alg},
+    {"test_read_header_unknown_hash_alg", test_read_header_unknown_hash_alg},
+    {"test_read_header_nonzero_flags", test_read_header_nonzero_flags},
+    {"test_read_header_nonzero_reserved", test_read_header_nonzero_reserved},
+    {"test_read_header_before_init", test_read_header_before_init},
+    {"test_read_check1_bad_footer_magic", test_read_check1_bad_footer_magic},
+    {"test_read_check2_index_hash_mismatch",
+     test_read_check2_index_hash_mismatch},
+    {"test_read_check3_path_absolute", test_read_check3_path_absolute},
+    {"test_read_check3_path_dotdot", test_read_check3_path_dotdot},
+    {"test_read_check3_path_empty_component_fmt",
+     test_read_check3_path_empty_component_fmt},
+    {"test_read_check4_path_too_long", test_read_check4_path_too_long},
+    {"test_read_check5_link_absolute", test_read_check5_link_absolute},
+    {"test_read_check5_link_dotdot", test_read_check5_link_dotdot},
+    {"test_read_check6_hardlink_missing_target",
+     test_read_check6_hardlink_missing_target},
+    {"test_read_check6_hardlink_forward_reference",
+     test_read_check6_hardlink_forward_reference},
+    {"test_read_check7_duplicate_path", test_read_check7_duplicate_path},
+    {"test_read_check8_missing_ancestor", test_read_check8_missing_ancestor},
+    {"test_read_check9_present_ancestor_non_directory",
+     test_read_check9_present_ancestor_non_directory},
+    {"test_read_check10_size_mismatch", test_read_check10_size_mismatch},
+    {"test_read_check11_data_offset_low", test_read_check11_data_offset_low},
+    {"test_read_check12_overlapping_ranges",
+     test_read_check12_overlapping_ranges},
+    {"test_read_check13_hardlink_targets_dir",
+     test_read_check13_hardlink_targets_dir},
+    {"test_read_check14_structural_gap", test_read_check14_structural_gap},
+    {"test_read_check15_zero_data_hash_mismatch",
+     test_read_check15_zero_data_hash_mismatch},
+    {"test_read_check16_zero_data_hash_mismatch",
+     test_read_check16_zero_data_hash_mismatch},
+    {"test_read_member_count_too_large", test_read_member_count_too_large},
+    {"test_read_verify_hash_match", test_read_verify_hash_match},
+    {"test_read_verify_hash_mismatch", test_read_verify_hash_mismatch},
+    {"test_read_verify_out_of_order_chunk",
+     test_read_verify_out_of_order_chunk},
+    {"test_read_chunk_invalid_deflate", test_read_chunk_invalid_deflate},
+    {"test_read_chunk_length_mismatch", test_read_chunk_length_mismatch},
+    {"test_read_empty_file_chunk_count_zero",
+     test_read_empty_file_chunk_count_zero},
     {"test_thread_stub", test_thread_stub},
     {"test_extract_stub", test_extract_stub},
     {"test_fault_stub", test_fault_stub},
