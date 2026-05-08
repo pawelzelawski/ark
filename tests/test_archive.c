@@ -7,10 +7,7 @@
 #include "blake3.h"
 #include "sha256.h"
 
-typedef union {
-	max_align_t align;
-	uint8_t bytes[8192];
-} write_ctx_storage_t;
+typedef ark_write_ctx_storage_t write_ctx_storage_t;
 
 static uint16_t le16_get(const uint8_t *p)
 {
@@ -843,10 +840,130 @@ int test_write_member_hash_matches_compressed_bytes(void)
 	return memcmp(index + 45U, expected, sizeof(expected)) == 0 ? 0 : 1;
 }
 
-typedef union {
-	max_align_t align;
-	uint8_t bytes[16384];
-} read_ctx_storage_t;
+int test_write_member_begin_invalid_type(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint8_t header[16];
+
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0xffU, "bad");
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
+	    0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		return 1;
+	if (ark_write_member_begin(ctx, &meta, &err) != -1)
+		return 1;
+	ark_write_free(ctx);
+	return err.code == ARK_ERR_USAGE ? 0 : 1;
+}
+
+int test_write_member_begin_rejects_bad_path(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint8_t header[16];
+
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0x01U, "a/../b");
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
+	    0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		return 1;
+	if (ark_write_member_begin(ctx, &meta, &err) != -1)
+		return 1;
+	ark_write_free(ctx);
+	return err.code == ARK_ERR_PATH_TRAVERSAL ? 0 : 1;
+}
+
+int test_write_member_begin_rejects_bad_link(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint8_t header[16];
+
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0x03U, "s");
+	(void)snprintf(meta.link, sizeof(meta.link), "%s", "/target");
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
+	    0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		return 1;
+	if (ark_write_member_begin(ctx, &meta, &err) != -1)
+		return 1;
+	ark_write_free(ctx);
+	return err.code == ARK_ERR_PATH_ABSOLUTE ? 0 : 1;
+}
+
+int test_write_member_begin_rejects_chunk_sizes(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint32_t chunk_sizes[1] = {1U};
+	uint8_t header[16];
+
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0x01U, "a");
+	meta.chunk_sizes = chunk_sizes;
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
+	    0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		return 1;
+	if (ark_write_member_begin(ctx, &meta, &err) != -1)
+		return 1;
+	ark_write_free(ctx);
+	return err.code == ARK_ERR_USAGE ? 0 : 1;
+}
+
+int test_write_size_compressed_owned_by_context(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	const uint8_t chunk[] = {0xde, 0xad, 0xbe};
+	uint8_t out[8];
+	uint8_t header[16];
+	uint8_t index[256];
+	ssize_t idx_len;
+
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0x01U, "a");
+	meta.size_original = sizeof(chunk);
+	meta.size_compressed = 999U;
+	meta.data_offset = 16U;
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
+	    0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		return 1;
+	if (ark_write_member_begin(ctx, &meta, &err) != 0)
+		return 1;
+	if (ark_write_chunk(ctx, chunk, sizeof(chunk), out, sizeof(out),
+	                    &err) != (ssize_t)sizeof(chunk))
+		return 1;
+	if (ark_write_member_end(ctx, &err) != 0)
+		return 1;
+	idx_len = ark_write_index(ctx, index, sizeof(index), &err);
+	ark_write_free(ctx);
+	if (idx_len <= 0)
+		return 1;
+	return le64_get(index + 29U) == (uint64_t)sizeof(chunk) ? 0 : 1;
+}
+
+typedef ark_read_ctx_storage_t read_ctx_storage_t;
 
 typedef struct {
 	uint8_t type;
@@ -1343,6 +1460,31 @@ int test_read_check5_link_dotdot(void)
 	                          ARK_ERR_PATH_TRAVERSAL);
 }
 
+int test_read_check5_link_too_long(void)
+{
+	read_entry_t e;
+	uint8_t link[1025];
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[1400];
+	uint8_t digest[32];
+	size_t index_len;
+
+	memset(link, 'a', 1024U);
+	link[1024] = '\0';
+	entry_base(&e, 0x03U, "s");
+	e.link = link;
+	e.link_len = 1024U;
+	hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e.hash);
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 1U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_FMT_INDEX);
+}
+
 int test_read_check6_hardlink_missing_target(void)
 {
 	read_entry_t e;
@@ -1526,6 +1668,31 @@ int test_read_check11_data_offset_low(void)
 	                          ARK_ERR_FMT_INDEX);
 }
 
+int test_read_check11_data_range_exceeds_body(void)
+{
+	read_entry_t e;
+	const uint32_t sizes[1] = {2U};
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e, 0x01U, "a");
+	e.size_original = 1U;
+	e.size_compressed = 2U;
+	e.data_offset = 16U;
+	e.chunk_count = 1U;
+	e.chunk_sizes = sizes;
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 17U, index_len, 1U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_FMT_INDEX);
+}
+
 int test_read_check12_overlapping_ranges(void)
 {
 	read_entry_t e[2];
@@ -1571,6 +1738,32 @@ int test_read_check13_hardlink_targets_dir(void)
 	hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[0].hash);
 	entry_base(&e[1], 0x04U, "h");
 	e[1].link = (const uint8_t *)"d";
+	e[1].link_len = 1U;
+	hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[1].hash);
+	if (build_index(e, 2U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 2U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_FMT_INDEX);
+}
+
+int test_read_check13_hardlink_targets_symlink(void)
+{
+	read_entry_t e[2];
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[512];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e[0], 0x03U, "s");
+	e[0].link = (const uint8_t *)"target";
+	e[0].link_len = strlen((const char *)e[0].link);
+	hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[0].hash);
+	entry_base(&e[1], 0x04U, "h");
+	e[1].link = (const uint8_t *)"s";
 	e[1].link_len = 1U;
 	hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[1].hash);
 	if (build_index(e, 2U, index, sizeof(index), &index_len) != 0)
@@ -1636,7 +1829,22 @@ int test_read_check15_zero_data_hash_mismatch(void)
 
 int test_read_check16_zero_data_hash_mismatch(void)
 {
-	return test_read_check15_zero_data_hash_mismatch();
+	read_entry_t e;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e, 0x01U, "e");
+	memset(e.hash, 0x22, sizeof(e.hash));
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 1U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_HASH_MEMBER);
 }
 
 int test_read_member_count_too_large(void)
@@ -1655,6 +1863,29 @@ int test_read_member_count_too_large(void)
 	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
 	build_header(header, ARK_HASH_BLAKE3);
 	build_footer(footer, 16U, index_len, 2U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_FMT_INDEX);
+}
+
+int test_read_regular_size_overflow_rejected(void)
+{
+	read_entry_t e;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e, 0x01U, "a");
+	e.size_original = UINT64_MAX;
+	e.size_compressed = 0U;
+	e.data_offset = 0U;
+	e.chunk_count = 0U;
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 1U, digest);
 	return parse_index_expect(header, footer, index, index_len,
 	                          ARK_ERR_FMT_INDEX);
 }
@@ -1701,7 +1932,7 @@ int test_read_verify_hash_match(void)
 		return 1;
 	if (ark_read_verify_member_begin(ctx, meta, &err) != 0)
 		return 1;
-	if (ark_read_verify_member_update(ctx, meta, comp, (size_t)clen,
+	if (ark_read_verify_member_update(ctx, meta, 0U, comp, (size_t)clen,
 	                                  &err) != 0)
 		return 1;
 	if (ark_read_verify_member_final(ctx, meta, &err) != 0)
@@ -1755,8 +1986,8 @@ int test_read_verify_hash_mismatch(void)
 		return 1;
 	if (ark_read_verify_member_begin(ctx, meta, &err) != 0)
 		return 1;
-	if (ark_read_verify_member_update(ctx, meta, bad, (size_t)clen, &err) !=
-	    0)
+	if (ark_read_verify_member_update(ctx, meta, 0U, bad, (size_t)clen,
+	                                  &err) != 0)
 		return 1;
 	if (ark_read_verify_member_final(ctx, meta, &err) != -1)
 		return 1;
@@ -1770,7 +2001,7 @@ int test_read_verify_out_of_order_chunk(void)
 	read_ctx_storage_t storage;
 	ark_read_ctx_t *ctx;
 	ark_error_t err;
-	const uint32_t csz[2] = {2U, 3U};
+	const uint32_t csz[2] = {3U, 3U};
 	uint8_t chunk2[3] = {1U, 2U, 3U};
 	uint8_t header[16];
 	uint8_t footer[64];
@@ -1781,7 +2012,7 @@ int test_read_verify_out_of_order_chunk(void)
 
 	entry_base(&e, 0x01U, "a");
 	e.size_original = (uint64_t)ARK_CHUNK_SIZE + 1U;
-	e.size_compressed = 5U;
+	e.size_compressed = 6U;
 	e.data_offset = 16U;
 	e.chunk_count = 2U;
 	e.chunk_sizes = csz;
@@ -1789,7 +2020,7 @@ int test_read_verify_out_of_order_chunk(void)
 		return 1;
 	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
 	build_header(header, ARK_HASH_BLAKE3);
-	build_footer(footer, 21U, index_len, 1U, digest);
+	build_footer(footer, 22U, index_len, 1U, digest);
 	if (parse_index_ok(header, footer, index, index_len, &storage, &ctx) !=
 	    0)
 		return 1;
@@ -1798,7 +2029,7 @@ int test_read_verify_out_of_order_chunk(void)
 		return 1;
 	if (ark_read_verify_member_begin(ctx, meta, &err) != 0)
 		return 1;
-	if (ark_read_verify_member_update(ctx, meta, chunk2, sizeof(chunk2),
+	if (ark_read_verify_member_update(ctx, meta, 1U, chunk2, sizeof(chunk2),
 	                                  &err) != -1)
 		return 1;
 	ark_read_free(ctx);
@@ -1887,6 +2118,53 @@ int test_read_chunk_length_mismatch(void)
 		return 1;
 	if (ark_read_chunk(ctx, meta, 0U, comp, (size_t)clen, out, sizeof(out),
 	                   &err) != -1)
+		return 1;
+	ark_read_free(ctx);
+	return err.code == ARK_ERR_FMT_DATA ? 0 : 1;
+}
+
+int test_read_chunk_compressed_size_mismatch(void)
+{
+	read_entry_t e;
+	read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+	uint8_t src[] = {0x41U};
+	uint8_t comp[64];
+	uint8_t out[64];
+	uint32_t csz[1];
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	ssize_t clen;
+	size_t index_len;
+	const ark_member_meta_t *meta;
+
+	clen = ark_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                            ARK_DEFLATE_DEFAULT);
+	if (clen <= 1)
+		return 1;
+	csz[0] = (uint32_t)clen;
+	entry_base(&e, 0x01U, "a");
+	e.size_original = sizeof(src);
+	e.size_compressed = (uint64_t)clen;
+	e.data_offset = 16U;
+	e.chunk_count = 1U;
+	e.chunk_sizes = csz;
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U + (uint64_t)clen, index_len, 1U, digest);
+	if (parse_index_ok(header, footer, index, index_len, &storage, &ctx) !=
+	    0)
+		return 1;
+	meta = ark_read_member_meta(ctx, 0U);
+	if (meta == NULL)
+		return 1;
+	if (ark_read_chunk(ctx, meta, 0U, comp, (size_t)clen - 1U, out,
+	                   sizeof(out), &err) != -1)
 		return 1;
 	ark_read_free(ctx);
 	return err.code == ARK_ERR_FMT_DATA ? 0 : 1;

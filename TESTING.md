@@ -225,6 +225,11 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_write_index_little_endian` | All multi-byte fields in index are little-endian |
 | `test_write_empty_file_chunk_count_zero` | Regular file with size_original=0; chunk_count=0 in index |
 | `test_write_member_hash_non_file_types` | Directories, symlinks, hardlinks: hash of empty byte sequence |
+| `test_write_member_begin_invalid_type` | Writer rejects unknown member type with `ARK_ERR_USAGE` |
+| `test_write_member_begin_rejects_bad_path` | Writer rejects canonical path grammar violation |
+| `test_write_member_begin_rejects_bad_link` | Writer rejects unsafe link target |
+| `test_write_member_begin_rejects_chunk_sizes` | Writer rejects non-NULL `chunk_sizes` on write path |
+| `test_write_size_compressed_owned_by_context` | Writer ignores caller `size_compressed` and records compressed byte total |
 
 ### 3.5 Archive Read Path (`test_archive.c`)
 
@@ -246,27 +251,33 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 |---|---|---|
 | `test_read_check1_bad_footer_magic` | Check 1 | `ARK_ERR_FMT_MAGIC` before index read |
 | `test_read_check2_index_hash_mismatch` | Check 2 | One byte of index flipped; `ARK_ERR_HASH_INDEX` |
-| `test_read_check3_path_exceeds_path_max` | Check 3 | Member path length > PATH_MAX; `ARK_ERR_PATH_TOO_LONG` |
-| `test_read_check4_path_absolute` | Check 4 | Member path starts with `/`; `ARK_ERR_PATH_TRAVERSAL` |
-| `test_read_check4_path_dotdot` | Check 4 | Member path contains `..`; `ARK_ERR_PATH_TRAVERSAL` |
-| `test_read_check5_link_too_long` | Check 5 | Link target > 1023 bytes; `ARK_ERR_FMT_INDEX` |
-| `test_read_check5_link_dotdot` | Check 5 | Link target contains `..`; `ARK_ERR_FMT_INDEX` |
-| `test_read_check6_hardlink_missing_target` | Check 6 | Hardlink names non-existent member; `ARK_ERR_FMT_INDEX` |
-| `test_read_check6_hardlink_forward_reference` | Check 6 | Hardlink target appears after hardlink; `ARK_ERR_FMT_INDEX` |
-| `test_read_check7_duplicate_path` | Check 7 | Two members with identical paths; `ARK_ERR_FMT_INDEX` |
-| `test_read_check8_missing_ancestor` | Check 8 | Leaf member path with no parent directory member; `ARK_ERR_FMT_INDEX` |
-| `test_read_check9_size_mismatch` | Check 9 | `size_compressed` != sum of `chunk_sizes`; `ARK_ERR_FMT_INDEX` |
-| `test_read_check10_data_offset_low` | Check 10 | `data_offset < 16`; `ARK_ERR_FMT_INDEX` |
-| `test_read_check10_data_range_exceeds_body` | Check 10 | `data_offset + size_compressed > index_offset`; `ARK_ERR_FMT_INDEX` |
-| `test_read_check11_overlapping_ranges` | Check 11 | Two members with overlapping data ranges; `ARK_ERR_FMT_INDEX` |
-| `test_read_check12_hardlink_targets_dir` | Check 12 | Hardlink target is a directory; `ARK_ERR_FMT_INDEX` |
-| `test_read_check12_hardlink_targets_symlink` | Check 12 | Hardlink target is a symlink; `ARK_ERR_FMT_INDEX` |
+| `test_read_check3_path_absolute` | Check 3 | Member path starts with `/`; `ARK_ERR_PATH_ABSOLUTE` |
+| `test_read_check3_path_dotdot` | Check 3 | Member path contains `..`; `ARK_ERR_PATH_TRAVERSAL` |
+| `test_read_check3_path_empty_component_fmt` | Check 3 | Member path has an empty component; `ARK_ERR_FMT_INDEX` |
+| `test_read_check4_path_too_long` | Check 5 | Member path length exceeds 1023 bytes; `ARK_ERR_PATH_TOO_LONG` |
+| `test_read_check5_link_too_long` | Check 6 | Link target > 1023 bytes; `ARK_ERR_FMT_INDEX` |
+| `test_read_check5_link_dotdot` | Check 6 | Link target contains `..`; `ARK_ERR_PATH_TRAVERSAL` |
+| `test_read_check6_hardlink_missing_target` | Check 7 | Hardlink names non-existent member; `ARK_ERR_FMT_INDEX` |
+| `test_read_check6_hardlink_forward_reference` | Check 7 | Hardlink target appears after hardlink; `ARK_ERR_FMT_INDEX` |
+| `test_read_check7_duplicate_path` | Check 8 | Two members with identical paths; `ARK_ERR_FMT_INDEX` |
+| `test_read_check8_missing_ancestor` | Check 9 | Leaf member path with no parent directory member; `ARK_ERR_FMT_INDEX` |
+| `test_read_check9_present_ancestor_non_directory` | Check 10 | Present ancestor is not an earlier directory; `ARK_ERR_FMT_INDEX` |
+| `test_read_check10_size_mismatch` | Check 11 | `size_compressed` != sum of `chunk_sizes`; `ARK_ERR_FMT_INDEX` |
+| `test_read_check11_data_offset_low` | Check 12 | `data_offset < 16`; `ARK_ERR_FMT_INDEX` |
+| `test_read_check11_data_range_exceeds_body` | Check 12 | `data_offset + size_compressed > index_offset`; `ARK_ERR_FMT_INDEX` |
+| `test_read_check12_overlapping_ranges` | Check 13 | Two members with overlapping data ranges; `ARK_ERR_FMT_INDEX` |
+| `test_read_check13_hardlink_targets_dir` | Check 14 | Hardlink target is a directory; `ARK_ERR_FMT_INDEX` |
+| `test_read_check13_hardlink_targets_symlink` | Check 14 | Hardlink target is a symlink; `ARK_ERR_FMT_INDEX` |
+| `test_read_check14_structural_gap` | Check 15 | Body ranges are not contiguous to the index; `ARK_ERR_FMT_INDEX` |
+| `test_read_check15_zero_data_hash_mismatch` | Check 16 | Directory hash is not empty-input digest; `ARK_ERR_HASH_MEMBER` |
+| `test_read_check16_zero_data_hash_mismatch` | Check 16 | Empty regular-file hash is not empty-input digest; `ARK_ERR_HASH_MEMBER` |
+| `test_read_regular_size_overflow_rejected` | Overflow-safe arithmetic | Huge `size_original` cannot overflow chunk-count calculation; `ARK_ERR_FMT_INDEX` |
 
 **Pre-allocation bound:**
 
 | Test case | What is verified |
 |---|---|
-| `test_read_member_count_too_large` | `member_count > index_size / 86`; `ARK_ERR_FMT_INDEX` before allocation |
+| `test_read_member_count_too_large` | `member_count > index_size / 84`; `ARK_ERR_FMT_INDEX` before allocation |
 
 **Per-member verification:**
 
@@ -277,6 +288,7 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_read_verify_out_of_order_chunk` | Chunk fed at wrong sequence number; `ARK_ERR_FMT_INDEX` immediately |
 | `test_read_chunk_invalid_deflate` | Compressed bytes are not a valid Deflate stream; `ARK_ERR_FMT_DATA` |
 | `test_read_chunk_length_mismatch` | Decompressed size does not match expected chunk size; `ARK_ERR_FMT_DATA` |
+| `test_read_chunk_compressed_size_mismatch` | Supplied compressed byte count does not match index chunk size; `ARK_ERR_FMT_DATA` |
 | `test_read_empty_file_chunk_count_zero` | Regular file with chunk_count=0; `ark_read_member_meta` reports correctly |
 
 ---
@@ -581,7 +593,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | SHA-256 NIST vectors all pass | `test_sha256.c` | ARCHITECTURE.md §8.4 |
 | BLAKE3 official vectors all pass | `test_blake3.c` | ARCHITECTURE.md §8.4 |
 | Deflate round-trip: byte-for-byte identity | `test_deflate.c` | ARCHITECTURE.md §7 |
-| All twelve §8.3 checks individually reject crafted malformed archive | `test_archive.c` | ARCHITECTURE.md §8.3 |
+| All sixteen §8.3 checks individually reject crafted malformed archive | `test_archive.c` | ARCHITECTURE.md §8.3 |
 | member_count pre-allocation bound enforced before allocation | `test_archive.c` | ARCHITECTURE.md §5.1 |
 | Write state machine: all invalid transitions return ARK_ERR_USAGE | `test_archive.c` | ARCHITECTURE.md §16.3 |
 | Out-of-order chunk update: ARK_ERR_FMT_INDEX immediate | `test_archive.c` | ARCHITECTURE.md §16.4 |
@@ -616,7 +628,7 @@ by one or more specific test cases.
 | Archive format: write state machine enforced | `test_archive.c` state machine catalogue |
 | Thread pool: no deadlock on worker error | `test_thread.c ring_io_thread_unblocks_on_abort` |
 | Thread pool: TSan clean | `make test-tsan` full test suite |
-| Extraction: all twelve §8.3 checks reject crafted inputs | `test_archive.c` §8.3 per-check tests |
+| Extraction: all sixteen §8.3 checks reject crafted inputs | `test_archive.c` §8.3 per-check tests |
 | Extraction: cleanup removes all objects on any fatal error | `test_extract.c` cleanup catalogue |
 | Extraction: metadata restored correctly per member type | `test_extract.c` metadata catalogue |
 | Edge cases: adversarial index inputs all rejected | `test_edge.c` adversarial catalogue |
@@ -639,7 +651,7 @@ by one or more specific test cases.
 | Format binary layout | ARCHITECTURE.md §3, §4, §5 |
 | Hash component APIs | ARCHITECTURE.md §8.4 |
 | Deflate component API | ARCHITECTURE.md §7 |
-| Pre-extraction validation (twelve checks) | ARCHITECTURE.md §8.3 |
+| Pre-extraction validation (sixteen checks) | ARCHITECTURE.md §8.3 |
 | Threading model and cancellation | ARCHITECTURE.md §6.3 |
 | Ring buffer abort sentinel | ARCHITECTURE.md §6.3 |
 | Worker error propagation | ARCHITECTURE.md §6.3 |

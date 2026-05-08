@@ -2175,7 +2175,29 @@ typedef struct {
                                     caller must not free directly;
                                     valid only until ark_read_free or ark_write_free */
 } ark_member_meta_t;
+
+typedef struct ark_write_ctx ark_write_ctx_t;
+typedef struct ark_read_ctx ark_read_ctx_t;
+
+#define ARK_WRITE_CTX_STORAGE_SIZE 8192U
+#define ARK_READ_CTX_STORAGE_SIZE 16384U
+
+typedef union {
+    max_align_t align;
+    uint8_t     bytes[ARK_WRITE_CTX_STORAGE_SIZE];
+} ark_write_ctx_storage_t;
+
+typedef union {
+    max_align_t align;
+    uint8_t     bytes[ARK_READ_CTX_STORAGE_SIZE];
+} ark_read_ctx_storage_t;
 ```
+
+`ark_write_ctx_t` and `ark_read_ctx_t` are semantically opaque: callers must
+not inspect or depend on their private fields. Callers allocate the matching
+storage union, zero it before the first init/header call, and pass a pointer to
+`bytes` cast to the opaque context pointer type. `archive.c` contains C11
+static assertions that the public storage size and alignment are sufficient.
 
 ### 16.3 Write Path
 
@@ -2370,8 +2392,10 @@ const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
    Validates that the decompressed byte count equals the expected chunk size:
    1048576 bytes for all chunks except the last, and
    (size_original mod 1048576) bytes for the last chunk (or 1048576 if
-   size_original is an exact multiple). A mismatch returns -1 with
-   ARK_ERR_FMT_DATA. An invalid Deflate stream returns -1 with
+   size_original is an exact multiple). A src_len mismatch against the
+   indexed compressed chunk size returns -1 with ARK_ERR_FMT_DATA. A
+   decompressed length mismatch returns -1 with ARK_ERR_FMT_DATA. An invalid
+   Deflate stream returns -1 with
    ARK_ERR_FMT_DATA. Returns decompressed bytes written on success, -1 on
    error. chunk_index must be in range [0, meta->chunk_count).
    Single-threaded extraction: main.c calls this in the main loop after
@@ -2398,19 +2422,21 @@ int ark_read_verify_member_begin(ark_read_ctx_t          *ctx,
                                  ark_error_t             *err);
 
 /* Feed one compressed chunk into the per-member hash context. Must be
-   called in chunk order, with the compressed bytes just read from the
+   called with chunk_index equal to the next expected index, with the
+   compressed bytes just read from the
    archive, before decompression. main.c calls this immediately after
    reading the compressed chunk from the archive file, before passing
    it to ark_read_chunk for decompression. Memory bound is one compressed
    chunk at a time regardless of member size.
    The read context tracks the expected chunk index internally, reset to 0
-   by ark_read_verify_member_begin. If chunk_data is supplied out of order
-   (i.e. not at the next expected index in sequence), this function returns
+   by ark_read_verify_member_begin. If chunk_index is supplied out of order
+   (i.e. not the next expected index in sequence), this function returns
    -1 with ARK_ERR_FMT_INDEX immediately rather than producing a silent
    hash mismatch at the final gate.
    Returns 0 on success, -1 on error. */
 int ark_read_verify_member_update(ark_read_ctx_t          *ctx,
                                   const ark_member_meta_t *meta,
+                                  uint32_t                 chunk_index,
                                   const uint8_t           *chunk_data,
                                   size_t                   chunk_len,
                                   ark_error_t             *err);

@@ -335,7 +335,7 @@ tests/
 │                           # Read path: header validation (bad magic, bad
 │                           #   version, unknown alg), footer validation,
 │                           #   index hash verification, member_count pre-
-│                           #   allocation bound, twelve §8.3 checks each
+│                           #   allocation bound, sixteen §8.3 checks each
 │                           #   individually, per-member hash verification,
 │                           #   out-of-order chunk update detection.
 │                           # See TESTING.md §3.4.
@@ -353,7 +353,7 @@ tests/
 │                           # See TESTING.md §3.5.
 │
 ├── test_extract.c          # Extraction correctness tests.
-│                           # Path validation: all twelve §8.3 checks,
+│                           # Path validation: all sixteen §8.3 checks,
 │                           #   each tested with a crafted index that
 │                           #   fails exactly that check.
 │                           # Member types: regular file, directory, symlink,

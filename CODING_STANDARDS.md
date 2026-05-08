@@ -759,15 +759,15 @@ if (ark_read_index(&ctx, index_buf, index_len, &err) != 0)
 
 `ark_read_verify_member_begin` must be called once per member before any
 `ark_read_verify_member_update` calls. `ark_read_verify_member_update` must
-be called in chunk order; out-of-order calls return `ARK_ERR_FMT_INDEX`
-immediately.
+be called with the next expected chunk index; out-of-order calls return
+`ARK_ERR_FMT_INDEX` immediately.
 
 ```c
 /* Correct */
 ark_read_verify_member_begin(&ctx, meta, &err);
 for (i = 0; i < meta->chunk_count; i++) {
 	read_compressed_chunk(fd, chunk_buf, meta->chunk_sizes[i]);
-	ark_read_verify_member_update(&ctx, meta, chunk_buf,
+	ark_read_verify_member_update(&ctx, meta, i, chunk_buf,
 	    meta->chunk_sizes[i], &err);
 	ark_read_chunk(&ctx, meta, i, chunk_buf, meta->chunk_sizes[i],
 	    decomp_buf, ARK_CHUNK_SIZE, &err);
@@ -821,7 +821,7 @@ section:
 
 ```c
 /*
- * Pre-extraction validation: twelve checks in order before any filesystem
+ * Pre-extraction validation: sixteen checks in order before any filesystem
  * side effect. See ARCHITECTURE.md §8.3.
  */
 
@@ -831,7 +831,7 @@ section:
  */
 
 /*
- * member_count pre-allocation bound: reject if member_count > index_size / 86
+ * member_count pre-allocation bound: reject if member_count > index_size / 84
  * before allocating the entry array. See ARCHITECTURE.md §5.1.
  */
 
@@ -918,8 +918,8 @@ on its own line before the guarded code.
  *       Without it, utimensat follows the symlink and modifies the target's
  *       mtime. See ARCHITECTURE.md §14.5. */
 
-/* NOTE: The minimum valid index entry is 86 bytes. The pre-allocation bound
- *       member_count > index_size / 86 must be checked before any allocation.
+/* NOTE: The minimum valid index entry is 84 bytes. The pre-allocation bound
+ *       member_count > index_size / 84 must be checked before any allocation.
  *       See ARCHITECTURE.md §5.1. */
 ```
 

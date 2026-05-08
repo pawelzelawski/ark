@@ -5,9 +5,6 @@
  * state machine and byte serialization rules from ARCHITECTURE.md section 16.3.
  */
 
-#include "archive.h"
-#include "ark_internal.h"
-
 #include <errno.h>
 #include <limits.h>
 #include <stddef.h>
@@ -15,8 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "archive.h"
 #include "blake3.h"
+#include "deflate.h"
 #include "sha256.h"
+
+#include "ark_internal.h"
 
 #define ARK_HEADER_SIZE 16U
 #define ARK_FOOTER_SIZE 64U
@@ -79,6 +80,15 @@ struct ark_read_ctx {
 	uint32_t verify_next_chunk;
 	int verify_active;
 };
+
+_Static_assert(sizeof(struct ark_write_ctx) <= ARK_WRITE_CTX_STORAGE_SIZE,
+               "ark_write_ctx_storage_t too small");
+_Static_assert(sizeof(struct ark_read_ctx) <= ARK_READ_CTX_STORAGE_SIZE,
+               "ark_read_ctx_storage_t too small");
+_Static_assert(_Alignof(struct ark_write_ctx) <= _Alignof(max_align_t),
+               "ark_write_ctx_storage_t alignment too small");
+_Static_assert(_Alignof(struct ark_read_ctx) <= _Alignof(max_align_t),
+               "ark_read_ctx_storage_t alignment too small");
 
 static void buf_zero(void *dst, size_t len)
 {
@@ -268,35 +278,11 @@ static int utf8_valid(const uint8_t *s, size_t len)
 	return 1;
 }
 
-static int validate_rel_field(const uint8_t *raw, size_t len, int is_path,
-                              ark_error_t *err)
+static int validate_path_components(const uint8_t *raw, size_t len,
+                                    int reject_dot, ark_error_t *err)
 {
 	size_t i;
 	size_t cstart;
-
-	if (len == 0U)
-		return ark_fail(err, ARK_ERR_FMT_INDEX, "empty path/link", 0);
-	if (len > 1023U)
-		return ark_fail(
-		    err, is_path ? ARK_ERR_PATH_TOO_LONG : ARK_ERR_FMT_INDEX,
-		    "path/link exceeds 1023 bytes", 0);
-	if (is_path && len >= (size_t)PATH_MAX)
-		return ark_fail(err, ARK_ERR_PATH_TOO_LONG,
-		                "path exceeds local PATH_MAX", 0);
-	if (raw[0] == '/')
-		return ark_fail(err, ARK_ERR_PATH_ABSOLUTE,
-		                "absolute path/link rejected", 0);
-	if (raw[len - 1U] == '/')
-		return ark_fail(err, ARK_ERR_FMT_INDEX,
-		                "trailing slash rejected", 0);
-	for (i = 0U; i < len; i++) {
-		if (raw[i] == '\0')
-			return ark_fail(err, ARK_ERR_FMT_INDEX,
-			                "NUL in path/link", 0);
-	}
-	if (utf8_valid(raw, len) == 0)
-		return ark_fail(err, ARK_ERR_PATH_ENCODING,
-		                "invalid UTF-8 path/link", 0);
 
 	cstart = 0U;
 	for (i = 0U; i <= len; i++) {
@@ -308,7 +294,7 @@ static int validate_rel_field(const uint8_t *raw, size_t len, int is_path,
 		if (clen == 0U)
 			return ark_fail(err, ARK_ERR_FMT_INDEX,
 			                "empty path component", 0);
-		if (clen == 1U && raw[cstart] == '.')
+		if (reject_dot != 0 && clen == 1U && raw[cstart] == '.')
 			return ark_fail(err, ARK_ERR_FMT_INDEX,
 			                "dot component rejected", 0);
 		if (clen == 2U && raw[cstart] == '.' && raw[cstart + 1U] == '.')
@@ -318,6 +304,86 @@ static int validate_rel_field(const uint8_t *raw, size_t len, int is_path,
 	}
 
 	return 0;
+}
+
+static int validate_member_path_raw(const uint8_t *raw, size_t len,
+                                    ark_error_t *err)
+{
+	size_t i;
+
+	if (len == 0U)
+		return ark_fail(err, ARK_ERR_FMT_INDEX, "empty path", 0);
+	if (len > 1023U)
+		return ark_fail(err, ARK_ERR_PATH_TOO_LONG,
+		                "path exceeds 1023 bytes", 0);
+	if (len >= (size_t)PATH_MAX)
+		return ark_fail(err, ARK_ERR_PATH_TOO_LONG,
+		                "path exceeds local PATH_MAX", 0);
+	if (raw[0] == '/')
+		return ark_fail(err, ARK_ERR_PATH_ABSOLUTE,
+		                "absolute path rejected", 0);
+	if (raw[len - 1U] == '/')
+		return ark_fail(err, ARK_ERR_FMT_INDEX,
+		                "trailing slash rejected", 0);
+	for (i = 0U; i < len; i++) {
+		if (raw[i] == '\0')
+			return ark_fail(err, ARK_ERR_FMT_INDEX, "NUL in path",
+			                0);
+	}
+	if (utf8_valid(raw, len) == 0)
+		return ark_fail(err, ARK_ERR_PATH_ENCODING,
+		                "invalid UTF-8 path", 0);
+
+	return validate_path_components(raw, len, 1, err);
+}
+
+static int validate_symlink_target_raw(const uint8_t *raw, size_t len,
+                                       ark_error_t *err)
+{
+	size_t i;
+	size_t cstart;
+
+	if (len == 0U)
+		return ark_fail(err, ARK_ERR_FMT_INDEX, "empty symlink target",
+		                0);
+	if (len > 1023U)
+		return ark_fail(err, ARK_ERR_FMT_INDEX,
+		                "link target exceeds 1023 bytes", 0);
+	if (raw[0] == '/')
+		return ark_fail(err, ARK_ERR_PATH_ABSOLUTE,
+		                "absolute link target rejected", 0);
+	for (i = 0U; i < len; i++) {
+		if (raw[i] == '\0')
+			return ark_fail(err, ARK_ERR_FMT_INDEX,
+			                "NUL in link target", 0);
+	}
+	if (utf8_valid(raw, len) == 0)
+		return ark_fail(err, ARK_ERR_PATH_ENCODING,
+		                "invalid UTF-8 link target", 0);
+
+	cstart = 0U;
+	for (i = 0U; i <= len; i++) {
+		size_t clen;
+
+		if (i != len && raw[i] != '/')
+			continue;
+		clen = i - cstart;
+		if (clen == 2U && raw[cstart] == '.' && raw[cstart + 1U] == '.')
+			return ark_fail(err, ARK_ERR_PATH_TRAVERSAL,
+			                "dotdot link target rejected", 0);
+		cstart = i + 1U;
+	}
+
+	return 0;
+}
+
+static int validate_hardlink_target_raw(const uint8_t *raw, size_t len,
+                                        ark_error_t *err)
+{
+	if (len > 1023U)
+		return ark_fail(err, ARK_ERR_FMT_INDEX,
+		                "hardlink target exceeds 1023 bytes", 0);
+	return validate_member_path_raw(raw, len, err);
 }
 
 static int find_member_by_path(const ark_member_meta_t *members, uint32_t n,
@@ -547,6 +613,23 @@ static int member_index_size(const ark_member_meta_t *m, size_t *out,
 	return 0;
 }
 
+static int expected_chunk_count(uint64_t size_original, uint32_t *out)
+{
+	uint64_t n;
+
+	if (size_original == 0U) {
+		*out = 0U;
+		return 0;
+	}
+	n = size_original / (uint64_t)ARK_CHUNK_SIZE;
+	if (size_original % (uint64_t)ARK_CHUNK_SIZE != 0U)
+		n++;
+	if (n > (uint64_t)UINT32_MAX)
+		return -1;
+	*out = (uint32_t)n;
+	return 0;
+}
+
 /*
  * Serialize one index entry as specified by ARCHITECTURE.md section 5.2.
  */
@@ -663,6 +746,7 @@ int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
                            ark_error_t *err)
 {
 	size_t path_len;
+	size_t link_len;
 
 	if (ctx == NULL || meta == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null member argument", 0);
@@ -671,24 +755,50 @@ int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
 		return ark_fail(err, ARK_ERR_USAGE,
 		                "write member begin out of sequence", 0);
 
+	if (meta->type != 0x01U && meta->type != 0x02U && meta->type != 0x03U &&
+	    meta->type != 0x04U)
+		return ark_fail(err, ARK_ERR_USAGE, "invalid member type", 0);
+	if (meta->chunk_sizes != NULL)
+		return ark_fail(err, ARK_ERR_USAGE,
+		                "write-path chunk_sizes must be NULL", 0);
+
 	path_len = strnlen(meta->path, sizeof(meta->path));
 	if (path_len == 0U || path_len >= sizeof(meta->path))
 		return ark_fail(err, ARK_ERR_USAGE, "invalid member path", 0);
-	if (meta->type == 0x03U || meta->type == 0x04U) {
-		size_t link_len;
+	if (validate_member_path_raw((const uint8_t *)meta->path, path_len,
+	                             err) != 0)
+		return -1;
 
-		link_len = strnlen(meta->link, sizeof(meta->link));
-		if (link_len >= sizeof(meta->link))
+	link_len = strnlen(meta->link, sizeof(meta->link));
+	if (meta->type == 0x03U || meta->type == 0x04U) {
+		if (link_len == 0U || link_len >= sizeof(meta->link))
 			return ark_fail(err, ARK_ERR_USAGE,
 			                "invalid member link", 0);
+		if (meta->type == 0x03U) {
+			if (validate_symlink_target_raw(
+			        (const uint8_t *)meta->link, link_len, err) !=
+			    0)
+				return -1;
+		} else {
+			if (validate_hardlink_target_raw(
+			        (const uint8_t *)meta->link, link_len, err) !=
+			    0)
+				return -1;
+		}
+	} else if (link_len != 0U) {
+		return ark_fail(err, ARK_ERR_USAGE,
+		                "link field present for non-link member", 0);
 	}
 
 	ctx->current = *meta;
 	ctx->current.chunk_sizes = NULL;
 	ctx->current.chunk_count = 0U;
+	ctx->current.size_compressed = 0U;
 	ctx->current_chunk_cap = 0U;
 
-	if (ctx->current.type != 0x01U) {
+	if (ctx->current.type == 0x01U && ctx->current.size_original == 0U)
+		ctx->current.data_offset = 0U;
+	else if (ctx->current.type != 0x01U) {
 		ctx->current.size_original = 0U;
 		ctx->current.size_compressed = 0U;
 		ctx->current.data_offset = 0U;
@@ -721,6 +831,8 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx, const uint8_t *src,
 	if (src_len > (size_t)UINT32_MAX)
 		return ark_fail(err, ARK_ERR_USAGE, "chunk size exceeds u32",
 		                0);
+	if (ctx->current.chunk_count == UINT32_MAX)
+		return ark_fail(err, ARK_ERR_USAGE, "too many chunks", 0);
 	if (dst_cap < src_len)
 		return ark_fail(err, ARK_ERR_IO_ALLOC,
 		                "chunk destination too small", 0);
@@ -736,7 +848,10 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx, const uint8_t *src,
 	hash_update(&ctx->member_hash, src, src_len);
 	ctx->current.chunk_sizes[ctx->current.chunk_count++] =
 	    (uint32_t)src_len;
-	ctx->current.size_compressed += (uint64_t)src_len;
+	if (u64_add_overflow(ctx->current.size_compressed, (uint64_t)src_len,
+	                     &ctx->current.size_compressed) != 0)
+		return ark_fail(err, ARK_ERR_USAGE, "compressed size overflow",
+		                0);
 	if (src_len > 0U)
 		buf_copy(dst, src, src_len);
 	return (ssize_t)src_len;
@@ -744,6 +859,8 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx, const uint8_t *src,
 
 int ark_write_member_end(ark_write_ctx_t *ctx, ark_error_t *err)
 {
+	uint32_t expected_chunks;
+
 	if (ctx == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null write context", 0);
 	if (ctx->state != ARK_WRITE_STATE_MEMBER)
@@ -757,7 +874,24 @@ int ark_write_member_end(ark_write_ctx_t *ctx, ark_error_t *err)
 	 * ARCHITECTURE.md section 5.2: non-file members carry no data ranges.
 	 * SAFETY: force zeroed size/data/chunk fields for non-regular entries.
 	 */
-	if (ctx->current.type != 0x01U) {
+	if (ctx->current.type == 0x01U) {
+		if (expected_chunk_count(ctx->current.size_original,
+		                         &expected_chunks) != 0)
+			return ark_fail(err, ARK_ERR_USAGE,
+			                "regular member too large", 0);
+		if (ctx->current.chunk_count != expected_chunks)
+			return ark_fail(err, ARK_ERR_USAGE,
+			                "regular member chunk count mismatch",
+			                0);
+		if (ctx->current.size_original == 0U) {
+			ctx->current.size_compressed = 0U;
+			ctx->current.data_offset = 0U;
+		} else if (ctx->current.data_offset < ARK_HEADER_SIZE) {
+			return ark_fail(err, ARK_ERR_USAGE,
+			                "regular member data offset too low",
+			                0);
+		}
+	} else {
 		ctx->current.size_original = 0U;
 		ctx->current.size_compressed = 0U;
 		ctx->current.data_offset = 0U;
@@ -998,8 +1132,8 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 		ark_member_meta_t *m;
 		size_t path_len;
 		size_t chunk_bytes;
-		uint64_t expected_chunks;
 		uint64_t chunk_sum;
+		uint32_t expected_chunks;
 		uint32_t j;
 
 		m = &members[i];
@@ -1031,7 +1165,8 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 		}
 		if (off > index_len || index_len - off < path_len)
 			goto fmt_index;
-		if (validate_rel_field(index_buf + off, path_len, 1, err) != 0)
+		if (validate_member_path_raw(index_buf + off, path_len, err) !=
+		    0)
 			goto fail;
 		buf_copy(m->path, index_buf + off, path_len);
 		m->path[path_len] = '\0';
@@ -1049,9 +1184,14 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 				goto fmt_index;
 			if (off > index_len || index_len - off < link_len)
 				goto fmt_index;
-			if (validate_rel_field(index_buf + off, link_len, 0,
-			                       err) != 0)
+			if (m->type == 0x03U) {
+				if (validate_symlink_target_raw(
+				        index_buf + off, link_len, err) != 0)
+					goto fail;
+			} else if (validate_hardlink_target_raw(
+			               index_buf + off, link_len, err) != 0) {
 				goto fail;
+			}
 			buf_copy(m->link, index_buf + off, link_len);
 			m->link[link_len] = '\0';
 			off += link_len;
@@ -1074,15 +1214,16 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 				    m->chunk_count != 0U)
 					goto fmt_index;
 			} else {
-				expected_chunks =
-				    (m->size_original +
-				     (uint64_t)ARK_CHUNK_SIZE - 1U) /
-				    (uint64_t)ARK_CHUNK_SIZE;
-				if ((uint64_t)m->chunk_count != expected_chunks)
+				if (expected_chunk_count(m->size_original,
+				                         &expected_chunks) != 0)
+					goto fmt_index;
+				if (m->chunk_count != expected_chunks)
 					goto fmt_index;
 			}
 		}
 
+		if ((size_t)m->chunk_count > SIZE_MAX / sizeof(uint32_t))
+			goto fmt_index;
 		chunk_bytes = (size_t)m->chunk_count * sizeof(uint32_t);
 		if (m->chunk_count > 0U) {
 			if (off > index_len || index_len - off < chunk_bytes)
@@ -1205,7 +1346,30 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			if (ranges[i].start < ranges[i - 1U].end)
 				goto fmt_index;
 		}
+	}
 
+	/* ARCHITECTURE.md section 8.3 check 14. */
+	for (i = 0U; i < ctx->member_count; i++) {
+		int t;
+
+		if (members[i].type != 0x04U)
+			continue;
+		t = find_member_by_path(members, i, members[i].link);
+		if (t < 0)
+			goto fmt_index;
+		if (members[t].type != 0x01U)
+			goto fmt_index;
+	}
+
+	{
+		uint32_t range_count;
+
+		range_count = 0U;
+		for (i = 0U; i < ctx->member_count; i++) {
+			if (members[i].type == 0x01U &&
+			    members[i].size_original > 0U)
+				range_count++;
+		}
 		/* ARCHITECTURE.md section 8.3 check 15 contiguous body. */
 		if (range_count == 0U) {
 			if (ctx->index_offset != ARK_HEADER_SIZE)
@@ -1220,19 +1384,6 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			if (ranges[range_count - 1U].end != ctx->index_offset)
 				goto fmt_index;
 		}
-	}
-
-	/* ARCHITECTURE.md section 8.3 check 14. */
-	for (i = 0U; i < ctx->member_count; i++) {
-		int t;
-
-		if (members[i].type != 0x04U)
-			continue;
-		t = find_member_by_path(members, i, members[i].link);
-		if (t < 0)
-			goto fmt_index;
-		if (members[t].type != 0x01U)
-			goto fmt_index;
 	}
 
 	/* ARCHITECTURE.md section 8.3 check 16 empty-input hash on zero-data.
@@ -1305,6 +1456,9 @@ ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
 	if (chunk_index >= meta->chunk_count)
 		return ark_fail(err, ARK_ERR_FMT_INDEX,
 		                "chunk index out of range", 0);
+	if (src_len != (size_t)meta->chunk_sizes[chunk_index])
+		return ark_fail(err, ARK_ERR_FMT_DATA,
+		                "compressed chunk length mismatch", 0);
 	if (src == NULL && src_len > 0U)
 		return ark_fail(err, ARK_ERR_USAGE, "null compressed chunk", 0);
 
@@ -1350,6 +1504,7 @@ int ark_read_verify_member_begin(ark_read_ctx_t *ctx,
 
 int ark_read_verify_member_update(ark_read_ctx_t *ctx,
                                   const ark_member_meta_t *meta,
+                                  uint32_t chunk_index,
                                   const uint8_t *chunk_data, size_t chunk_len,
                                   ark_error_t *err)
 {
@@ -1364,6 +1519,9 @@ int ark_read_verify_member_update(ark_read_ctx_t *ctx,
 		                "verify update member mismatch", 0);
 	/* SAFETY: this guard enforces strict chunk-order verification as
 	 * required by ARCHITECTURE.md section 16.4 and 8.2. */
+	if (chunk_index != ctx->verify_next_chunk)
+		return ark_fail(err, ARK_ERR_FMT_INDEX,
+		                "verify update chunk out of order", 0);
 	if (ctx->verify_next_chunk >= meta->chunk_count)
 		return ark_fail(err, ARK_ERR_FMT_INDEX,
 		                "too many verify update calls", 0);

@@ -29,7 +29,7 @@
 | M4 | BLAKE3 official vectors all pass | DONE |
 | M5 | Deflate round-trip: byte-for-byte identity on all test inputs | DONE |
 | M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | DONE |
-| M7 | Archive format: all twelve §8.3 checks individually reject crafted malformed archives | DONE |
+| M7 | Archive format: all sixteen §8.3 checks individually reject crafted malformed archives | DONE |
 | M8 | Archive format: write state machine enforced; all invalid transitions return ARK_ERR_USAGE | DONE |
 | M9 | Single-threaded create produces valid, verifiable archive | NOT STARTED |
 | M10 | Single-threaded extract round-trip: extracted content byte-identical to source | NOT STARTED |
@@ -40,7 +40,7 @@
 | M15 | Parallel create: output bit-identical to single-threaded create on same input | NOT STARTED |
 | M16 | Fault injection: every create sequence step covered with forced failure | NOT STARTED |
 | M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
-| M18 | All twelve §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
+| M18 | All sixteen §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
 | M19 | Pre-epoch mtime: stored and restored; tv_nsec normalised to [0, 999999999] | NOT STARTED |
 | M20 | Empty file: chunk_count=0 accepted; empty file extracted correctly | DONE |
 | M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
@@ -355,7 +355,7 @@ data. Round-trip produces byte-for-byte identical output.
 ## Phase 4 - Archive Format
 
 **Goal:** `archive.c` is fully implemented. Write path produces correct
-binary output per the format spec. Read path validates all twelve §8.3
+binary output per the format spec. Read path validates all sixteen §8.3
 checks before touching the filesystem. All write state machine transitions
 enforced. Per-member and index hash verification correct.
 
@@ -363,7 +363,7 @@ enforced. Per-member and index hash verification correct.
 
 **Reference documents:**
 - ARCHITECTURE.md §3-§6 - format binary layout
-- ARCHITECTURE.md §8.3 - twelve pre-extraction validation checks
+- ARCHITECTURE.md §8.3 - sixteen pre-extraction validation checks
 - ARCHITECTURE.md §16.3 - write path API and state machine
 - ARCHITECTURE.md §16.4 - read path API and call sequence
 - TESTING.md §3.4 - archive write path test catalogue
@@ -422,11 +422,11 @@ enforced. Per-member and index hash verification correct.
   validate footer per §4; populate `index_offset`, `index_size`,
   `member_count`, `index_hash` into context; set state to FOOTER_DONE
 - [x] Implement `ark_read_index`: validate state is FOOTER_DONE; apply
-  member_count pre-allocation bound (`member_count > index_size / 86` →
+  member_count pre-allocation bound (`member_count > index_size / 84` →
   `ARK_ERR_FMT_INDEX`); verify index hash before parsing; implement all
-  twelve §8.3 checks in order; allocate and populate member entry array;
+  sixteen §8.3 checks in order; allocate and populate member entry array;
   verify bytes consumed equals `index_size`; set state to INDEX_DONE
-- [x] Implement all twelve §8.3 checks explicitly; each check is a distinct
+- [x] Implement all sixteen §8.3 checks explicitly; each check is a distinct
   validation step with its specific error code; see ARCHITECTURE.md §8.3
 - [x] Implement `ark_read_member_meta`: validate state is INDEX_DONE; return
   pointer to entry at position `pos`; NULL if out of range
@@ -444,7 +444,7 @@ enforced. Per-member and index hash verification correct.
 
 **4.5 - Read path tests** ✓ DONE
 - [x] Implement all header validation tests per TESTING.md §3.5
-- [x] Implement all twelve §8.3 per-check tests: each test crafts a binary
+- [x] Implement all sixteen §8.3 per-check tests: each test crafts a binary
   archive that passes all prior checks and fails exactly at check N
 - [x] Implement `test_read_member_count_too_large`
 - [x] Implement all per-member verification tests
@@ -454,7 +454,7 @@ enforced. Per-member and index hash verification correct.
 ### Phase 4 Completion Criteria
 
 - [x] All archive unit tests pass on Linux and OpenBSD
-- [x] All twelve §8.3 checks individually verified by crafted malformed
+- [x] All sixteen §8.3 checks individually verified by crafted malformed
   archive tests
 - [x] Write state machine enforced: all invalid transitions tested
 - [x] Per-member hash mismatch detected and reported correctly
@@ -746,7 +746,7 @@ in TESTING.md §11 is fully populated.
   triggers it under correct conditions
 - [ ] Verify every create sequence step has a fault injection test
 - [ ] Verify every extract sequence step has a fault injection test
-- [ ] Verify all twelve §8.3 checks are individually tested with crafted
+- [ ] Verify all sixteen §8.3 checks are individually tested with crafted
   archives
 - [ ] Populate TESTING.md §11 coverage tracking table; all cells marked done
 

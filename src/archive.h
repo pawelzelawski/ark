@@ -117,6 +117,27 @@ typedef struct {
 typedef struct ark_write_ctx ark_write_ctx_t;
 typedef struct ark_read_ctx ark_read_ctx_t;
 
+#define ARK_WRITE_CTX_STORAGE_SIZE 8192U
+#define ARK_READ_CTX_STORAGE_SIZE 16384U
+
+/*
+ * Opaque context storage.
+ *
+ * Callers allocate one of these storage objects, zero it before first use,
+ * and pass a pointer to its bytes cast to ark_write_ctx_t or ark_read_ctx_t.
+ * The concrete context fields remain private to archive.c. The storage sizes
+ * are guarded by compile-time assertions in archive.c.
+ */
+typedef union {
+	max_align_t align;
+	uint8_t bytes[ARK_WRITE_CTX_STORAGE_SIZE];
+} ark_write_ctx_storage_t;
+
+typedef union {
+	max_align_t align;
+	uint8_t bytes[ARK_READ_CTX_STORAGE_SIZE];
+} ark_read_ctx_storage_t;
+
 /*
  * ark_write_init - Initialize a write context.
  *
@@ -125,7 +146,8 @@ typedef struct ark_read_ctx ark_read_ctx_t;
  *
  * Returns 0 on success, -1 on failure.
  * Failure contract: populates err when non-NULL.
- * Preconditions: ctx must be non-NULL and in UNINIT state.
+ * Preconditions: ctx must point to zero-initialized ark_write_ctx_storage_t
+ * storage and be in UNINIT state.
  *
  * See ARCHITECTURE.md section 16.3.
  */
@@ -277,8 +299,8 @@ const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
  * ark_read_chunk - Decompress one member chunk.
  *
  * Returns decompressed byte count on success, -1 on failure.
- * Failure contract: invalid Deflate stream or expected-length mismatch maps
- * to ARK_ERR_FMT_DATA via err.
+ * Failure contract: compressed byte-count mismatch, invalid Deflate stream,
+ * or expected decompressed-length mismatch maps to ARK_ERR_FMT_DATA via err.
  * Preconditions: chunk_index in [0, meta->chunk_count).
  *
  * See ARCHITECTURE.md section 16.4.
@@ -304,13 +326,15 @@ int ark_read_verify_member_begin(ark_read_ctx_t *ctx,
  * ark_read_verify_member_update - Feed one compressed chunk to member hash.
  *
  * Returns 0 on success, -1 on failure.
- * Failure contract: out-of-order updates return ARK_ERR_FMT_INDEX via err.
+ * Failure contract: out-of-order chunk_index values return
+ * ARK_ERR_FMT_INDEX via err.
  * Preconditions: ark_read_verify_member_begin() already called for meta.
  *
  * See ARCHITECTURE.md section 16.4.
  */
 int ark_read_verify_member_update(ark_read_ctx_t *ctx,
                                   const ark_member_meta_t *meta,
+                                  uint32_t chunk_index,
                                   const uint8_t *chunk_data, size_t chunk_len,
                                   ark_error_t *err);
 
