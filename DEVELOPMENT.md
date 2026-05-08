@@ -308,7 +308,7 @@ data. Round-trip produces byte-for-byte identical output.
 - [x] Expose `ARK_CHUNK_SIZE` as a named constant in `deflate.h`
 - [x] Verify `deflate.h` is self-contained
 
-**3.2 - Deflate compressor**
+**3.2 - Deflate compressor** ✓ DONE
 - [x] Implement `ark_deflate_bound`: returns an upper bound on compressed
   output size for a given input size; must hold for all inputs including
   incompressible (stored block framing overhead)
@@ -321,13 +321,13 @@ data. Round-trip produces byte-for-byte identical output.
   "near-optimal parsing" and "aggressive block boundary decisions") are
   explicitly deferred to a future optimization pass.
 
-**3.3 - Deflate decompressor**
+**3.3 - Deflate decompressor** ✓ DONE
 - [x] Implement `ark_deflate_decompress`: strict RFC 1951 Deflate
   decompressor; supports stored, fixed-Huffman, and dynamic-Huffman blocks;
   validates all block headers and back-references; returns -1 on any invalid
   stream or output buffer overflow
 
-**3.4 - Deflate tests**
+**3.4 - Deflate tests** ✓ DONE
 - [x] Implement `test_deflate_round_trip_text`
 - [x] Implement `test_deflate_round_trip_binary`
 - [x] Implement `test_deflate_round_trip_empty`
@@ -371,16 +371,16 @@ enforced. Per-member and index hash verification correct.
 
 ### Tasks
 
-**4.1 - archive.h public types**
-- [ ] Define `ark_err_t` enum: all error codes per ARCHITECTURE.md §11.3
-- [ ] Define `ark_error_t` struct: `code`, `sys_errno`, `msg[256]`,
+**4.1 - archive.h public types** ✓ DONE
+- [x] Define `ark_err_t` enum: all error codes per ARCHITECTURE.md §11.3
+- [x] Define `ark_error_t` struct: `code`, `sys_errno`, `msg[256]`,
   `path[1024]`
-- [ ] Define `ark_hash_alg_t`, `ark_deflate_mode_t` enums
-- [ ] Define `ark_member_meta_t` struct: all fields per §5.2; `chunk_sizes`
+- [x] Define `ark_hash_alg_t`, `ark_deflate_mode_t` enums
+- [x] Define `ark_member_meta_t` struct: all fields per §5.2; `chunk_sizes`
   is a `uint32_t *` (NULL on write path, populated on read path)
-- [ ] Define `ark_write_ctx_t` and `ark_read_ctx_t` as opaque structs
-- [ ] Declare all public write and read path functions
-- [ ] Verify `archive.h` is self-contained
+- [x] Define `ark_write_ctx_t` and `ark_read_ctx_t` as opaque structs
+- [x] Declare all public write and read path functions
+- [x] Verify `archive.h` is self-contained
 
 **4.2 - Write path implementation**
 - [ ] Implement `ark_write_init`: initialise context, record `hash_alg` and

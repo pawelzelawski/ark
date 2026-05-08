@@ -5,7 +5,6 @@
 
 #include "deflate.h"
 
-
 static void fill_pattern(uint8_t *buf, size_t len)
 {
 	size_t i;
