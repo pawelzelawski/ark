@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-07
 **Current Phase:** Phase 4 - Archive format (next)
-**Next Task:** Phase 4.1 - archive.h public types
+**Next Task:** Phase 4.4 - Read path implementation
 
 ### Phase Summary
 
@@ -382,36 +382,36 @@ enforced. Per-member and index hash verification correct.
 - [x] Declare all public write and read path functions
 - [x] Verify `archive.h` is self-contained
 
-**4.2 - Write path implementation**
-- [ ] Implement `ark_write_init`: initialise context, record `hash_alg` and
+**4.2 - Write path implementation** ✓ DONE
+- [x] Implement `ark_write_init`: initialise context, record `hash_alg` and
   `mode`; set state to READY
-- [ ] Implement `ark_write_header`: serialise 16-byte fixed header per §3;
+- [x] Implement `ark_write_header`: serialise 16-byte fixed header per §3;
   all fields little-endian; dst_cap < 16 → `ARK_ERR_IO_ALLOC`; set state
   to IDLE
-- [ ] Implement `ark_write_member_begin`: validate state is IDLE; record
+- [x] Implement `ark_write_member_begin`: validate state is IDLE; record
   member metadata; initialise per-member hash context; set state to MEMBER
-- [ ] Implement `ark_write_chunk`: validate state is MEMBER; validate member
+- [x] Implement `ark_write_chunk`: validate state is MEMBER; validate member
   type is 0x01; update per-member hash over `src` bytes; record chunk size;
   copy `src` to `dst`; return bytes copied
-- [ ] Implement `ark_write_member_end`: validate state is MEMBER; finalise
+- [x] Implement `ark_write_member_end`: validate state is MEMBER; finalise
   per-member hash; record hash and chunk table into context; set state to IDLE
-- [ ] Implement `ark_write_index`: validate state is IDLE; serialise all
+- [x] Implement `ark_write_index`: validate state is IDLE; serialise all
   member entries in index format per §5; compute and store index hash;
   dst_cap check → `ARK_ERR_IO_ALLOC`; set state to INDEXED
-- [ ] Implement `ark_write_footer`: validate state is INDEXED; serialise
+- [x] Implement `ark_write_footer`: validate state is INDEXED; serialise
   64-byte footer per §4; retrieve index hash from context; dst_cap < 64 →
   `ARK_ERR_IO_ALLOC`; set state to DONE
-- [ ] Implement `ark_write_free`: release all context-owned memory regardless
+- [x] Implement `ark_write_free`: release all context-owned memory regardless
   of state
-- [ ] Verify all state machine transitions: every invalid transition returns
+- [x] Verify all state machine transitions: every invalid transition returns
   -1 with `ARK_ERR_USAGE`
 
-**4.3 - Write path tests**
-- [ ] Implement all state machine tests per TESTING.md §3.4
-- [ ] Implement all byte layout correctness tests
-- [ ] Implement hash correctness tests: write archive, read back, verify
+**4.3 - Write path tests** ✓ DONE
+- [x] Implement all state machine tests per TESTING.md §3.4
+- [x] Implement all byte layout correctness tests
+- [x] Implement hash correctness tests: write archive, read back, verify
   index hash and per-member hashes match expected values
-- [ ] Implement empty member type tests: directory, symlink, hardlink hash
+- [x] Implement empty member type tests: directory, symlink, hardlink hash
   equals hash of empty byte sequence
 
 **4.4 - Read path implementation**

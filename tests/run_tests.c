@@ -8,7 +8,32 @@ typedef struct {
 	test_fn_t fn;
 } test_case_t;
 
-int test_archive_stub(void);
+int test_write_valid_sequence_zero_members(void);
+int test_write_valid_sequence_one_member(void);
+int test_write_valid_sequence_multi_member(void);
+int test_write_chunk_outside_member(void);
+int test_write_member_begin_while_active(void);
+int test_write_member_end_outside_member(void);
+int test_write_index_before_member_end(void);
+int test_write_footer_before_index(void);
+int test_write_chunk_non_regular_member(void);
+int test_write_free_any_state(void);
+int test_write_header_dst_cap_undersize(void);
+int test_write_footer_dst_cap_undersize(void);
+int test_write_index_dst_cap_undersize(void);
+int test_write_header_magic(void);
+int test_write_header_version(void);
+int test_write_header_flags_zero(void);
+int test_write_header_comp_alg(void);
+int test_write_header_hash_alg(void);
+int test_write_header_reserved_zero(void);
+int test_write_footer_magic_confirm(void);
+int test_write_footer_index_offset(void);
+int test_write_index_little_endian(void);
+int test_write_empty_file_chunk_count_zero(void);
+int test_write_member_hash_non_file_types(void);
+int test_write_index_hash_matches_footer(void);
+int test_write_member_hash_matches_compressed_bytes(void);
 int test_blake3_vectors_all(void);
 int test_blake3_empty(void);
 int test_blake3_single_chunk(void);
@@ -89,7 +114,44 @@ static const test_case_t g_tests[] = {
     {"test_deflate_output_buffer_too_small",
      test_deflate_output_buffer_too_small},
     {"test_deflate_output_buffer_exact", test_deflate_output_buffer_exact},
-    {"test_archive_stub", test_archive_stub},
+    {"test_write_valid_sequence_zero_members",
+     test_write_valid_sequence_zero_members},
+    {"test_write_valid_sequence_one_member",
+     test_write_valid_sequence_one_member},
+    {"test_write_valid_sequence_multi_member",
+     test_write_valid_sequence_multi_member},
+    {"test_write_chunk_outside_member", test_write_chunk_outside_member},
+    {"test_write_member_begin_while_active",
+     test_write_member_begin_while_active},
+    {"test_write_member_end_outside_member",
+     test_write_member_end_outside_member},
+    {"test_write_index_before_member_end", test_write_index_before_member_end},
+    {"test_write_footer_before_index", test_write_footer_before_index},
+    {"test_write_chunk_non_regular_member",
+     test_write_chunk_non_regular_member},
+    {"test_write_free_any_state", test_write_free_any_state},
+    {"test_write_header_dst_cap_undersize",
+     test_write_header_dst_cap_undersize},
+    {"test_write_footer_dst_cap_undersize",
+     test_write_footer_dst_cap_undersize},
+    {"test_write_index_dst_cap_undersize", test_write_index_dst_cap_undersize},
+    {"test_write_header_magic", test_write_header_magic},
+    {"test_write_header_version", test_write_header_version},
+    {"test_write_header_flags_zero", test_write_header_flags_zero},
+    {"test_write_header_comp_alg", test_write_header_comp_alg},
+    {"test_write_header_hash_alg", test_write_header_hash_alg},
+    {"test_write_header_reserved_zero", test_write_header_reserved_zero},
+    {"test_write_footer_magic_confirm", test_write_footer_magic_confirm},
+    {"test_write_footer_index_offset", test_write_footer_index_offset},
+    {"test_write_index_little_endian", test_write_index_little_endian},
+    {"test_write_empty_file_chunk_count_zero",
+     test_write_empty_file_chunk_count_zero},
+    {"test_write_member_hash_non_file_types",
+     test_write_member_hash_non_file_types},
+    {"test_write_index_hash_matches_footer",
+     test_write_index_hash_matches_footer},
+    {"test_write_member_hash_matches_compressed_bytes",
+     test_write_member_hash_matches_compressed_bytes},
     {"test_thread_stub", test_thread_stub},
     {"test_extract_stub", test_extract_stub},
     {"test_fault_stub", test_fault_stub},
