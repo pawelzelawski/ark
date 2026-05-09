@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (in progress)
-**Next Task:** Phase 5.7 - Verify subcommand
+**Next Task:** Phase 5.9 - Output formatting
 
 ### Phase Summary
 
@@ -571,18 +571,18 @@ pipeline passes end-to-end tests.
 - [x] `--member` flag: print only the specified member; `ARK_ERR_FMT_INDEX`
   if not found
 
-**5.7 - Verify subcommand**
-- [ ] Implement `cmd_verify`: open and validate archive via read path; for
+**5.7 - Verify subcommand** ✓ DONE
+- [x] Implement `cmd_verify`: open and validate archive via read path; for
   each regular member: decompress all chunks into a temporary per-chunk
   buffer and feed compressed bytes into the verification hash; call
   `ark_read_verify_member_final`; report any hash mismatch immediately
 
-**5.8 - generate-reader subcommand**
-- [ ] Implement `src/recovery_template.c`: standalone recovery reader per
+**5.8 - generate-reader subcommand** ✓ DONE
+- [x] Implement `src/recovery_template.c`: standalone recovery reader per
   ARCHITECTURE.md §15; footer parsing, index parsing and hash verification,
   member extraction to current directory; byte-by-byte little-endian field
   reads; no platform dependencies beyond libc; no host-endian struct casts
-- [ ] Implement `cmd_generate_reader`: write the embedded
+- [x] Implement `cmd_generate_reader`: write the embedded
   `recovery_template[]` byte array to the specified output path; use
   libchevron for the write; apply sandbox with write-only policy for output
   path

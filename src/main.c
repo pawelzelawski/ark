@@ -18,6 +18,7 @@
 #include "archive.h"
 #include "ark_internal.h"
 #include "chevron.h"
+#include "recovery_template_data.h"
 
 #ifdef __linux__
 #include <linux/landlock.h>
@@ -130,6 +131,8 @@ static int parent_dir(const char *, char *, size_t, ark_error_t *);
 static int cmd_create(const ark_args_t *, ark_error_t *);
 static int cmd_extract(const ark_args_t *, int, ark_error_t *);
 static int cmd_list(const ark_args_t *, ark_error_t *);
+static int cmd_verify(const ark_args_t *, ark_error_t *);
+static int cmd_generate_reader(const ark_args_t *, ark_error_t *);
 static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
                         uint64_t *, modified_path_list_t *, ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
@@ -453,7 +456,7 @@ static int cmd_create(const ark_args_t *args, ark_error_t *err)
 	ark_write_ctx_t *wctx;
 	chevron_handle_t handle = CHEVRON_HANDLE_INIT;
 	chevron_error_t cerr = {0};
-	modified_path_list_t modified = {0};
+	modified_path_list_t modified = {0 };
 	uint8_t header[16];
 	uint8_t *index_buf = NULL;
 	uint8_t *footer_buf = NULL;
@@ -1319,6 +1322,181 @@ cleanup:
 	free(index_buf);
 	ark_read_free(rctx);
 	return rc;
+}
+
+/*
+ * cmd_verify - Validate archive and verify selected regular members.
+ *
+ * ARCHITECTURE.md section 14.3: verify hashes compressed bytes while
+ * decompressing each chunk into a bounded temporary buffer with no
+ * filesystem writes.
+ */
+static int cmd_verify(const ark_args_t *args, ark_error_t *err)
+{
+	ark_read_ctx_storage_t rstorage = {0};
+	ark_read_ctx_t *rctx;
+	uint8_t *index_buf;
+	unsigned char *selected;
+	uint8_t *comp_buf;
+	uint8_t *decomp_buf;
+	size_t index_len;
+	size_t member_count;
+	size_t comp_cap;
+	int archive_fd;
+	int rc;
+
+	rctx = (ark_read_ctx_t *)rstorage.bytes;
+	index_buf = NULL;
+	selected = NULL;
+	comp_buf = NULL;
+	decomp_buf = NULL;
+	rc = -1;
+
+	archive_fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
+	if (archive_fd == -1)
+		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
+		                  args->archive_path, errno);
+	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
+	                       &index_len, err) != 0)
+		goto cleanup;
+
+	member_count = read_member_count(rctx);
+	selected = (unsigned char *)calloc(member_count + 1U, 1U);
+	if (selected == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "selection allocation failed", "", 0);
+		goto cleanup;
+	}
+	if (build_extract_selection(args, rctx, member_count, selected, err) !=
+	    0)
+		goto cleanup;
+
+	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+	/* OWNERSHIP: command cleanup frees both verification buffers. */
+	comp_buf = (uint8_t *)malloc(comp_cap);
+	decomp_buf = (uint8_t *)malloc(ARK_CHUNK_SIZE);
+	if (comp_buf == NULL || decomp_buf == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "verification buffer allocation failed", "",
+		                 0);
+		goto cleanup;
+	}
+
+	for (uint32_t i = 0U; i < member_count; i++) {
+		const ark_member_meta_t *meta;
+		uint32_t chunk;
+		uint64_t chunk_off;
+
+		if (selected[i] == 0U)
+			continue;
+		meta = ark_read_member_meta(rctx, i);
+		if (meta->type != 0x01)
+			continue;
+
+		if (args->verbose) {
+			if (printf("verify: %s\n", meta->path) < 0) {
+				(void)fail_error(err, ARK_ERR_IO_WRITE,
+				                 "verify output failed", "",
+				                 errno);
+				goto cleanup;
+			}
+		}
+
+		if (ark_read_verify_member_begin(rctx, meta, err) != 0)
+			goto cleanup;
+		chunk_off = meta->data_offset;
+		for (chunk = 0U; chunk < meta->chunk_count; chunk++) {
+			size_t csz;
+
+			csz = (size_t)meta->chunk_sizes[chunk];
+			if (csz > comp_cap) {
+				(void)fail_error(err, ARK_ERR_FMT_INDEX,
+				                 "chunk size exceeds bound",
+				                 meta->path, 0);
+				goto cleanup;
+			}
+			if (ARK_LSEEK(archive_fd, (off_t)chunk_off, SEEK_SET) ==
+			    (off_t)-1) {
+				(void)fail_error(err, ARK_ERR_IO_SEEK,
+				                 "archive seek failed",
+				                 meta->path, errno);
+				goto cleanup;
+			}
+			if (read_full(archive_fd, comp_buf, csz, meta->path,
+			              err) != 0)
+				goto cleanup;
+			/*
+			 * SAFETY: verification hashes compressed bytes in
+			 * on-disk chunk order before decompression. See
+			 * ARCHITECTURE.md section 14.3.
+			 */
+			if (ark_read_verify_member_update(
+			        rctx, meta, chunk, comp_buf, csz, err) != 0)
+				goto cleanup;
+			if (ark_read_chunk(rctx, meta, chunk, comp_buf, csz,
+			                   decomp_buf, ARK_CHUNK_SIZE, err) < 0)
+				goto cleanup;
+			if (UINT64_MAX - chunk_off < (uint64_t)csz) {
+				(void)fail_error(err, ARK_ERR_FMT_INDEX,
+				                 "chunk offset overflow",
+				                 meta->path, 0);
+				goto cleanup;
+			}
+			chunk_off += (uint64_t)csz;
+		}
+		if (ark_read_verify_member_final(rctx, meta, err) != 0)
+			goto cleanup;
+	}
+
+	rc = 0;
+
+cleanup:
+	free(decomp_buf);
+	free(comp_buf);
+	free(selected);
+	free(index_buf);
+	if (ARK_CLOSE(archive_fd) != 0 && rc == 0)
+		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
+		                args->archive_path, errno);
+	(void)index_len;
+	ark_read_free(rctx);
+	return rc;
+}
+
+/*
+ * cmd_generate_reader - Atomically write embedded recovery source output.
+ *
+ * ARCHITECTURE.md sections 10.4 and 15.2 require generate-reader to emit the
+ * embedded template and use libchevron for atomic replacement semantics.
+ */
+static int cmd_generate_reader(const ark_args_t *args, ark_error_t *err)
+{
+	chevron_handle_t handle = CHEVRON_HANDLE_INIT;
+	chevron_error_t cerr = {0};
+	size_t len;
+
+	len = sizeof(recovery_template);
+	/* The awk-emitted string form is NUL-terminated; do not write
+	 * terminator. */
+	len--;
+
+	if (chevron_open(&handle, args->generate_reader_output, CHEVRON_FULL,
+	                 CHEVRON_MODE_DEFAULT, &cerr) != 0)
+		return chevron_error_fail(err, &cerr,
+		                          "generate-reader output open failed",
+		                          args->generate_reader_output);
+
+	if (chevron_write_or_fail(&handle, recovery_template, len,
+	                          args->generate_reader_output, err) != 0) {
+		chevron_abort(&handle);
+		return -1;
+	}
+
+	if (chevron_commit(&handle, &cerr) != 0)
+		return chevron_error_fail(
+		    err, &cerr, "generate-reader output commit failed",
+		    args->generate_reader_output);
+	return 0;
 }
 
 /*
@@ -2870,7 +3048,13 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 		if (unveil(NULL, NULL) != 0)
 			return fail_error(err, ARK_ERR_USAGE,
 			                  "unveil lock failed", "", errno);
-		if (pledge("stdio wpath cpath", NULL) != 0)
+		/*
+		 * NOTE: libchevron opens the output parent directory read-only
+		 * in chevron_open(), so generate-reader requires rpath in
+		 * addition to wpath/cpath under pledge. commit also applies
+		 * ownership/mode (fchown/fchmod), which requires fattr.
+		 */
+		if (pledge("stdio rpath wpath cpath fattr", NULL) != 0)
 			return fail_error(err, ARK_ERR_USAGE, "pledge failed",
 			                  "", errno);
 		return 0;
@@ -3390,6 +3574,51 @@ int main(int argc, char **argv)
 			return exit_code_from_err(err.code);
 		}
 	}
+	if (args.cmd == ARK_CMD_GENERATE_READER) {
+		char parent[PATH_MAX];
+		int parent_fd;
+
+		/*
+		 * ARCHITECTURE.md section 10.4: verify output parent path
+		 * accessibility before sandbox application.
+		 */
+		if (parent_dir(args.generate_reader_output, parent,
+		               sizeof(parent), &err) != 0) {
+			if (err.path[0] != '\0')
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputs(": ", stderr),
+				    (void)fputs(err.path, stderr),
+				    (void)fputc('\n', stderr);
+			else
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputc('\n', stderr);
+			args_free(&args);
+			return exit_code_from_err(err.code);
+		}
+		parent_fd =
+		    ARK_OPEN(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+		if (parent_fd == -1) {
+			(void)fail_error(
+			    &err, ARK_ERR_IO_OPEN,
+			    "generate-reader output parent open failed", parent,
+			    errno);
+			if (err.path[0] != '\0')
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputs(": ", stderr),
+				    (void)fputs(err.path, stderr),
+				    (void)fputc('\n', stderr);
+			else
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputc('\n', stderr);
+			args_free(&args);
+			return exit_code_from_err(err.code);
+		}
+		(void)ARK_CLOSE(parent_fd);
+	}
 
 #if defined(__linux__) || defined(__OpenBSD__)
 	const char *sandbox_dst;
@@ -3433,6 +3662,10 @@ int main(int argc, char **argv)
 		rc = cmd_extract(&args, extract_dest_fd, &err);
 	else if (args.cmd == ARK_CMD_LIST)
 		rc = cmd_list(&args, &err);
+	else if (args.cmd == ARK_CMD_VERIFY)
+		rc = cmd_verify(&args, &err);
+	else if (args.cmd == ARK_CMD_GENERATE_READER)
+		rc = cmd_generate_reader(&args, &err);
 	else
 		rc = 0;
 

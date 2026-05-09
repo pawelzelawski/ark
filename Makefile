@@ -63,7 +63,7 @@ CFLAGS_VG = $(CFLAGS_COMMON)                              \
 INCLUDES = -I. -I./src -I./vendor/libchevron/include -I./$(BUILD_DIR)
 
 APP_SRCS = src/archive.c src/blake3.c src/deflate.c src/main.c \
-	src/recovery_template.c src/sha256.c vendor/libchevron/src/chevron.c
+	src/sha256.c vendor/libchevron/src/chevron.c
 
 CORE_SRCS = src/archive.c src/blake3.c src/deflate.c src/sha256.c \
 	vendor/libchevron/src/chevron.c
@@ -162,7 +162,9 @@ $(TEST_BIN_VG): $(RECOVERY_HEADER) $(CORE_SRCS) $(TEST_SRCS)
 
 $(RECOVERY_HEADER): src/recovery_template.c
 	@mkdir -p $(BUILD_DIR)
-	awk 'BEGIN { print "static const unsigned char recovery_template[] =" } \
-		{ gsub(/\\\\/, "\\\\\\\\"); gsub(/"/, "\\\\\""); \
-		  print "\"" $$0 "\\n\"" } \
-		END { print ";" }' src/recovery_template.c > $(RECOVERY_HEADER)
+	{ \
+		echo "static const unsigned char recovery_template[] = {"; \
+		od -An -v -tx1 src/recovery_template.c | \
+		awk '{ for (i = 1; i <= NF; i++) printf "0x%s,", $$i; print "" }'; \
+		echo "0x00};"; \
+	} > $(RECOVERY_HEADER)

@@ -540,6 +540,12 @@ test verifies the sandbox does not interfere with legitimate operations.
 Sandbox policy is applied in each integration test as it would be in
 production.
 
+OpenBSD-specific note: `generate-reader` uses libchevron atomic commit flow,
+which performs metadata operations (`fchmod`/`fchown`) and read-only parent
+directory access during commit/open; the pledge profile for
+`ARK_CMD_GENERATE_READER` therefore requires `rpath` and `fattr` in addition
+to `stdio wpath cpath`.
+
 **Landlock ABI version detection:** The integration tests on Linux verify
 correct behaviour on the host kernel's Landlock ABI version. No specific
 kernel version is required for the test environment beyond the hard minimum
