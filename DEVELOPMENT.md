@@ -2,9 +2,9 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-08
+**Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (next)
-**Next Task:** Phase 5.1 - Argument parsing
+**Next Task:** Phase 5.2 - Sandbox application
 
 ### Phase Summary
 
@@ -487,14 +487,15 @@ pipeline passes end-to-end tests.
 
 ### Tasks
 
-**5.1 - Argument parsing**
-- [ ] Implement `parse_args` in `main.c`: parse subcommand, flags, and
+**5.1 - Argument parsing** ✓ DONE
+- [x] Implement `parse_args` in `main.c`: parse subcommand, flags, and
   operands; validate required arguments; populate an `ark_args_t` struct;
   return `ARK_ERR_USAGE` with a descriptive message on invalid invocation
-- [ ] Subcommands: `create`, `extract`, `list`, `verify`, `generate-reader`
-- [ ] Flags: `--hash` (blake3 | sha256), `--overwrite`, `--member`,
+- [x] Subcommands: `create`, `extract`, `list`, `verify`, `generate-reader`
+- [x] Flags: `--hash` (blake3 | sha256), `--overwrite`, `--member`,
   `--output`, `--fast`, `--verbose`, `--human`; flag interactions validated
-- [ ] `print_usage()` emits synopsis to stderr and exits 1
+- [x] `print_usage()` emits one-line invocation error detail to stderr,
+  followed by `See man ark for usage.`, and exits 1
 
 **5.2 - Sandbox application**
 - [ ] Implement `sandbox_apply(subcommand, src_path, dst_path)` in `main.c`
