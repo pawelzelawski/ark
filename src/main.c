@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
+#include <time.h>
 
 #include "archive.h"
 #include "ark_internal.h"
@@ -192,8 +194,12 @@ static void decode_mtime(uint64_t, struct timespec[2]);
 static int restore_regular_meta(int, const ark_member_meta_t *, ark_error_t *);
 static void restore_symlink_meta(int, const ark_member_meta_t *);
 static void apply_deferred_dir_meta(int, const dir_deferred_meta_t *);
-static int print_member_row(const ark_member_meta_t *);
-static void print_warning_path(const char *, const char *);
+static void print_error(const ark_error_t *);
+static void print_warning(const char *, const char *);
+static int print_member(const ark_member_meta_t *, int, int);
+static void format_u64_dec(uint64_t, char *, size_t);
+static void format_size_human(uint64_t, char *, size_t);
+static void format_mtime_human(uint64_t, char *, size_t);
 
 #ifdef __linux__
 static uint64_t landlock_read_rights(void);
@@ -269,8 +275,10 @@ static void print_modified_summary(const modified_path_list_t *list)
 {
 	size_t i;
 
+	syslog(LOG_ERR, "source files modified during archiving");
 	(void)fputs("ark: source files modified during archiving:\n", stderr);
 	for (i = 0U; i < list->count; i++) {
+		syslog(LOG_ERR, "%s", list->paths[i]);
 		(void)fputs("ark:   ", stderr);
 		(void)fputs(list->paths[i], stderr);
 		(void)fputc('\n', stderr);
@@ -456,7 +464,7 @@ static int cmd_create(const ark_args_t *args, ark_error_t *err)
 	ark_write_ctx_t *wctx;
 	chevron_handle_t handle = CHEVRON_HANDLE_INIT;
 	chevron_error_t cerr = {0};
-	modified_path_list_t modified = {0 };
+	modified_path_list_t modified = {0};
 	uint8_t header[16];
 	uint8_t *index_buf = NULL;
 	uint8_t *footer_buf = NULL;
@@ -920,8 +928,10 @@ static int preflight_conflicts(const ark_args_t *args,
 	if (conflicts.count > 0U) {
 		size_t j;
 
+		syslog(LOG_ERR, "extraction conflicts found");
 		(void)fputs("ark: extraction conflicts found:\n", stderr);
 		for (j = 0U; j < conflicts.count; j++) {
+			syslog(LOG_ERR, "%s", conflicts.paths[j]);
 			(void)fputs("ark:   ", stderr);
 			(void)fputs(conflicts.paths[j], stderr);
 			(void)fputc('\n', stderr);
@@ -983,8 +993,8 @@ static void cleanup_run(cleanup_tracker_t *tracker, int dest_fd)
 		if (ARK_UNLINKAT(dest_fd, tracker->entries[i].path, flags) !=
 		        0 &&
 		    errno != ENOENT)
-			print_warning_path("cleanup failed",
-			                   tracker->entries[i].path);
+			print_warning("cleanup failed",
+			              tracker->entries[i].path);
 	}
 }
 
@@ -1132,8 +1142,8 @@ static int restore_regular_meta(int fd, const ark_member_meta_t *meta,
 			return fail_error(err, ARK_ERR_IO_CHOWN,
 			                  "fchown failed", meta->path, errno);
 		if (rc != 0 && errno == EPERM)
-			print_warning_path("ownership restore not permitted",
-			                   meta->path);
+			print_warning("ownership restore not permitted",
+			              meta->path);
 	}
 	do {
 		rc = ARK_FCHMOD(fd, (mode_t)(meta->mode & 0777U));
@@ -1166,15 +1176,15 @@ static void restore_symlink_meta(int dest_fd, const ark_member_meta_t *meta)
 			                 (gid_t)meta->gid, AT_SYMLINK_NOFOLLOW);
 		} while (rc != 0 && errno == EINTR);
 		if (rc != 0)
-			print_warning_path("symlink ownership restore failed",
-			                   meta->path);
+			print_warning("symlink ownership restore failed",
+			              meta->path);
 	}
 	do {
 		rc = ARK_UTIMENSAT(dest_fd, meta->path, times,
 		                   AT_SYMLINK_NOFOLLOW);
 	} while (rc != 0 && errno == EINTR);
 	if (rc != 0)
-		print_warning_path("symlink mtime restore failed", meta->path);
+		print_warning("symlink mtime restore failed", meta->path);
 }
 
 /*
@@ -1199,7 +1209,7 @@ static void apply_deferred_dir_meta(int dest_fd,
 				                  (gid_t)meta->gid, 0);
 			} while (rc != 0 && errno == EINTR);
 			if (rc != 0)
-				print_warning_path(
+				print_warning(
 				    "directory ownership restore failed",
 				    meta->path);
 		}
@@ -1208,23 +1218,145 @@ static void apply_deferred_dir_meta(int dest_fd,
 			                  (mode_t)(meta->mode & 0777U), 0);
 		} while (rc != 0 && errno == EINTR);
 		if (rc != 0)
-			print_warning_path("directory mode restore failed",
-			                   meta->path);
+			print_warning("directory mode restore failed",
+			              meta->path);
 		do {
 			rc = ARK_UTIMENSAT(dest_fd, meta->path, times, 0);
 		} while (rc != 0 && errno == EINTR);
 		if (rc != 0)
-			print_warning_path("directory mtime restore failed",
-			                   meta->path);
+			print_warning("directory mtime restore failed",
+			              meta->path);
 	}
 }
 
 /*
- * print_member_row - Print one fixed-column list output row.
+ * format_u64_dec - Convert unsigned 64-bit value to decimal C string.
  */
-static int print_member_row(const ark_member_meta_t *meta)
+static void format_u64_dec(uint64_t value, char *out, size_t out_len)
+{
+	char tmp[32];
+	size_t i;
+	size_t j;
+
+	if (out_len == 0U)
+		return;
+	if (value == 0U) {
+		out[0] = '0';
+		if (out_len > 1U)
+			out[1] = '\0';
+		return;
+	}
+
+	i = 0U;
+	while (value > 0U && i < sizeof(tmp) - 1U) {
+		tmp[i++] = (char)('0' + (value % 10U));
+		value /= 10U;
+	}
+
+	j = 0U;
+	while (i > 0U && j + 1U < out_len)
+		out[j++] = tmp[--i];
+	out[j] = '\0';
+}
+
+/*
+ * format_size_human - Render a list size field using B/KB/MB/GB units.
+ */
+static void format_size_human(uint64_t bytes, char *out, size_t out_len)
+{
+	const char *unit_str;
+	char whole_buf[32];
+	unsigned int unit;
+	uint64_t div;
+	uint64_t whole;
+	uint64_t rem;
+	uint64_t frac;
+	size_t off;
+
+	unit = 0U;
+	div = 1U;
+	while ((bytes / div) >= 1024U && unit < 3U) {
+		div *= 1024U;
+		unit++;
+	}
+
+	if (unit == 0U) {
+		format_u64_dec(bytes, out, out_len);
+		off = strlen(out);
+		if (off + 1U < out_len) {
+			out[off++] = 'B';
+			out[off] = '\0';
+		}
+		return;
+	}
+
+	if (unit == 1U)
+		unit_str = "KB";
+	else if (unit == 2U)
+		unit_str = "MB";
+	else
+		unit_str = "GB";
+
+	whole = bytes / div;
+	rem = bytes % div;
+	frac = ((rem * 10U) + (div / 2U)) / div;
+	if (frac >= 10U) {
+		whole++;
+		frac = 0U;
+	}
+
+	format_u64_dec(whole, whole_buf, sizeof(whole_buf));
+	copy_msg(out, out_len, whole_buf);
+	off = strlen(out);
+	if (off + 1U < out_len) {
+		out[off++] = '.';
+		out[off++] = (char)('0' + frac);
+		out[off] = '\0';
+	}
+	if (off + strlen(unit_str) < out_len)
+		copy_msg(out + off, out_len - off, unit_str);
+}
+
+/*
+ * format_mtime_human - Render archive nanosecond timestamp as UTC text.
+ *
+ * NOTE: Human mtime formatting is used only for list --human output. See
+ * ARCHITECTURE.md section 12.2.
+ */
+static void format_mtime_human(uint64_t mtime, char *out, size_t out_len)
+{
+	int64_t ns_total;
+	int64_t sec;
+	time_t tv_sec;
+	struct tm tm;
+
+	ns_total = (int64_t)mtime;
+	sec = ns_total / INT64_C(1000000000);
+	if ((ns_total % INT64_C(1000000000)) < 0)
+		sec--;
+	tv_sec = (time_t)sec;
+	if ((int64_t)tv_sec != sec || gmtime_r(&tv_sec, &tm) == NULL) {
+		copy_msg(out, out_len, "invalid-time");
+		return;
+	}
+	if (strftime(out, out_len, "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+		copy_msg(out, out_len, "invalid-time");
+}
+
+/*
+ * print_member - Print one list row according to --verbose/--human flags.
+ *
+ * ARCHITECTURE.md section 12.2 defines these list output modes:
+ * - default: path only
+ * - --verbose: type, size, mode, mtime, path
+ * - --human: same columns with human-readable size and mtime
+ */
+static int print_member(const ark_member_meta_t *meta, int verbose, int human)
 {
 	const char *type;
+
+	if (!verbose)
+		return printf("%s\n", meta->path) < 0 ? -1 : 0;
 
 	switch (meta->type) {
 	case 0x01:
@@ -1243,6 +1375,21 @@ static int print_member_row(const ark_member_meta_t *meta)
 		type = "unknown";
 		break;
 	}
+
+	if (human) {
+		char size_buf[32];
+		char mtime_buf[64];
+
+		format_size_human(meta->size_original, size_buf,
+		                  sizeof(size_buf));
+		format_mtime_human(meta->mtime, mtime_buf, sizeof(mtime_buf));
+		if (printf("%-8s %12s %04o %20s %s\n", type, size_buf,
+		           (unsigned int)(meta->mode & 0777U), mtime_buf,
+		           meta->path) < 0)
+			return -1;
+		return 0;
+	}
+
 	if (printf("%-8s %12llu %04o %20llu %s\n", type,
 	           (unsigned long long)meta->size_original,
 	           (unsigned int)(meta->mode & 0777U),
@@ -1273,6 +1420,9 @@ static int cmd_list(const ark_args_t *args, ark_error_t *err)
 	                       &(size_t){0}, err) != 0)
 		goto cleanup;
 
+	if (args->human && !args->verbose)
+		print_warning("--human ignored without --verbose", "");
+
 	if (args->member_count == 0U) {
 		size_t i;
 
@@ -1282,7 +1432,8 @@ static int cmd_list(const ark_args_t *args, ark_error_t *err)
 			meta = ark_read_member_meta(rctx, (uint32_t)i);
 			if (meta == NULL)
 				break;
-			if (print_member_row(meta) != 0) {
+			if (print_member(meta, args->verbose, args->human) !=
+			    0) {
 				(void)fail_error(err, ARK_ERR_IO_WRITE,
 				                 "list output failed", "",
 				                 errno);
@@ -1305,7 +1456,8 @@ static int cmd_list(const ark_args_t *args, ark_error_t *err)
 				goto cleanup;
 			}
 			meta = ark_read_member_meta(rctx, pos);
-			if (print_member_row(meta) != 0) {
+			if (print_member(meta, args->verbose, args->human) !=
+			    0) {
 				(void)fail_error(err, ARK_ERR_IO_WRITE,
 				                 "list output failed", "",
 				                 errno);
@@ -1966,15 +2118,19 @@ static int parent_dir(const char *path, char *dst, size_t dst_len,
 }
 
 /*
- * print_warning_path - Emit a traversal warning for one path.
+ * print_warning - Emit warning text to stderr and syslog.
  *
- * Phase 5.9 replaces this local formatter with the shared warning/syslog
- * path. This helper is intentionally small so Phase 5.3 can report skipped
- * traversal entries required by ARCHITECTURE.md section 13.
+ * ARCHITECTURE.md section 11 requires yellow ANSI warnings on TTY stderr.
+ * TECH_STACK.md section 3.5 requires diagnostic mirroring to syslog.
  */
-static void print_warning_path(const char *msg, const char *path)
+static void print_warning(const char *msg, const char *path)
 {
 	int color;
+
+	if (path != NULL && path[0] != '\0')
+		syslog(LOG_WARNING, "%s: %s", msg, path);
+	else
+		syslog(LOG_WARNING, "%s", msg);
 
 	color = isatty(STDERR_FILENO);
 	if (color)
@@ -1984,6 +2140,48 @@ static void print_warning_path(const char *msg, const char *path)
 	if (path != NULL && path[0] != '\0') {
 		(void)fputs(": ", stderr);
 		(void)fputs(path, stderr);
+	}
+	if (color)
+		(void)fputs("\033[0m", stderr);
+	(void)fputc('\n', stderr);
+}
+
+/*
+ * print_error - Emit ark_error_t to stderr and syslog.
+ *
+ * ARCHITECTURE.md section 11 requires red ANSI errors on TTY stderr.
+ */
+static void print_error(const ark_error_t *err)
+{
+	int color;
+
+	if (err == NULL)
+		return;
+
+	if (err->path[0] != '\0' && err->sys_errno != 0)
+		syslog(LOG_ERR, "%s: %s (errno=%d: %s)", err->msg, err->path,
+		       err->sys_errno, strerror(err->sys_errno));
+	else if (err->path[0] != '\0')
+		syslog(LOG_ERR, "%s: %s", err->msg, err->path);
+	else if (err->sys_errno != 0)
+		syslog(LOG_ERR, "%s (errno=%d: %s)", err->msg, err->sys_errno,
+		       strerror(err->sys_errno));
+	else
+		syslog(LOG_ERR, "%s", err->msg);
+
+	color = isatty(STDERR_FILENO);
+	if (color)
+		(void)fputs("\033[31m", stderr);
+	(void)fputs("ark: ", stderr);
+	(void)fputs(err->msg, stderr);
+	if (err->path[0] != '\0') {
+		(void)fputs(": ", stderr);
+		(void)fputs(err->path, stderr);
+	}
+	if (err->sys_errno != 0) {
+		(void)fputs(" (", stderr);
+		(void)fputs(strerror(err->sys_errno), stderr);
+		(void)fputc(')', stderr);
 	}
 	if (color)
 		(void)fputs("\033[0m", stderr);
@@ -2330,7 +2528,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	fd = ARK_OPEN(abs_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
 	if (fd == -1) {
 		if (errno == EACCES || errno == EPERM) {
-			print_warning_path("permission denied", abs_path);
+			print_warning("permission denied", abs_path);
 			ctx->permission_error = 1;
 			return 0;
 		}
@@ -2419,8 +2617,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	if (meta_sb.st_size != sb->st_size ||
 	    meta_sb.st_mtim.tv_sec != sb->st_mtim.tv_sec ||
 	    meta_sb.st_mtim.tv_nsec != sb->st_mtim.tv_nsec) {
-		print_warning_path("source file modified during read",
-		                   abs_path);
+		print_warning("source file modified during read", abs_path);
 		if (modified_path_list_push(ctx->modified_paths, abs_path,
 		                            err) != 0) {
 			rc = -1;
@@ -2656,7 +2853,7 @@ static int traverse_directory_abs(traverse_ctx_t *ctx, const char *abs_path,
 	(void)member_path;
 	rc = dir_entries_collect(abs_path, &list, err);
 	if (rc == 1) {
-		print_warning_path("permission denied", abs_path);
+		print_warning("permission denied", abs_path);
 		ctx->permission_error = 1;
 		return 0;
 	}
@@ -2696,7 +2893,7 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
 	/* SAFETY: lstat classifies the entry without following symlinks. */
 	if (ARK_LSTAT(abs_path, &sb) != 0) {
 		if (errno == EACCES || errno == EPERM) {
-			print_warning_path("permission denied", abs_path);
+			print_warning("permission denied", abs_path);
 			ctx->permission_error = 1;
 			return 0;
 		}
@@ -2711,7 +2908,7 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
 		 * section 13.7.
 		 */
 		if (sb.st_dev != ctx->root_dev) {
-			print_warning_path("skipping mount point", abs_path);
+			print_warning("skipping mount point", abs_path);
 			return 0;
 		}
 		if (member_meta_init(&meta, 0x02U, member_path, &sb, err) != 0)
@@ -2745,7 +2942,7 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
 
 	/* ARCHITECTURE.md section 13.9: unsupported special objects are
 	 * skipped. */
-	print_warning_path("skipping special filesystem object", abs_path);
+	print_warning("skipping special filesystem object", abs_path);
 	return 0;
 }
 
@@ -3524,12 +3721,17 @@ fail:
  */
 static void print_usage(const char *problem)
 {
-	if (problem != NULL && problem[0] != '\0')
+	if (problem != NULL && problem[0] != '\0') {
+		syslog(LOG_ERR, "%s", problem);
 		(void)fputs("ark: ", stderr), (void)fputs(problem, stderr),
 		    (void)fputc('\n', stderr);
-	else
+	} else {
+		syslog(LOG_ERR, "invalid invocation");
 		(void)fputs("ark: invalid invocation\n", stderr);
+	}
+	syslog(LOG_ERR, "See man ark for usage.");
 	(void)fputs("See man ark for usage.\n", stderr);
+	closelog();
 	exit(1);
 }
 
@@ -3541,11 +3743,13 @@ int main(int argc, char **argv)
 	int rc;
 
 	extract_dest_fd = -1;
+	openlog("ark", LOG_PID, LOG_USER);
 
 	if (parse_args(argc, argv, &args, &err) != 0) {
 		if (err.code == ARK_ERR_USAGE)
 			print_usage(err.msg);
-		(void)fputs("ark: argument parsing failed\n", stderr);
+		print_error(&err);
+		closelog();
 		return 1;
 	}
 
@@ -3560,17 +3764,9 @@ int main(int argc, char **argv)
 			(void)fail_error(&err, ARK_ERR_IO_OPEN,
 			                 "output directory open failed",
 			                 args.output_path, errno);
-			if (err.path[0] != '\0')
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputs(": ", stderr),
-				    (void)fputs(err.path, stderr),
-				    (void)fputc('\n', stderr);
-			else
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputc('\n', stderr);
+			print_error(&err);
 			args_free(&args);
+			closelog();
 			return exit_code_from_err(err.code);
 		}
 	}
@@ -3584,17 +3780,9 @@ int main(int argc, char **argv)
 		 */
 		if (parent_dir(args.generate_reader_output, parent,
 		               sizeof(parent), &err) != 0) {
-			if (err.path[0] != '\0')
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputs(": ", stderr),
-				    (void)fputs(err.path, stderr),
-				    (void)fputc('\n', stderr);
-			else
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputc('\n', stderr);
+			print_error(&err);
 			args_free(&args);
+			closelog();
 			return exit_code_from_err(err.code);
 		}
 		parent_fd =
@@ -3604,17 +3792,9 @@ int main(int argc, char **argv)
 			    &err, ARK_ERR_IO_OPEN,
 			    "generate-reader output parent open failed", parent,
 			    errno);
-			if (err.path[0] != '\0')
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputs(": ", stderr),
-				    (void)fputs(err.path, stderr),
-				    (void)fputc('\n', stderr);
-			else
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputc('\n', stderr);
+			print_error(&err);
 			args_free(&args);
+			closelog();
 			return exit_code_from_err(err.code);
 		}
 		(void)ARK_CLOSE(parent_fd);
@@ -3639,19 +3819,11 @@ int main(int argc, char **argv)
 	                  sandbox_dst, &err) != 0) {
 		if (err.code == ARK_ERR_USAGE)
 			print_usage(err.msg);
-		if (err.path[0] != '\0')
-			(void)fputs("ark: ", stderr),
-			    (void)fputs(err.msg, stderr),
-			    (void)fputs(": ", stderr),
-			    (void)fputs(err.path, stderr),
-			    (void)fputc('\n', stderr);
-		else
-			(void)fputs("ark: ", stderr),
-			    (void)fputs(err.msg, stderr),
-			    (void)fputc('\n', stderr);
+		print_error(&err);
 		args_free(&args);
 		if (extract_dest_fd != -1)
 			(void)ARK_CLOSE(extract_dest_fd);
+		closelog();
 		return 1;
 	}
 #endif
@@ -3670,24 +3842,17 @@ int main(int argc, char **argv)
 		rc = 0;
 
 	if (rc != 0) {
-		if (err.path[0] != '\0')
-			(void)fputs("ark: ", stderr),
-			    (void)fputs(err.msg, stderr),
-			    (void)fputs(": ", stderr),
-			    (void)fputs(err.path, stderr),
-			    (void)fputc('\n', stderr);
-		else
-			(void)fputs("ark: ", stderr),
-			    (void)fputs(err.msg, stderr),
-			    (void)fputc('\n', stderr);
+		print_error(&err);
 		args_free(&args);
 		if (extract_dest_fd != -1)
 			(void)ARK_CLOSE(extract_dest_fd);
+		closelog();
 		return exit_code_from_err(err.code);
 	}
 
 	args_free(&args);
 	if (extract_dest_fd != -1)
 		(void)ARK_CLOSE(extract_dest_fd);
+	closelog();
 	return 0;
 }

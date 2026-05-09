@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (in progress)
-**Next Task:** Phase 5.9 - Output formatting
+**Next Task:** Phase 5.10 - Extraction and fault tests
 
 ### Phase Summary
 
@@ -587,13 +587,13 @@ pipeline passes end-to-end tests.
   libchevron for the write; apply sandbox with write-only policy for output
   path
 
-**5.9 - Output formatting**
-- [ ] Implement `print_error`: format `ark_error_t` to stderr with ANSI
+**5.9 - Output formatting** ✓ DONE
+- [x] Implement `print_error`: format `ark_error_t` to stderr with ANSI
   colour when `isatty(STDERR_FILENO)` is true; red for errors
-- [ ] Implement `print_warning`: yellow warning line to stderr with terminal
+- [x] Implement `print_warning`: yellow warning line to stderr with terminal
   detection
-- [ ] Implement `print_member`: one formatted row for list output
-- [ ] All messages to syslog via `openlog`/`syslog`/`closelog` in addition
+- [x] Implement `print_member`: one formatted row for list output
+- [x] All messages to syslog via `openlog`/`syslog`/`closelog` in addition
   to stderr
 
 **5.10 - Extraction and fault tests**
