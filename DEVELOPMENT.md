@@ -3,7 +3,7 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-09
-**Current Phase:** Phase 5 - CLI: core operations (in progress)
+**Current Phase:** Phase 6 - Thread pool (in progress)
 **Next Task:** Phase 6.1 - Ring buffer
 
 ### Phase Summary
@@ -14,7 +14,7 @@
 | 2 | Cryptographic components | DONE | 2.1-2.4 complete | sha256, blake3 against official test vectors |
 | 3 | Deflate component | DONE | 3.1-3.4 complete | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
-| 5 | CLI: core operations | NOT STARTED | - | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
+| 5 | CLI: core operations | DONE | 5.1-5.10 complete | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | NOT STARTED | - | Ring buffer, workers, cancellation, error propagation; TSan required |
 | 7 | Test suite completion | NOT STARTED | - | Integration tests, coverage verification |
 | 8 | Hardening and release | NOT STARTED | - | Valgrind, TSan final, static analysis, README |
@@ -31,21 +31,21 @@
 | M6 | Deflate bound: ark_deflate_bound holds for all inputs including incompressible | DONE |
 | M7 | Archive format: all sixteen §8.3 checks individually reject crafted malformed archives | DONE |
 | M8 | Archive format: write state machine enforced; all invalid transitions return ARK_ERR_USAGE | DONE |
-| M9 | Single-threaded create produces valid, verifiable archive | NOT STARTED |
-| M10 | Single-threaded extract round-trip: extracted content byte-identical to source | NOT STARTED |
-| M11 | Sandboxing: all subcommands operate correctly under pledge/unveil on OpenBSD | NOT STARTED |
-| M12 | Sandboxing: all subcommands operate correctly under Landlock on Linux 5.13+ | NOT STARTED |
+| M9 | Single-threaded create produces valid, verifiable archive | DONE |
+| M10 | Single-threaded extract round-trip: extracted content byte-identical to source | DONE |
+| M11 | Sandboxing: all subcommands operate correctly under pledge/unveil on OpenBSD | DONE |
+| M12 | Sandboxing: all subcommands operate correctly under Landlock on Linux 5.13+ | DONE |
 | M13 | Thread pool: no deadlock on worker error (ring buffer abort sentinel unblocks I/O thread) | NOT STARTED |
 | M14 | Thread pool: TSan clean | NOT STARTED |
 | M15 | Parallel create: output bit-identical to single-threaded create on same input | NOT STARTED |
 | M16 | Fault injection: every create sequence step covered with forced failure | NOT STARTED |
 | M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
 | M18 | All sixteen §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
-| M19 | Pre-epoch mtime: stored and restored; tv_nsec normalised to [0, 999999999] | NOT STARTED |
+| M19 | Pre-epoch mtime: stored and restored; tv_nsec normalised to [0, 999999999] | DONE |
 | M20 | Empty file: chunk_count=0 accepted; empty file extracted correctly | DONE |
 | M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
-| M22 | --overwrite: existing target unlinked before open; no stale tail bytes | NOT STARTED |
-| M23 | Cleanup: all filesystem objects removed after any fatal extraction error, including implicitly created dirs | NOT STARTED |
+| M22 | --overwrite: existing target unlinked before open; no stale tail bytes | DONE |
+| M23 | Cleanup: all filesystem objects removed after any fatal extraction error, including implicitly created dirs | DONE |
 | M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly (Phase 7 integration) | NOT STARTED |
 | M25 | Deterministic archives: identical source content archived twice produces bit-identical archives (Phase 7 integration) | NOT STARTED |
 | M26 | Valgrind clean on Linux x86_64 and ARM64 | NOT STARTED |
@@ -609,13 +609,13 @@ pipeline passes end-to-end tests.
 
 ### Phase 5 Completion Criteria
 
-- [ ] All five subcommands work correctly end-to-end (single-threaded)
-- [ ] Sandboxing applied correctly on both platforms; no sandbox interference
+- [x] All five subcommands work correctly end-to-end (single-threaded)
+- [x] Sandboxing applied correctly on both platforms; no sandbox interference
   with legitimate operations
-- [ ] All extraction and fault tests pass on Linux
-- [ ] All tests pass on OpenBSD
-- [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M9, M10, M11, M12, M19, M22, M23 confirmed
+- [x] All extraction and fault tests pass on Linux
+- [x] All tests pass on OpenBSD
+- [x] Valgrind clean; ASan/UBSan clean on Linux
+- [x] Quality milestones M9, M10, M11, M12, M19, M22, M23 confirmed
 
 ---
 

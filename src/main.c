@@ -3046,8 +3046,17 @@ static uint64_t landlock_create_rights(int abi)
 {
 	uint64_t rights;
 
+	/*
+	 * libchevron commit uses rename + temp cleanup in output parent, so
+	 * create needs REFER and REMOVE_FILE in addition to write/create
+	 * rights. See ARCHITECTURE.md section 10.4.
+	 */
 	rights = landlock_read_rights() | LANDLOCK_ACCESS_FS_WRITE_FILE |
-	         LANDLOCK_ACCESS_FS_MAKE_REG;
+	         LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG;
+#ifdef LANDLOCK_ACCESS_FS_REFER
+	if (abi >= 2)
+		rights |= LANDLOCK_ACCESS_FS_REFER;
+#endif
 #ifdef LANDLOCK_ACCESS_FS_TRUNCATE
 	if (abi >= 3)
 		rights |= LANDLOCK_ACCESS_FS_TRUNCATE;
@@ -3087,10 +3096,13 @@ static uint64_t landlock_extract_rights(int abi)
  */
 static int landlock_detect_abi(ark_error_t *err)
 {
-	struct landlock_ruleset_attr attr = {0};
 	int abi;
 
-	abi = (int)syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr),
+	/*
+	 * Linux ABI contract: LANDLOCK_CREATE_RULESET_VERSION probe requires
+	 * attr=NULL and size=0, otherwise EINVAL even when Landlock exists.
+	 */
+	abi = (int)syscall(SYS_landlock_create_ruleset, (void *)0, 0,
 	                   LANDLOCK_CREATE_RULESET_VERSION);
 	if (abi < 1)
 		return fail_error(err, ARK_ERR_USAGE,
@@ -3328,7 +3340,12 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 			                  "extract paths missing for sandbox",
 			                  "", 0);
 		}
-		if (landlock_add_path_rule(ruleset_fd, archive_path,
+		if (parent_dir(archive_path, parent, sizeof(parent), err) !=
+		    0) {
+			(void)ARK_CLOSE(ruleset_fd);
+			return -1;
+		}
+		if (landlock_add_path_rule(ruleset_fd, parent,
 		                           landlock_read_rights(), err) != 0) {
 			(void)ARK_CLOSE(ruleset_fd);
 			return -1;
@@ -3348,7 +3365,12 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 			                  "archive path missing for sandbox",
 			                  "", 0);
 		}
-		if (landlock_add_path_rule(ruleset_fd, archive_path,
+		if (parent_dir(archive_path, parent, sizeof(parent), err) !=
+		    0) {
+			(void)ARK_CLOSE(ruleset_fd);
+			return -1;
+		}
+		if (landlock_add_path_rule(ruleset_fd, parent,
 		                           landlock_read_rights(), err) != 0) {
 			(void)ARK_CLOSE(ruleset_fd);
 			return -1;
