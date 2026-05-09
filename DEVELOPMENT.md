@@ -3,8 +3,8 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-09
-**Current Phase:** Phase 5 - CLI: core operations (next)
-**Next Task:** Phase 5.4 - Create subcommand
+**Current Phase:** Phase 5 - CLI: core operations (in progress)
+**Next Task:** Phase 5.5 - Extract subcommand
 
 ### Phase Summary
 
@@ -528,17 +528,17 @@ pipeline passes end-to-end tests.
   `traverse_entry` for regular file chunks; call `ark_write_chunk` with the
   compressed result; no ring buffer, no worker threads yet
 
-**5.4 - Create subcommand**
-- [ ] Implement `cmd_create`: parse source paths and output path; initialise
+**5.4 - Create subcommand** ✓ DONE
+- [x] Implement `cmd_create`: parse source paths and output path; initialise
   libchevron handle with `CHEVRON_FULL` durability; call `ark_write_init`,
   `ark_write_header`; run traversal; call `ark_write_index`,
   `ark_write_footer`; call `chevron_commit` on success or `chevron_abort`
   on any error; serialise index and footer into a malloc'd buffer before
   passing to `chevron_write_chunk`
-- [ ] Source modification detection per §13.4: record `st_mtime` of each
+- [x] Source modification detection per §13.4: record `st_mtime` of each
   regular file before opening; verify it has not changed after reading;
   `ARK_ERR_MODIFIED` on mismatch
-- [ ] Multiple source arguments: each argument is a separate archive root;
+- [x] Multiple source arguments: each argument is a separate archive root;
   traversed in order
 
 **5.5 - Extract subcommand**

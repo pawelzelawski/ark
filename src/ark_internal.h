@@ -24,6 +24,7 @@ enum ark_fault_which {
 	ARK_FAULT_WRITE,
 	ARK_FAULT_OPEN,
 	ARK_FAULT_CLOSE,
+	ARK_FAULT_FSTAT,
 	ARK_FAULT_LSTAT,
 	ARK_FAULT_UNLINK,
 	ARK_FAULT_RMDIR,
@@ -47,6 +48,7 @@ typedef struct ark_fault {
 	int write_calls;
 	int open_calls;
 	int close_calls;
+	int fstat_calls;
 	int lstat_calls;
 	int unlink_calls;
 	int rmdir_calls;
@@ -71,6 +73,7 @@ ssize_t ark_stub_read(int fd, void *buf, size_t count);
 ssize_t ark_stub_write(int fd, const void *buf, size_t count);
 int ark_stub_open(const char *path, int flags, ...);
 int ark_stub_close(int fd);
+int ark_stub_fstat(int fd, struct stat *sb);
 int ark_stub_lstat(const char *path, struct stat *sb);
 int ark_stub_unlink(const char *path);
 int ark_stub_rmdir(const char *path);
@@ -90,6 +93,7 @@ ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
 #define ARK_WRITE ark_stub_write
 #define ARK_OPEN ark_stub_open
 #define ARK_CLOSE ark_stub_close
+#define ARK_FSTAT ark_stub_fstat
 #define ARK_LSTAT ark_stub_lstat
 #define ARK_UNLINK ark_stub_unlink
 #define ARK_RMDIR ark_stub_rmdir
@@ -110,6 +114,7 @@ ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
 #define ARK_WRITE write
 #define ARK_OPEN open
 #define ARK_CLOSE close
+#define ARK_FSTAT fstat
 #define ARK_LSTAT lstat
 #define ARK_UNLINK unlink
 #define ARK_RMDIR rmdir

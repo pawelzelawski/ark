@@ -78,16 +78,23 @@ typedef struct {
 } dir_entry_list_t;
 
 typedef struct {
+	char **paths;
+	size_t count;
+	size_t capacity;
+} modified_path_list_t;
+
+typedef struct {
 	char root[PATH_MAX];
 	dev_t root_dev;
 	ark_write_ctx_t *write_ctx;
 	chevron_handle_t *chev_handle;
+	modified_path_list_t *modified_paths;
 	inode_table_t inodes;
 	uint8_t *input_buf;
 	uint8_t *comp_buf;
 	uint8_t *write_buf;
 	size_t comp_cap;
-	uint64_t output_offset;
+	uint64_t *output_offset;
 	int permission_error;
 } traverse_ctx_t;
 
@@ -103,8 +110,9 @@ static int push_member(ark_args_t *, const char *, int, ark_error_t *);
 static void print_usage(const char *);
 static void copy_msg(char *, size_t, const char *);
 static int parent_dir(const char *, char *, size_t, ark_error_t *);
-int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
-                 ark_error_t *);
+static int cmd_create(const ark_args_t *, ark_error_t *);
+static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
+                        uint64_t *, modified_path_list_t *, ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
                           ark_error_t *);
 static int traverse_directory_abs(traverse_ctx_t *, const char *, const char *,
@@ -113,6 +121,8 @@ static int emit_regular_file(traverse_ctx_t *, const char *, const char *,
                              const struct stat *, ark_error_t *);
 static int emit_nonfile_member(traverse_ctx_t *, const ark_member_meta_t *,
                                ark_error_t *);
+static int chevron_write_or_fail(chevron_handle_t *, const void *, size_t,
+                                 const char *, ark_error_t *);
 static int emit_symlink_member(traverse_ctx_t *, const char *, const char *,
                                const struct stat *, ark_error_t *);
 static int inode_table_init(inode_table_t *, ark_error_t *);
@@ -122,6 +132,20 @@ static int inode_table_insert(inode_table_t *, dev_t, ino_t, const char *,
                               ark_error_t *);
 static int sandbox_apply(ark_cmd_t, const char **, int, const char *,
                          const char *, ark_error_t *);
+static int modified_path_list_push(modified_path_list_t *, const char *,
+                                   ark_error_t *);
+static void modified_path_list_free(modified_path_list_t *);
+static void print_modified_summary(const modified_path_list_t *);
+static int create_validate_destination_outside_sources(const char *,
+                                                       const char **, size_t,
+                                                       ark_error_t *);
+static int create_serialize_index(ark_write_ctx_t *, uint8_t **, size_t *,
+                                  ark_error_t *);
+static int create_serialize_footer(ark_write_ctx_t *, uint64_t, uint64_t,
+                                   uint8_t **, size_t *, ark_error_t *);
+static int chevron_error_fail(ark_error_t *, const chevron_error_t *,
+                              const char *, const char *);
+static int exit_code_from_err(ark_err_t);
 
 #ifdef __linux__
 static uint64_t landlock_read_rights(void);
@@ -130,6 +154,415 @@ static uint64_t landlock_extract_rights(int);
 static int landlock_detect_abi(ark_error_t *);
 static int landlock_add_path_rule(int, const char *, uint64_t, ark_error_t *);
 #endif
+
+/*
+ * modified_path_list_push - Append one modified-source path.
+ */
+static int modified_path_list_push(modified_path_list_t *list, const char *path,
+                                   ark_error_t *err)
+{
+	char *copy;
+	char **new_paths;
+	size_t len;
+
+	if (list == NULL || path == NULL)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "invalid modified-path tracking argument", "",
+		                  0);
+	if (list->count == list->capacity) {
+		size_t new_cap;
+
+		new_cap = list->capacity == 0U ? 32U : list->capacity * 2U;
+		/* OWNERSHIP: list owns paths and frees them in
+		 * modified_path_list_free. */
+		new_paths = (char **)realloc((void *)list->paths,
+		                             new_cap * sizeof(list->paths[0]));
+		if (new_paths == NULL)
+			return fail_error(
+			    err, ARK_ERR_IO_ALLOC,
+			    "modified-path list allocation failed", "", 0);
+		list->paths = new_paths;
+		list->capacity = new_cap;
+	}
+	len = strlen(path);
+	/* OWNERSHIP: list entry copy is owned by list and freed at cleanup. */
+	copy = (char *)calloc(len + 1U, 1U);
+	if (copy == NULL)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "modified-path copy allocation failed", "",
+		                  0);
+	copy_msg(copy, len + 1U, path);
+	list->paths[list->count++] = copy;
+	return 0;
+}
+
+/*
+ * modified_path_list_free - Release all source-modification path entries.
+ */
+static void modified_path_list_free(modified_path_list_t *list)
+{
+	size_t i;
+
+	for (i = 0U; i < list->count; i++)
+		free(list->paths[i]);
+	free((void *)list->paths);
+	list->paths = NULL;
+	list->count = 0U;
+	list->capacity = 0U;
+}
+
+/*
+ * print_modified_summary - Emit post-traversal modified-source summary.
+ *
+ * ARCHITECTURE.md section 13.4 requires immediate warnings and an end-of-run
+ * summary of all affected paths.
+ */
+static void print_modified_summary(const modified_path_list_t *list)
+{
+	size_t i;
+
+	(void)fputs("ark: source files modified during archiving:\n", stderr);
+	for (i = 0U; i < list->count; i++) {
+		(void)fputs("ark:   ", stderr);
+		(void)fputs(list->paths[i], stderr);
+		(void)fputc('\n', stderr);
+	}
+}
+
+/*
+ * create_path_contains - Return 1 when child is equal to or under root.
+ */
+static int create_path_contains(const char *root, const char *child)
+{
+	size_t rlen;
+
+	if (strcmp(root, "/") == 0)
+		return 1;
+	rlen = strlen(root);
+	if (strncmp(root, child, rlen) != 0)
+		return 0;
+	if (child[rlen] == '\0' || child[rlen] == '/')
+		return 1;
+	return 0;
+}
+
+/*
+ * create_validate_destination_outside_sources - Enforce create precondition.
+ *
+ * ARCHITECTURE.md section 13.5 requires destination parent realpath to be
+ * outside every source root before libchevron setup and traversal.
+ */
+static int create_validate_destination_outside_sources(const char *archive_path,
+                                                       const char **sources,
+                                                       size_t source_count,
+                                                       ark_error_t *err)
+{
+	char parent_raw[PATH_MAX];
+	char dst_parent[PATH_MAX];
+	char src_root[PATH_MAX];
+	size_t i;
+
+	if (archive_path == NULL || sources == NULL || source_count == 0U)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "create destination/source paths missing", "",
+		                  0);
+	if (parent_dir(archive_path, parent_raw, sizeof(parent_raw), err) != 0)
+		return -1;
+	if (ARK_REALPATH(parent_raw, dst_parent) == NULL)
+		return fail_error(err, ARK_ERR_IO_OPEN,
+		                  "destination parent path resolution failed",
+		                  parent_raw, errno);
+	for (i = 0U; i < source_count; i++) {
+		if (ARK_REALPATH(sources[i], src_root) == NULL)
+			return fail_error(err, ARK_ERR_IO_READ,
+			                  "source path resolution failed",
+			                  sources[i], errno);
+		if (create_path_contains(src_root, dst_parent))
+			return fail_error(
+			    err, ARK_ERR_USAGE,
+			    "destination archive path is inside source tree",
+			    archive_path, 0);
+	}
+	return 0;
+}
+
+/*
+ * create_serialize_index - Allocate and serialize the index block.
+ *
+ * OWNERSHIP: on success *out_buf transfers to caller and is freed by
+ * cmd_create cleanup.
+ */
+static int create_serialize_index(ark_write_ctx_t *ctx, uint8_t **out_buf,
+                                  size_t *out_len, ark_error_t *err)
+{
+	uint8_t *buf;
+	size_t cap;
+
+	cap = 4096U;
+	for (;;) {
+		ssize_t n;
+
+		/* OWNERSHIP: temporary buffer is freed here on retry/failure.
+		 */
+		buf = (uint8_t *)malloc(cap);
+		if (buf == NULL)
+			return fail_error(err, ARK_ERR_IO_ALLOC,
+			                  "index buffer allocation failed", "",
+			                  0);
+		n = ark_write_index(ctx, buf, cap, err);
+		if (n >= 0) {
+			*out_buf = buf;
+			*out_len = (size_t)n;
+			return 0;
+		}
+		if (err == NULL || err->code != ARK_ERR_IO_ALLOC) {
+			free(buf);
+			return -1;
+		}
+		free(buf);
+		if (cap > (SIZE_MAX / 2U))
+			return fail_error(err, ARK_ERR_IO_ALLOC,
+			                  "index buffer size overflow", "", 0);
+		cap *= 2U;
+	}
+}
+
+/*
+ * create_serialize_footer - Allocate and serialize the fixed footer.
+ *
+ * OWNERSHIP: on success *out_buf transfers to caller and is freed by
+ * cmd_create cleanup.
+ */
+static int create_serialize_footer(ark_write_ctx_t *ctx, uint64_t index_offset,
+                                   uint64_t index_size, uint8_t **out_buf,
+                                   size_t *out_len, ark_error_t *err)
+{
+	uint8_t *buf;
+	ssize_t n;
+
+	/* OWNERSHIP: footer buffer is freed by cmd_create cleanup. */
+	buf = (uint8_t *)malloc(64U);
+	if (buf == NULL)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "footer buffer allocation failed", "", 0);
+	n = ark_write_footer(ctx, index_offset, index_size, buf, 64U, err);
+	if (n < 0) {
+		free(buf);
+		return -1;
+	}
+	*out_buf = buf;
+	*out_len = (size_t)n;
+	return 0;
+}
+
+/*
+ * chevron_error_fail - Map libchevron failure class into ark_error_t.
+ *
+ * Mapping follows ARCHITECTURE.md section 11.3.
+ */
+static int chevron_error_fail(ark_error_t *err, const chevron_error_t *cerr,
+                              const char *msg, const char *path)
+{
+	ark_err_t code;
+
+	switch (cerr->err) {
+	case CHEVRON_ERR_OPEN:
+		code = ARK_ERR_IO_OPEN;
+		break;
+	case CHEVRON_ERR_WRITE:
+		code = ARK_ERR_IO_WRITE;
+		break;
+	case CHEVRON_ERR_FSYNC:
+		code = ARK_ERR_IO_FSYNC;
+		break;
+	case CHEVRON_ERR_CLOSE:
+		code = ARK_ERR_IO_WRITE;
+		break;
+	case CHEVRON_ERR_RENAME:
+		code = ARK_ERR_IO_COMMIT;
+		break;
+	case CHEVRON_ERR_PERMISSION:
+		code = ARK_ERR_IO_OPEN;
+		break;
+	case CHEVRON_ERR_INVALID:
+		code = ARK_ERR_USAGE;
+		break;
+	case CHEVRON_ERR_NONE:
+	default:
+		code = ARK_ERR_IO_WRITE;
+		break;
+	}
+	return fail_error(err, code, msg, path, cerr->errno_value);
+}
+
+/*
+ * cmd_create - Execute single-threaded archive creation.
+ *
+ * Runs the write sequence from ARCHITECTURE.md section 16.3, streams bytes
+ * through libchevron per section 9, enforces destination preconditions per
+ * section 13.5, and performs source-modification checks per section 13.4.
+ */
+static int cmd_create(const ark_args_t *args, ark_error_t *err)
+{
+	ark_write_ctx_storage_t wstorage = {0};
+	ark_write_ctx_t *wctx;
+	chevron_handle_t handle = CHEVRON_HANDLE_INIT;
+	chevron_error_t cerr = {0};
+	modified_path_list_t modified = {0};
+	uint8_t header[16];
+	uint8_t *index_buf = NULL;
+	uint8_t *footer_buf = NULL;
+	size_t index_len;
+	size_t footer_len;
+	ssize_t n;
+	uint64_t output_offset;
+	uint64_t index_offset;
+	int opened;
+	int rc;
+	size_t i;
+
+	if (args == NULL || args->archive_path == NULL ||
+	    args->create_path_count == 0U)
+		return fail_error(
+		    err, ARK_ERR_USAGE,
+		    "create requires archive path and source paths", "", 0);
+
+	if (create_validate_destination_outside_sources(
+	        args->archive_path, args->create_paths, args->create_path_count,
+	        err) != 0)
+		return -1;
+
+	wctx = (ark_write_ctx_t *)wstorage.bytes;
+	opened = 0;
+	rc = -1;
+	output_offset = 0U;
+
+	if (ark_write_init(wctx, args->hash_alg, args->deflate_mode, err) != 0)
+		goto cleanup;
+
+	if (chevron_open(&handle, args->archive_path, CHEVRON_FULL,
+	                 CHEVRON_MODE_DEFAULT, &cerr) != 0) {
+		rc = chevron_error_fail(err, &cerr, "archive open failed",
+		                        args->archive_path);
+		goto cleanup;
+	}
+	opened = 1;
+
+	n = ark_write_header(wctx, header, sizeof(header), err);
+	if (n < 0)
+		goto cleanup;
+	if (chevron_write_or_fail(&handle, header, (size_t)n,
+	                          args->archive_path, err) != 0)
+		goto cleanup;
+	output_offset = (uint64_t)n;
+
+	for (i = 0U; i < args->create_path_count; i++) {
+		if (traverse_dir(args->create_paths[i], wctx, &handle,
+		                 &output_offset, &modified, err) != 0)
+			goto cleanup;
+	}
+
+	if (modified.count > 0U) {
+		print_modified_summary(&modified);
+		(void)fail_error(err, ARK_ERR_MODIFIED,
+		                 "source files modified during archiving", "",
+		                 0);
+		goto cleanup;
+	}
+
+	index_offset = output_offset;
+	if (create_serialize_index(wctx, &index_buf, &index_len, err) != 0)
+		goto cleanup;
+	if (chevron_write_or_fail(&handle, index_buf, index_len,
+	                          args->archive_path, err) != 0)
+		goto cleanup;
+	if (UINT64_MAX - output_offset < (uint64_t)index_len) {
+		(void)fail_error(err, ARK_ERR_USAGE, "archive offset overflow",
+		                 args->archive_path, 0);
+		goto cleanup;
+	}
+	output_offset += (uint64_t)index_len;
+
+	if (create_serialize_footer(wctx, index_offset, (uint64_t)index_len,
+	                            &footer_buf, &footer_len, err) != 0)
+		goto cleanup;
+	if (chevron_write_or_fail(&handle, footer_buf, footer_len,
+	                          args->archive_path, err) != 0)
+		goto cleanup;
+
+	/*
+	 * SAFETY: commit occurs only after successful header, member data,
+	 * index, and footer writes; all error paths abort the handle before
+	 * returning. See ARCHITECTURE.md sections 9 and 16.3.
+	 */
+	if (chevron_commit(&handle, &cerr) != 0) {
+		rc = chevron_error_fail(err, &cerr, "archive commit failed",
+		                        args->archive_path);
+		opened = 0;
+		goto cleanup;
+	}
+	opened = 0;
+	rc = 0;
+
+cleanup:
+	if (rc != 0 && opened)
+		chevron_abort(&handle);
+	free(footer_buf);
+	free(index_buf);
+	modified_path_list_free(&modified);
+	ark_write_free(wctx);
+	return rc;
+}
+
+/*
+ * exit_code_from_err - Map ark_err_t class to process exit code.
+ *
+ * See ARCHITECTURE.md section 11.1.
+ */
+static int exit_code_from_err(ark_err_t code)
+{
+	switch (code) {
+	case ARK_ERR_USAGE:
+		return 1;
+	case ARK_ERR_IO_READ:
+	case ARK_ERR_IO_WRITE:
+	case ARK_ERR_IO_SEEK:
+	case ARK_ERR_IO_OPEN:
+	case ARK_ERR_IO_FSYNC:
+	case ARK_ERR_IO_COMMIT:
+	case ARK_ERR_IO_MKDIR:
+	case ARK_ERR_IO_SYMLINK:
+	case ARK_ERR_IO_LINK:
+	case ARK_ERR_IO_CHMOD:
+	case ARK_ERR_IO_CHOWN:
+	case ARK_ERR_IO_UTIMES:
+	case ARK_ERR_IO_ALLOC:
+		return 2;
+	case ARK_ERR_FMT_MAGIC:
+	case ARK_ERR_FMT_VERSION:
+	case ARK_ERR_FMT_COMP_ALG:
+	case ARK_ERR_FMT_HASH_ALG:
+	case ARK_ERR_FMT_RESERVED:
+	case ARK_ERR_FMT_INDEX:
+	case ARK_ERR_FMT_MEMBER_TYPE:
+	case ARK_ERR_FMT_TRUNCATED:
+	case ARK_ERR_FMT_DATA:
+		return 3;
+	case ARK_ERR_HASH_INDEX:
+	case ARK_ERR_HASH_MEMBER:
+		return 4;
+	case ARK_ERR_PATH_TRAVERSAL:
+	case ARK_ERR_PATH_TOO_LONG:
+	case ARK_ERR_PATH_ABSOLUTE:
+	case ARK_ERR_PATH_ENCODING:
+		return 5;
+	case ARK_ERR_MODIFIED:
+		return 6;
+	case ARK_OK:
+	default:
+		return 1;
+	}
+}
 
 /*
  * usage_error - Set ARK_ERR_USAGE with a descriptive parser message.
@@ -443,18 +876,21 @@ static int member_path_from_abs(const char *root, const char *abs_path,
 {
 	size_t rlen;
 	const char *rel;
+	size_t rel_len;
 
 	rlen = strlen(root);
-	if (strcmp(root, "/") == 0)
+	if (strcmp(root, "/") == 0) {
 		rel = abs_path + 1;
-	else {
+		rel_len = strlen(rel);
+	} else {
 		if (strncmp(abs_path, root, rlen) != 0 || abs_path[rlen] != '/')
 			return fail_error(err, ARK_ERR_USAGE,
 			                  "path outside traversal root",
 			                  abs_path, 0);
 		rel = abs_path + rlen + 1U;
+		rel_len = strlen(rel);
 	}
-	if (rel[0] == '\0' || strlen(rel) >= dst_len)
+	if (rel_len == 0U || rel_len >= dst_len)
 		return fail_error(err, ARK_ERR_PATH_TOO_LONG,
 		                  "member path too long", abs_path, 0);
 	copy_msg(dst, dst_len, rel);
@@ -570,6 +1006,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
                              ark_error_t *err)
 {
 	ark_member_meta_t meta;
+	struct stat meta_sb;
 	ssize_t n;
 	ssize_t clen;
 	ssize_t written;
@@ -586,7 +1023,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 		return -1;
 	meta.size_original = (uint64_t)sb->st_size;
 	if (meta.size_original != 0U)
-		meta.data_offset = ctx->output_offset;
+		meta.data_offset = *ctx->output_offset;
 
 	/*
 	 * SAFETY: O_NOFOLLOW prevents a file swapped to a symlink after lstat
@@ -663,13 +1100,35 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			rc = -1;
 			goto cleanup;
 		}
-		if (UINT64_MAX - ctx->output_offset < (uint64_t)written) {
+		if (UINT64_MAX - *ctx->output_offset < (uint64_t)written) {
 			rc = fail_error(err, ARK_ERR_USAGE,
 			                "archive offset overflow", abs_path, 0);
 			goto cleanup;
 		}
-		ctx->output_offset += (uint64_t)written;
+		*ctx->output_offset += (uint64_t)written;
 		remaining -= want;
+	}
+
+	/*
+	 * ARCHITECTURE.md section 13.4: compare pre-read lstat metadata with
+	 * post-read fstat metadata on the same fd to detect source changes
+	 * during archiving.
+	 */
+	if (ARK_FSTAT(fd, &meta_sb) != 0) {
+		rc = fail_error(err, ARK_ERR_IO_READ,
+		                "member file fstat failed", abs_path, errno);
+		goto cleanup;
+	}
+	if (meta_sb.st_size != sb->st_size ||
+	    meta_sb.st_mtim.tv_sec != sb->st_mtim.tv_sec ||
+	    meta_sb.st_mtim.tv_nsec != sb->st_mtim.tv_nsec) {
+		print_warning_path("source file modified during read",
+		                   abs_path);
+		if (modified_path_list_push(ctx->modified_paths, abs_path,
+		                            err) != 0) {
+			rc = -1;
+			goto cleanup;
+		}
 	}
 
 	if (ark_write_member_end(ctx->write_ctx, err) != 0)
@@ -1004,8 +1463,9 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
  * chev_handle is an active libchevron streaming handle. See ARCHITECTURE.md
  * sections 13.1, 13.2, 13.6, and 16.3.
  */
-int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
-                 chevron_handle_t *chev_handle, ark_error_t *err)
+static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
+                        chevron_handle_t *chev_handle, uint64_t *output_offset,
+                        modified_path_list_t *modified_paths, ark_error_t *err)
 {
 	traverse_ctx_t ctx;
 	struct stat sb;
@@ -1015,11 +1475,11 @@ int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 	ctx = (traverse_ctx_t){0};
 	ctx.write_ctx = write_ctx;
 	ctx.chev_handle = chev_handle;
-	/* ARCHITECTURE.md sections 3 and 16.3: the fixed header is written
-	 * before traversal emits member data. */
-	ctx.output_offset = 16U;
+	ctx.output_offset = output_offset;
+	ctx.modified_paths = modified_paths;
 
-	if (src_path == NULL || write_ctx == NULL || chev_handle == NULL)
+	if (src_path == NULL || write_ctx == NULL || chev_handle == NULL ||
+	    output_offset == NULL || modified_paths == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "invalid traversal argument", "", 0);
 	if (ARK_REALPATH(src_path, ctx.root) == NULL)
@@ -1772,6 +2232,7 @@ int main(int argc, char **argv)
 {
 	ark_args_t args;
 	ark_error_t err = {0};
+	int rc;
 
 	if (parse_args(argc, argv, &args, &err) != 0) {
 		if (err.code == ARK_ERR_USAGE)
@@ -1813,6 +2274,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 #endif
+
+	if (args.cmd == ARK_CMD_CREATE) {
+		rc = cmd_create(&args, &err);
+		if (rc != 0) {
+			if (err.path[0] != '\0')
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputs(": ", stderr),
+				    (void)fputs(err.path, stderr),
+				    (void)fputc('\n', stderr);
+			else
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputc('\n', stderr);
+			args_free(&args);
+			return exit_code_from_err(err.code);
+		}
+	}
 
 	args_free(&args);
 	return 0;

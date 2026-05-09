@@ -84,6 +84,16 @@ int ark_stub_close(int fd)
 	return (close(fd));
 }
 
+int ark_stub_fstat(int fd, struct stat *sb)
+{
+	ark_fault.fstat_calls++;
+	if (fault_should_fail(ARK_FAULT_FSTAT, ark_fault.fstat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fstat(fd, sb));
+}
+
 int ark_stub_lstat(const char *path, struct stat *sb)
 {
 	ark_fault.lstat_calls++;
