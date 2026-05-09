@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (next)
-**Next Task:** Phase 5.2 - Sandbox application
+**Next Task:** Phase 5.3 - Filesystem traversal (create)
 
 ### Phase Summary
 
@@ -497,18 +497,18 @@ pipeline passes end-to-end tests.
 - [x] `print_usage()` emits one-line invocation error detail to stderr,
   followed by `See man ark for usage.`, and exits 1
 
-**5.2 - Sandbox application**
-- [ ] Implement `sandbox_apply(subcommand, src_path, dst_path)` in `main.c`
-- [ ] On OpenBSD: call `pledge` and `unveil` with the correct strings and
+**5.2 - Sandbox application** ✓ DONE
+- [x] Implement `sandbox_apply(subcommand, src_paths, src_count, archive_path, dst_path)` in `main.c`
+- [x] On OpenBSD: call `pledge` and `unveil` with the correct strings and
   paths per ARCHITECTURE.md §10.4; `pledge` failure is fatal
-- [ ] On Linux: create Landlock ruleset with the correct access rights per
+- [x] On Linux: create Landlock ruleset with the correct access rights per
   §10.4; add rules for src and dst paths; apply ruleset via
   `landlock_restrict_self`; on kernel < 5.13 or Landlock unavailable: fail
   immediately with a clear error identifying the minimum kernel requirement
-- [ ] Sandbox is applied after argument parsing and libchevron handle
+- [x] Sandbox is applied after argument parsing and libchevron handle
   initialisation, before the main operation; thread pool is initialised
   before sandbox is applied (Phase 6 task, but the call site is reserved)
-- [ ] Verify pledge/unveil strings match ARCHITECTURE.md §10.4 exactly:
+- [x] Verify pledge/unveil strings match ARCHITECTURE.md §10.4 exactly:
   `pthread` promise present for create and extract
 
 **5.3 - Filesystem traversal (create)**
