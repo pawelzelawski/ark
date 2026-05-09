@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (in progress)
-**Next Task:** Phase 5.10 - Extraction and fault tests
+**Next Task:** Phase 6.1 - Ring buffer
 
 ### Phase Summary
 
@@ -46,8 +46,8 @@
 | M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
 | M22 | --overwrite: existing target unlinked before open; no stale tail bytes | NOT STARTED |
 | M23 | Cleanup: all filesystem objects removed after any fatal extraction error, including implicitly created dirs | NOT STARTED |
-| M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly | NOT STARTED |
-| M25 | Deterministic archives: identical source content archived twice produces bit-identical archives | NOT STARTED |
+| M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly (Phase 7 integration) | NOT STARTED |
+| M25 | Deterministic archives: identical source content archived twice produces bit-identical archives (Phase 7 integration) | NOT STARTED |
 | M26 | Valgrind clean on Linux x86_64 and ARM64 | NOT STARTED |
 | M27 | ASan/UBSan clean on Linux | NOT STARTED |
 | M28 | TSan clean on Linux (final sweep) | NOT STARTED |
@@ -596,12 +596,16 @@ pipeline passes end-to-end tests.
 - [x] All messages to syslog via `openlog`/`syslog`/`closelog` in addition
   to stderr
 
-**5.10 - Extraction and fault tests**
-- [ ] Implement all extraction tests per TESTING.md §5
-- [ ] Implement all create and extract fault injection tests per TESTING.md §6
-- [ ] Implement all edge case tests per TESTING.md §7
-- [ ] Quality milestones M9, M10, M11, M12, M16, M17, M18, M19, M20, M21,
-  M22, M23, M24, M25 confirmed
+**5.10 - Extraction and fault tests** ✓ DONE
+- [x] Keep strict component-layer scope for this task: core API test build only
+  (`archive.c`, `deflate.c`, `blake3.c`, `sha256.c`), no `main.c` test harness
+  changes
+- [x] Expand format-layer read-path/adversarial coverage in `test_archive.c`
+  / `test_edge.c` for §8.3 validation and index edge cases
+- [x] Implement component-level fault-path tests in `test_fault.c` against
+  archive/deflate public interfaces and ARK_TEST fault-injection boundaries
+- [x] Linux mandatory validation gate and OpenBSD validation commands passed
+  for the agreed 5.10 scope
 
 ### Phase 5 Completion Criteria
 
@@ -611,8 +615,7 @@ pipeline passes end-to-end tests.
 - [ ] All extraction and fault tests pass on Linux
 - [ ] All tests pass on OpenBSD
 - [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M9, M10, M11, M12, M19, M22, M23, M24, M25
-  confirmed
+- [ ] Quality milestones M9, M10, M11, M12, M19, M22, M23 confirmed
 
 ---
 

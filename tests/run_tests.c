@@ -102,9 +102,39 @@ int test_deflate_invalid_stream(void);
 int test_deflate_truncated_stream(void);
 int test_deflate_output_buffer_too_small(void);
 int test_deflate_output_buffer_exact(void);
-int test_edge_stub(void);
+int test_edge_empty_archive(void);
+int test_edge_single_member(void);
+int test_edge_max_path_length(void);
+int test_edge_path_one_over_max(void);
+int test_edge_empty_file(void);
+int test_adv_forged_member_count(void);
+int test_adv_data_offset_in_header(void);
+int test_adv_data_range_past_index(void);
+int test_adv_overlapping_data_ranges(void);
+int test_adv_hardlink_to_dir(void);
+int test_adv_hardlink_forward_ref(void);
+int test_adv_duplicate_paths(void);
+int test_adv_path_traversal_abs(void);
+int test_adv_path_traversal_dotdot(void);
+int test_adv_link_target_dotdot(void);
+int test_adv_link_target_too_long(void);
+int test_adv_chunk_count_mismatch(void);
+int test_adv_nonzero_chunk_count_empty_file(void);
+int test_adv_corrupt_index_hash(void);
+int test_adv_corrupt_member_data(void);
 int test_extract_stub(void);
-int test_fault_stub(void);
+int test_fault_archive_header_dst_cap_undersize(void);
+int test_fault_archive_index_dst_cap_undersize(void);
+int test_fault_archive_footer_dst_cap_undersize(void);
+int test_fault_archive_index_hash_mismatch(void);
+int test_fault_archive_invalid_deflate_maps_fmt_data(void);
+int test_fault_archive_chunk_length_mismatch_maps_fmt_data(void);
+int test_fault_archive_chunk_size_mismatch_maps_fmt_data(void);
+int test_fault_deflate_invalid_stream(void);
+int test_fault_deflate_truncated_stream(void);
+int test_fault_deflate_output_buffer_too_small(void);
+int test_fault_injection_no_effect_on_archive_component(void);
+int test_fault_injection_no_effect_on_deflate_component(void);
 int test_integration_stub(void);
 int test_thread_stub(void);
 
@@ -266,10 +296,52 @@ static const test_case_t g_tests[] = {
      test_read_chunk_compressed_size_mismatch},
     {"test_read_empty_file_chunk_count_zero",
      test_read_empty_file_chunk_count_zero},
+    {"test_fault_archive_header_dst_cap_undersize",
+     test_fault_archive_header_dst_cap_undersize},
+    {"test_fault_archive_index_dst_cap_undersize",
+     test_fault_archive_index_dst_cap_undersize},
+    {"test_fault_archive_footer_dst_cap_undersize",
+     test_fault_archive_footer_dst_cap_undersize},
+    {"test_fault_archive_index_hash_mismatch",
+     test_fault_archive_index_hash_mismatch},
+    {"test_fault_archive_invalid_deflate_maps_fmt_data",
+     test_fault_archive_invalid_deflate_maps_fmt_data},
+    {"test_fault_archive_chunk_length_mismatch_maps_fmt_data",
+     test_fault_archive_chunk_length_mismatch_maps_fmt_data},
+    {"test_fault_archive_chunk_size_mismatch_maps_fmt_data",
+     test_fault_archive_chunk_size_mismatch_maps_fmt_data},
+    {"test_fault_deflate_invalid_stream", test_fault_deflate_invalid_stream},
+    {"test_fault_deflate_truncated_stream",
+     test_fault_deflate_truncated_stream},
+    {"test_fault_deflate_output_buffer_too_small",
+     test_fault_deflate_output_buffer_too_small},
+    {"test_fault_injection_no_effect_on_archive_component",
+     test_fault_injection_no_effect_on_archive_component},
+    {"test_fault_injection_no_effect_on_deflate_component",
+     test_fault_injection_no_effect_on_deflate_component},
+    {"test_edge_empty_archive", test_edge_empty_archive},
+    {"test_edge_single_member", test_edge_single_member},
+    {"test_edge_max_path_length", test_edge_max_path_length},
+    {"test_edge_path_one_over_max", test_edge_path_one_over_max},
+    {"test_edge_empty_file", test_edge_empty_file},
+    {"test_adv_forged_member_count", test_adv_forged_member_count},
+    {"test_adv_data_offset_in_header", test_adv_data_offset_in_header},
+    {"test_adv_data_range_past_index", test_adv_data_range_past_index},
+    {"test_adv_overlapping_data_ranges", test_adv_overlapping_data_ranges},
+    {"test_adv_hardlink_to_dir", test_adv_hardlink_to_dir},
+    {"test_adv_hardlink_forward_ref", test_adv_hardlink_forward_ref},
+    {"test_adv_duplicate_paths", test_adv_duplicate_paths},
+    {"test_adv_path_traversal_abs", test_adv_path_traversal_abs},
+    {"test_adv_path_traversal_dotdot", test_adv_path_traversal_dotdot},
+    {"test_adv_link_target_dotdot", test_adv_link_target_dotdot},
+    {"test_adv_link_target_too_long", test_adv_link_target_too_long},
+    {"test_adv_chunk_count_mismatch", test_adv_chunk_count_mismatch},
+    {"test_adv_nonzero_chunk_count_empty_file",
+     test_adv_nonzero_chunk_count_empty_file},
+    {"test_adv_corrupt_index_hash", test_adv_corrupt_index_hash},
+    {"test_adv_corrupt_member_data", test_adv_corrupt_member_data},
     {"test_thread_stub", test_thread_stub},
     {"test_extract_stub", test_extract_stub},
-    {"test_fault_stub", test_fault_stub},
-    {"test_edge_stub", test_edge_stub},
     {"test_integration_stub", test_integration_stub},
 };
 
