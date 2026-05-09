@@ -35,19 +35,10 @@ else \
 	echo ""; \
 fi
 
-EXTRA_DEFS != if [ "$(OS)" = "Linux" ]; then \
-	echo "-D_GNU_SOURCE"; \
-elif [ "$(OS)" = "OpenBSD" ]; then \
-	echo "-D_BSD_SOURCE"; \
-else \
-	echo ""; \
-fi
-
 CFLAGS_COMMON = -std=c11 -Wall -Wextra -Wpedantic        \
-	-Wno-unused-parameter                               \
-	-D_POSIX_C_SOURCE=200809L                           \
-	-D_XOPEN_SOURCE=700                                 \
-	$(EXTRA_DEFS)
+		-Wno-unused-parameter                               \
+		-D_POSIX_C_SOURCE=200809L                           \
+		-D_XOPEN_SOURCE=700
 
 CFLAGS_DEV = $(CFLAGS_COMMON)                             \
 	-O0 -g3 -gdwarf-4                                   \
@@ -175,4 +166,3 @@ $(RECOVERY_HEADER): src/recovery_template.c
 		{ gsub(/\\\\/, "\\\\\\\\"); gsub(/"/, "\\\\\""); \
 		  print "\"" $$0 "\\n\"" } \
 		END { print ";" }' src/recovery_template.c > $(RECOVERY_HEADER)
-

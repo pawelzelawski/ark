@@ -7,6 +7,7 @@
  * See ARCHITECTURE.md section 7.
  */
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -49,6 +50,16 @@ typedef struct {
 	size_t dist;
 } ark_match_t;
 
+typedef struct {
+	uint32_t lit[286];
+	uint32_t dist[30];
+} ark_freq_t;
+
+typedef struct {
+	uint16_t code[288];
+	uint8_t len[288];
+} ark_codebook_t;
+
 /* RFC 1951 length code base values and extra-bit widths (257..285). */
 static const uint16_t g_len_base[29] = {
     3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23,  27,
@@ -74,6 +85,13 @@ static const uint8_t g_dist_extra[30] = {
 
 static const uint8_t g_cl_order[19] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+};
+
+static const size_t g_default_block_candidates[] = {
+    (size_t)16U * 1024U,
+    (size_t)32U * 1024U,
+    (size_t)64U * 1024U,
+    (size_t)128U * 1024U,
 };
 
 /* Reverse the low n bits of v for Deflate's LSB-first bitstream. */
@@ -207,6 +225,55 @@ static int huff_build(ark_huff_table_t *tab, const uint8_t *lengths,
 			tab->len[idx] = len;
 			tab->sym[idx] = (int16_t)i;
 		}
+	}
+
+	return 0;
+}
+
+/* Build bit-reversed canonical codes for Deflate output. */
+static int build_codes(const uint8_t *lengths, size_t n_symbols,
+                       unsigned int max_bits, ark_codebook_t *book)
+{
+	uint16_t count[16];
+	uint16_t next_code[16];
+	unsigned int bits;
+	uint16_t code;
+	size_t i;
+
+	if (max_bits > 15U || n_symbols > 288U)
+		return -1;
+
+	for (i = 0; i < 288U; i++) {
+		book->code[i] = 0;
+		book->len[i] = 0;
+	}
+	for (i = 0; i < 16U; i++) {
+		count[i] = 0;
+		next_code[i] = 0;
+	}
+
+	for (i = 0; i < n_symbols; i++) {
+		if (lengths[i] > max_bits)
+			return -1;
+		if (lengths[i] != 0U)
+			count[lengths[i]]++;
+	}
+
+	code = 0;
+	for (bits = 1; bits <= max_bits; bits++) {
+		code = (uint16_t)((code + count[bits - 1U]) << 1U);
+		next_code[bits] = code;
+	}
+
+	for (i = 0; i < n_symbols; i++) {
+		uint8_t len;
+
+		len = lengths[i];
+		if (len == 0U)
+			continue;
+		book->code[i] = bit_reverse(next_code[len], len);
+		book->len[i] = len;
+		next_code[len]++;
 	}
 
 	return 0;
@@ -378,6 +445,15 @@ static int distance_symbol(size_t dist, unsigned int *sym,
 	return -1;
 }
 
+/* Emit one canonical Huffman symbol. */
+static int emit_code_symbol(ark_bit_writer_t *bw, const ark_codebook_t *book,
+                            unsigned int sym)
+{
+	if (sym >= 288U || book->len[sym] == 0U)
+		return -1;
+	return bw_put_bits(bw, book->code[sym], book->len[sym]);
+}
+
 /* Deflate hash over three bytes for LZ77 match candidate lookup. */
 static unsigned int hash3(const uint8_t *p)
 {
@@ -458,6 +534,173 @@ static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
 	}
 
 	return best;
+}
+
+/* Choose Deflate code lengths by frequency rank with a valid Kraft budget. */
+static void assign_rank_lengths(const uint32_t *freq, size_t n_symbols,
+                                uint8_t *lengths, int is_dist)
+{
+	uint16_t order[288];
+	size_t used;
+	size_t i;
+
+	for (i = 0; i < n_symbols; i++)
+		lengths[i] = 0;
+
+	used = 0;
+	for (i = 0; i < n_symbols; i++) {
+		size_t j;
+
+		if (freq[i] == 0U)
+			continue;
+		j = used;
+		while (j > 0 && (freq[order[j - 1U]] < freq[i] ||
+		                 (freq[order[j - 1U]] == freq[i] &&
+		                  order[j - 1U] > i))) {
+			order[j] = order[j - 1U];
+			j--;
+		}
+		order[j] = (uint16_t)i;
+		used++;
+	}
+
+	if (used == 0U) {
+		lengths[0] = is_dist ? 5U : 9U;
+		return;
+	}
+
+	for (i = 0; i < used; i++) {
+		if (is_dist) {
+			if (i < 4U)
+				lengths[order[i]] = 4U;
+			else
+				lengths[order[i]] = 6U;
+		} else {
+			if (i < 4U)
+				lengths[order[i]] = 5U;
+			else if (i < 16U)
+				lengths[order[i]] = 7U;
+			else
+				lengths[order[i]] = 9U;
+		}
+	}
+}
+
+/* Parse a block once, optionally collecting frequencies or emitting symbols. */
+static int parse_block(const uint8_t *src, size_t src_len,
+                       ark_deflate_mode_t mode, ark_freq_t *freq,
+                       ark_bit_writer_t *bw, const ark_codebook_t *lit_book,
+                       const ark_codebook_t *dist_book)
+{
+	int32_t head[ARK_DEFLATE_HASH_SIZE];
+	int32_t prev[ARK_DEFLATE_WINDOW_SIZE];
+	unsigned int max_chain;
+	size_t nice_len;
+	size_t pos;
+	size_t i;
+
+	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 1024U;
+	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
+
+	for (i = 0; i < ARK_DEFLATE_HASH_SIZE; i++)
+		head[i] = -1;
+	for (i = 0; i < ARK_DEFLATE_WINDOW_SIZE; i++)
+		prev[i] = -1;
+
+	if (freq != NULL) {
+		for (i = 0; i < 286U; i++)
+			freq->lit[i] = 0;
+		for (i = 0; i < 30U; i++)
+			freq->dist[i] = 0;
+	}
+
+	pos = 0U;
+	while (pos < src_len) {
+		ark_match_t m;
+		int32_t candidate;
+
+		candidate = insert_hash(src, src_len, pos, head, prev);
+		m = find_match(src, src_len, pos, candidate, prev, max_chain,
+		               nice_len);
+
+		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
+		    mode == ARK_DEFLATE_DEFAULT) {
+			ark_match_t m_next;
+
+			m_next.len = 0U;
+			m_next.dist = 0U;
+			if (pos + 3U < src_len) {
+				unsigned int hnext;
+				int32_t cnext;
+
+				hnext = hash3(src + pos + 1U);
+				cnext = head[hnext];
+				m_next =
+				    find_match(src, src_len, pos + 1U, cnext,
+				               prev, max_chain, nice_len);
+			}
+			if (m_next.len > m.len + 1U) {
+				if (freq != NULL)
+					freq->lit[src[pos]]++;
+				if (bw != NULL &&
+				    emit_code_symbol(bw, lit_book, src[pos]) !=
+				        0)
+					return -1;
+				pos++;
+				continue;
+			}
+		}
+
+		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
+			unsigned int lsym;
+			unsigned int lextra_n;
+			uint16_t lextra_v;
+			unsigned int dsym;
+			unsigned int dextra_n;
+			uint16_t dextra_v;
+
+			if (length_symbol(m.len, &lsym, &lextra_n, &lextra_v) !=
+			    0)
+				return -1;
+			if (distance_symbol(m.dist, &dsym, &dextra_n,
+			                    &dextra_v) != 0)
+				return -1;
+			if (freq != NULL) {
+				freq->lit[lsym]++;
+				freq->dist[dsym]++;
+			}
+			if (bw != NULL) {
+				if (emit_code_symbol(bw, lit_book, lsym) != 0)
+					return -1;
+				if (lextra_n != 0U &&
+				    bw_put_bits(bw, lextra_v, lextra_n) != 0)
+					return -1;
+				if (emit_code_symbol(bw, dist_book, dsym) != 0)
+					return -1;
+				if (dextra_n != 0U &&
+				    bw_put_bits(bw, dextra_v, dextra_n) != 0)
+					return -1;
+			}
+
+			for (i = 1; i < m.len; i++)
+				(void)insert_hash(src, src_len, pos + i, head,
+				                  prev);
+			pos += m.len;
+			continue;
+		}
+
+		if (freq != NULL)
+			freq->lit[src[pos]]++;
+		if (bw != NULL && emit_code_symbol(bw, lit_book, src[pos]) != 0)
+			return -1;
+		pos++;
+	}
+
+	if (freq != NULL)
+		freq->lit[256]++;
+	if (bw != NULL && emit_code_symbol(bw, lit_book, 256U) != 0)
+		return -1;
+	return 0;
 }
 
 /* Emit one literal byte using fixed Huffman coding. */
@@ -550,7 +793,8 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 		m = find_match(src, src_len, pos, candidate, prev, max_chain,
 		               nice_len);
 
-		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
+		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
+		    mode == ARK_DEFLATE_DEFAULT) {
 			ark_match_t m_next;
 
 			m_next.len = 0U;
@@ -575,7 +819,9 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 				pos++;
 				continue;
 			}
+		}
 
+		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
 			/*
 			 * SAFETY: emit match only with Deflate-legal distance
 			 * and length. A malformed pair would violate RFC 1951
@@ -606,6 +852,225 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 		return -1;
 
 	return (int)bw.pos;
+}
+
+static size_t freq_extra_bits(const ark_freq_t *freq)
+{
+	size_t bits;
+	size_t i;
+
+	bits = 0U;
+	for (i = 257U; i < 286U; i++)
+		bits += (size_t)freq->lit[i] * g_len_extra[i - 257U];
+	for (i = 0; i < 30U; i++)
+		bits += (size_t)freq->dist[i] * g_dist_extra[i];
+	return bits;
+}
+
+static size_t huff_data_bits(const ark_freq_t *freq, const uint8_t *lit_len,
+                             const uint8_t *dist_len)
+{
+	size_t bits;
+	size_t i;
+
+	bits = freq_extra_bits(freq);
+	for (i = 0; i < 286U; i++)
+		bits += (size_t)freq->lit[i] * lit_len[i];
+	for (i = 0; i < 30U; i++)
+		bits += (size_t)freq->dist[i] * dist_len[i];
+	return bits;
+}
+
+static size_t dynamic_header_bits(size_t hlit_count, size_t hdist_count)
+{
+	return 3U + 5U + 5U + 4U + 19U * 3U + (hlit_count + hdist_count) * 4U;
+}
+
+static size_t estimate_dynamic_bits(const uint8_t *src, size_t src_len)
+{
+	ark_freq_t freq;
+	uint8_t lit_len[286];
+	uint8_t dist_len[30];
+	size_t hlit_count;
+	size_t hdist_count;
+	size_t i;
+
+	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &freq, NULL, NULL,
+	                NULL) != 0)
+		return (size_t)-1;
+	assign_rank_lengths(freq.lit, 286U, lit_len, 0);
+	assign_rank_lengths(freq.dist, 30U, dist_len, 1);
+
+	hlit_count = 257U;
+	for (i = 257U; i < 286U; i++) {
+		if (lit_len[i] != 0U)
+			hlit_count = i + 1U;
+	}
+	hdist_count = 1U;
+	for (i = 1U; i < 30U; i++) {
+		if (dist_len[i] != 0U)
+			hdist_count = i + 1U;
+	}
+
+	return dynamic_header_bits(hlit_count, hdist_count) +
+	       huff_data_bits(&freq, lit_len, dist_len);
+}
+
+static size_t choose_default_block_len(const uint8_t *src, size_t remaining)
+{
+	size_t best_len;
+	size_t best_score;
+	size_t i;
+
+	best_len = remaining;
+	best_score = (size_t)-1;
+
+	for (i = 0; i < sizeof(g_default_block_candidates) /
+	                    sizeof(g_default_block_candidates[0]);
+	     i++) {
+		size_t len;
+		size_t bits;
+		size_t score;
+
+		len = g_default_block_candidates[i];
+		if (len > remaining)
+			len = remaining;
+		bits = estimate_dynamic_bits(src, len);
+		if (bits == (size_t)-1)
+			continue;
+		score = (bits * 65536U) / (len == 0U ? 1U : len);
+		if (score < best_score) {
+			best_score = score;
+			best_len = len;
+		}
+		if (len == remaining)
+			break;
+	}
+
+	return best_len;
+}
+
+static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
+                               const uint8_t *dist_len, size_t hlit_count,
+                               size_t hdist_count, ark_codebook_t *lit_book,
+                               ark_codebook_t *dist_book)
+{
+	ark_codebook_t cl_book;
+	uint8_t cl_len[19];
+	size_t i;
+
+	for (i = 0; i < 19U; i++)
+		cl_len[i] = i <= 15U ? 4U : 0U;
+
+	if (build_codes(lit_len, 286U, 15U, lit_book) != 0)
+		return -1;
+	if (build_codes(dist_len, 30U, 15U, dist_book) != 0)
+		return -1;
+	if (build_codes(cl_len, 19U, 7U, &cl_book) != 0)
+		return -1;
+
+	if (bw_put_bits(bw, (uint16_t)(hlit_count - 257U), 5U) != 0)
+		return -1;
+	if (bw_put_bits(bw, (uint16_t)(hdist_count - 1U), 5U) != 0)
+		return -1;
+	if (bw_put_bits(bw, 15U, 4U) != 0)
+		return -1;
+
+	for (i = 0; i < 19U; i++) {
+		if (bw_put_bits(bw, cl_len[g_cl_order[i]], 3U) != 0)
+			return -1;
+	}
+	for (i = 0; i < hlit_count; i++) {
+		if (emit_code_symbol(bw, &cl_book, lit_len[i]) != 0)
+			return -1;
+	}
+	for (i = 0; i < hdist_count; i++) {
+		if (emit_code_symbol(bw, &cl_book, dist_len[i]) != 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int emit_dynamic_block(ark_bit_writer_t *bw, const uint8_t *src,
+                              size_t src_len, int final)
+{
+	ark_codebook_t lit_book;
+	ark_codebook_t dist_book;
+	ark_freq_t freq;
+	uint8_t lit_len[286];
+	uint8_t dist_len[30];
+	size_t hlit_count;
+	size_t hdist_count;
+	size_t i;
+
+	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &freq, NULL, NULL,
+	                NULL) != 0)
+		return -1;
+	assign_rank_lengths(freq.lit, 286U, lit_len, 0);
+	assign_rank_lengths(freq.dist, 30U, dist_len, 1);
+
+	hlit_count = 257U;
+	for (i = 257U; i < 286U; i++) {
+		if (lit_len[i] != 0U)
+			hlit_count = i + 1U;
+	}
+	hdist_count = 1U;
+	for (i = 1U; i < 30U; i++) {
+		if (dist_len[i] != 0U)
+			hdist_count = i + 1U;
+	}
+
+	if (bw_put_bits(bw, final ? 1U : 0U, 1U) != 0)
+		return -1;
+	if (bw_put_bits(bw, 2U, 2U) != 0)
+		return -1;
+	if (emit_dynamic_header(bw, lit_len, dist_len, hlit_count, hdist_count,
+	                        &lit_book, &dist_book) != 0)
+		return -1;
+	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, NULL, bw, &lit_book,
+	                &dist_book) != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * Compress default archival mode using dynamic Huffman blocks.
+ * Candidate block sizes are costed before emission so deterministic block
+ * boundaries are selected from the local cost model.
+ */
+static int compress_dynamic_default(const uint8_t *src, size_t src_len,
+                                    uint8_t *dst, size_t dst_cap)
+{
+	ark_bit_writer_t bw;
+	size_t off;
+
+	off = 0U;
+	if (src_len == 0U)
+		return emit_stored_blocks(src, src_len, dst, dst_cap);
+
+	bw.dst = dst;
+	bw.cap = dst_cap;
+	bw.pos = 0;
+	bw.bits = 0;
+	bw.nbits = 0;
+
+	while (off < src_len) {
+		size_t len;
+		int final;
+
+		len = choose_default_block_len(src + off, src_len - off);
+		if (len == 0U || len > src_len - off)
+			return -1;
+		final = off + len == src_len;
+		if (emit_dynamic_block(&bw, src + off, len, final) != 0)
+			return -1;
+		off += len;
+	}
+
+	if (bw_flush_to_byte(&bw) != 0)
+		return -1;
+	return bw.pos > (size_t)INT_MAX ? -1 : (int)bw.pos;
 }
 
 /* Decode one Huffman-coded Deflate block until end-of-block marker. */
@@ -894,7 +1359,11 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	if (dst_cap < ark_deflate_bound(src_len))
 		return -1;
 
-	fixed_len = compress_fixed(src, src_len, dst, dst_cap, mode);
+	if (mode == ARK_DEFLATE_DEFAULT)
+		fixed_len =
+		    compress_dynamic_default(src, src_len, dst, dst_cap);
+	else
+		fixed_len = compress_fixed(src, src_len, dst, dst_cap, mode);
 
 	/*
 	 * ARCHITECTURE.md section 7.2: for incompressible data, emit stored

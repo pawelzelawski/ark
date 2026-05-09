@@ -26,7 +26,7 @@
 #ifndef CHEVRON_TEST
 #define CHEVRON_OPEN open
 #define CHEVRON_LINKAT linkat
-#define CHEVRON_MKOSTEMP mkostemp
+#define CHEVRON_MKOSTEMP chevron_mkostemp_cloexec
 #define CHEVRON_WRITE write
 #define CHEVRON_FSYNC fsync
 #define CHEVRON_CLOSE close

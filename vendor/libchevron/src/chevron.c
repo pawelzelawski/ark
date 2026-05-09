@@ -25,6 +25,41 @@
 #endif
 
 /*
+ * chevron_mkostemp_cloexec - portable mkostemp(O_CLOEXEC) equivalent.
+ *
+ * mkostemp is a GNU extension. Keep libchevron buildable with only POSIX/XSI
+ * feature macros by using mkstemp followed immediately by FD_CLOEXEC.
+ */
+static int
+chevron_mkostemp_cloexec(char *template, int flags)
+{
+	int fd;
+	int fdflags;
+	int saved_errno;
+
+	if ((flags & ~O_CLOEXEC) != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	fd = mkstemp(template);
+	if (fd == -1)
+		return -1;
+
+	fdflags = fcntl(fd, F_GETFD);
+	if (fdflags == -1 ||
+	    fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) == -1) {
+		saved_errno = errno;
+		(void)close(fd);
+		(void)unlink(template);
+		errno = saved_errno;
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
  * chevron_fail - populate err and return -1.
  */
 static inline int chevron_fail(chevron_error_t *err, chevron_err_t e,

@@ -316,10 +316,6 @@ data. Round-trip produces byte-for-byte identical output.
   hash-chain match finding and lazy matching; handles incompressible content
   via stored blocks (fallback when compressed size >= input size);
   deterministic: same input always produces same output
-- NOTE: Compressor currently emits fixed-Huffman blocks only. Dynamic-Huffman
-  block generation and block-boundary optimization (ARCHITECTURE.md §7.2
-  "near-optimal parsing" and "aggressive block boundary decisions") are
-  explicitly deferred to a future optimization pass.
 
 **3.3 - Deflate decompressor** ✓ DONE
 - [x] Implement `ark_deflate_decompress`: strict RFC 1951 Deflate
@@ -337,6 +333,8 @@ data. Round-trip produces byte-for-byte identical output.
 - [x] Implement `test_deflate_incompressible_within_bound`
 - [x] Implement `test_deflate_bound_non_zero`
 - [x] Implement `test_deflate_stored_block_valid`
+- [x] Implement `test_deflate_default_emits_dynamic_block`
+- [x] Implement `test_deflate_fast_emits_fixed_block`
 - [x] Implement `test_deflate_invalid_stream`
 - [x] Implement `test_deflate_truncated_stream`
 - [x] Implement `test_deflate_output_buffer_too_small`

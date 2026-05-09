@@ -186,9 +186,11 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_deflate_incompressible_within_bound` | Incompressible input; compressed size <= `ark_deflate_bound(src_len)` |
 | `test_deflate_bound_non_zero` | `ark_deflate_bound(n) > n` for all tested n |
 | `test_deflate_stored_block_valid` | Incompressible chunk stored as Deflate stored block; decompresses correctly |
+| `test_deflate_default_emits_dynamic_block` | Default mode emits a dynamic-Huffman block for compressible input |
+| `test_deflate_fast_emits_fixed_block` | Fast mode emits a fixed-Huffman block for compressible input |
 | `test_deflate_invalid_stream` | Corrupt compressed bytes fed to decompress; returns -1 |
 | `test_deflate_truncated_stream` | Compressed bytes truncated; returns -1 |
-| `test_deflate_length_mismatch` | Correct compressed stream but wrong expected decompressed length; returns -1 |
+| `test_deflate_output_buffer_too_small` | Correct compressed stream but insufficient output capacity; returns -1 |
 | `test_deflate_output_buffer_exact` | Output buffer exactly the right size; no overflow |
 
 ### 3.4 Archive Write Path (`test_archive.c`)

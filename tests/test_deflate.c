@@ -252,6 +252,56 @@ int test_deflate_stored_block_valid(void)
 	return rc;
 }
 
+int test_deflate_default_emits_dynamic_block(void)
+{
+	uint8_t in[8192];
+	uint8_t *comp;
+	size_t bound;
+	ssize_t comp_len;
+	size_t i;
+	int rc;
+
+	for (i = 0; i < sizeof(in); i++)
+		in[i] = 'a';
+
+	bound = ark_deflate_bound(sizeof(in));
+	comp = malloc(bound);
+	if (comp == NULL)
+		return 1;
+
+	comp_len = ark_deflate_compress(in, sizeof(in), comp, bound,
+	                                ARK_DEFLATE_DEFAULT);
+	rc = (comp_len > 0 && (comp[0] & 0x06U) == 0x04U) ? 0 : 1;
+
+	free(comp);
+	return rc;
+}
+
+int test_deflate_fast_emits_fixed_block(void)
+{
+	uint8_t in[8192];
+	uint8_t *comp;
+	size_t bound;
+	ssize_t comp_len;
+	size_t i;
+	int rc;
+
+	for (i = 0; i < sizeof(in); i++)
+		in[i] = 'a';
+
+	bound = ark_deflate_bound(sizeof(in));
+	comp = malloc(bound);
+	if (comp == NULL)
+		return 1;
+
+	comp_len =
+	    ark_deflate_compress(in, sizeof(in), comp, bound, ARK_DEFLATE_FAST);
+	rc = (comp_len > 0 && (comp[0] & 0x06U) == 0x02U) ? 0 : 1;
+
+	free(comp);
+	return rc;
+}
+
 int test_deflate_invalid_stream(void)
 {
 	const uint8_t bad[] = {0x06};
