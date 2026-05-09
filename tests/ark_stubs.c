@@ -204,3 +204,14 @@ char *ark_stub_realpath(const char *path, char *resolved_path)
 	}
 	return (realpath(path, resolved_path));
 }
+
+/* ark_stub_readlink - Fault-injectable wrapper for symlink traversal reads. */
+ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz)
+{
+	ark_fault.readlink_calls++;
+	if (fault_should_fail(ARK_FAULT_READLINK, ark_fault.readlink_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (readlink(path, buf, bufsiz));
+}

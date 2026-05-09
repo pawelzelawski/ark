@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (next)
-**Next Task:** Phase 5.3 - Filesystem traversal (create)
+**Next Task:** Phase 5.4 - Create subcommand
 
 ### Phase Summary
 
@@ -511,20 +511,20 @@ pipeline passes end-to-end tests.
 - [x] Verify pledge/unveil strings match ARCHITECTURE.md §10.4 exactly:
   `pthread` promise present for create and extract
 
-**5.3 - Filesystem traversal (create)**
-- [ ] Implement `traverse_dir(src_path, write_ctx, chev_handle, err)` in
+**5.3 - Filesystem traversal (create)** ✓ DONE
+- [x] Implement `traverse_dir(src_path, write_ctx, chev_handle, err)` in
   `main.c`: depth-first traversal; entries sorted by `memcmp` byte order at
   each level per §13.1; stops at mount point boundaries per §13.6; skips
   special filesystem objects with a warning per §13.8; aborts on permission
   errors per §13.7
-- [ ] Implement `traverse_entry`: handles regular files, directories,
+- [x] Implement `traverse_entry`: handles regular files, directories,
   symlinks, hardlinks; uses `ARK_LSTAT`, never follows symlinks
-- [ ] Path stripping per §13.5: resolve source via `ARK_REALPATH` once before
+- [x] Path stripping per §13.5: resolve source via `ARK_REALPATH` once before
   traversal; strip prefix from all member paths
-- [ ] Inode deduplication table per §13.2: detect hardlink relationships;
+- [x] Inode deduplication table per §13.2: detect hardlink relationships;
   initial capacity 4096 slots, 0.75 load factor, double on resize; table
   freed after traversal
-- [ ] In single-threaded Phase 5: call `ark_deflate_compress` directly in
+- [x] In single-threaded Phase 5: call `ark_deflate_compress` directly in
   `traverse_entry` for regular file chunks; call `ark_write_chunk` with the
   compressed result; no ring buffer, no worker threads yet
 

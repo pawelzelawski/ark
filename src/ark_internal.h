@@ -36,6 +36,7 @@ enum ark_fault_which {
 	ARK_FAULT_READDIR,
 	ARK_FAULT_CLOSEDIR,
 	ARK_FAULT_REALPATH,
+	ARK_FAULT_READLINK,
 };
 
 typedef struct ark_fault {
@@ -58,6 +59,7 @@ typedef struct ark_fault {
 	int readdir_calls;
 	int closedir_calls;
 	int realpath_calls;
+	int readlink_calls;
 } ark_fault_t;
 
 extern ark_fault_t ark_fault;
@@ -82,6 +84,7 @@ DIR *ark_stub_opendir(const char *path);
 struct dirent *ark_stub_readdir(DIR *dirp);
 int ark_stub_closedir(DIR *dirp);
 char *ark_stub_realpath(const char *path, char *resolved_path);
+ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
 
 #define ARK_READ ark_stub_read
 #define ARK_WRITE ark_stub_write
@@ -99,6 +102,7 @@ char *ark_stub_realpath(const char *path, char *resolved_path);
 #define ARK_READDIR ark_stub_readdir
 #define ARK_CLOSEDIR ark_stub_closedir
 #define ARK_REALPATH ark_stub_realpath
+#define ARK_READLINK ark_stub_readlink
 
 #else
 
@@ -118,6 +122,7 @@ char *ark_stub_realpath(const char *path, char *resolved_path);
 #define ARK_READDIR readdir
 #define ARK_CLOSEDIR closedir
 #define ARK_REALPATH realpath
+#define ARK_READLINK readlink
 
 #endif
 
