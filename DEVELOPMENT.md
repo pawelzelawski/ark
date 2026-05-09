@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-09
 **Current Phase:** Phase 5 - CLI: core operations (in progress)
-**Next Task:** Phase 5.5 - Extract subcommand
+**Next Task:** Phase 5.7 - Verify subcommand
 
 ### Phase Summary
 
@@ -541,34 +541,34 @@ pipeline passes end-to-end tests.
 - [x] Multiple source arguments: each argument is a separate archive root;
   traversed in order
 
-**5.5 - Extract subcommand**
-- [ ] Implement `cmd_extract`: open archive; call `ark_read_header`,
+**5.5 - Extract subcommand** ✓ DONE
+- [x] Implement `cmd_extract`: open archive; call `ark_read_header`,
   `ark_read_init`, `ark_read_index`; apply pre-extraction validation (§8.3
   checks are implemented in `ark_read_index`; §14.2 conflict pre-flight
   check is main.c responsibility); apply sandbox; extract each member in
   index order
-- [ ] Implement extraction cleanup tracker: `cleanup_track` records each
+- [x] Implement extraction cleanup tracker: `cleanup_track` records each
   filesystem object immediately after creation; `cleanup_created` removes
   all tracked objects on fatal error; tracker allocated as a dynamic list
   grown by doubling
-- [ ] Implement extraction of each member type per §14: regular files,
+- [x] Implement extraction of each member type per §14: regular files,
   directories, symlinks, hardlinks
-- [ ] Implement metadata restoration per §14.5: per-member-type rules;
+- [x] Implement metadata restoration per §14.5: per-member-type rules;
   `lchown` before `chmod`; `chmod` skipped for symlinks; `utimensat` with
   `AT_SYMLINK_NOFOLLOW` for symlinks
-- [ ] Implement `--overwrite` per §14.2: `lstat` target; if exists: `unlink`;
+- [x] Implement `--overwrite` per §14.2: `lstat` target; if exists: `unlink`;
   open with `O_CREAT|O_WRONLY|O_NOFOLLOW`; `ELOOP` → `ARK_ERR_IO_OPEN`
-- [ ] Per-member hash verification: `ark_read_verify_member_begin`,
+- [x] Per-member hash verification: `ark_read_verify_member_begin`,
   `ark_read_verify_member_update` (called with compressed bytes before
   passing to `ark_read_chunk`), `ark_read_verify_member_final`
-- [ ] In single-threaded Phase 5: process one chunk at a time in the main
+- [x] In single-threaded Phase 5: process one chunk at a time in the main
   loop; no parallelism
 
-**5.6 - List subcommand**
-- [ ] Implement `cmd_list`: open and validate archive via read path; iterate
+**5.6 - List subcommand** ✓ DONE
+- [x] Implement `cmd_list`: open and validate archive via read path; iterate
   members; call `print_member` for each; output columns: type, size, mode,
   mtime, path
-- [ ] `--member` flag: print only the specified member; `ARK_ERR_FMT_INDEX`
+- [x] `--member` flag: print only the specified member; `ARK_ERR_FMT_INDEX`
   if not found
 
 **5.7 - Verify subcommand**

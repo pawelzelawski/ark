@@ -74,6 +74,24 @@ int ark_stub_open(const char *path, int flags, ...)
 	return (open(path, flags, mode));
 }
 
+int ark_stub_openat(int fd, const char *path, int flags, ...)
+{
+	mode_t mode;
+	va_list ap;
+
+	ark_fault.openat_calls++;
+	if (fault_should_fail(ARK_FAULT_OPENAT, ark_fault.openat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	if ((flags & O_CREAT) == 0)
+		return (openat(fd, path, flags));
+	va_start(ap, flags);
+	mode = va_arg(ap, mode_t);
+	va_end(ap);
+	return (openat(fd, path, flags, mode));
+}
+
 int ark_stub_close(int fd)
 {
 	ark_fault.close_calls++;
@@ -84,6 +102,16 @@ int ark_stub_close(int fd)
 	return (close(fd));
 }
 
+off_t ark_stub_lseek(int fd, off_t offset, int whence)
+{
+	ark_fault.lseek_calls++;
+	if (fault_should_fail(ARK_FAULT_LSEEK, ark_fault.lseek_calls)) {
+		errno = ark_fault.errno_value;
+		return ((off_t)-1);
+	}
+	return (lseek(fd, offset, whence));
+}
+
 int ark_stub_fstat(int fd, struct stat *sb)
 {
 	ark_fault.fstat_calls++;
@@ -92,6 +120,16 @@ int ark_stub_fstat(int fd, struct stat *sb)
 		return (-1);
 	}
 	return (fstat(fd, sb));
+}
+
+int ark_stub_fstatat(int fd, const char *path, struct stat *sb, int flags)
+{
+	ark_fault.fstatat_calls++;
+	if (fault_should_fail(ARK_FAULT_FSTATAT, ark_fault.fstatat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fstatat(fd, path, sb, flags));
 }
 
 int ark_stub_lstat(const char *path, struct stat *sb)
@@ -114,6 +152,16 @@ int ark_stub_unlink(const char *path)
 	return (unlink(path));
 }
 
+int ark_stub_unlinkat(int fd, const char *path, int flags)
+{
+	ark_fault.unlinkat_calls++;
+	if (fault_should_fail(ARK_FAULT_UNLINKAT, ark_fault.unlinkat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (unlinkat(fd, path, flags));
+}
+
 int ark_stub_rmdir(const char *path)
 {
 	ark_fault.rmdir_calls++;
@@ -134,6 +182,17 @@ int ark_stub_link(const char *oldpath, const char *newpath)
 	return (link(oldpath, newpath));
 }
 
+int ark_stub_linkat(int oldfd, const char *oldpath, int newfd,
+                    const char *newpath, int flags)
+{
+	ark_fault.linkat_calls++;
+	if (fault_should_fail(ARK_FAULT_LINKAT, ark_fault.linkat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (linkat(oldfd, oldpath, newfd, newpath, flags));
+}
+
 int ark_stub_mkdir(const char *path, mode_t mode)
 {
 	ark_fault.mkdir_calls++;
@@ -142,6 +201,26 @@ int ark_stub_mkdir(const char *path, mode_t mode)
 		return (-1);
 	}
 	return (mkdir(path, mode));
+}
+
+int ark_stub_mkdirat(int fd, const char *path, mode_t mode)
+{
+	ark_fault.mkdirat_calls++;
+	if (fault_should_fail(ARK_FAULT_MKDIRAT, ark_fault.mkdirat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (mkdirat(fd, path, mode));
+}
+
+int ark_stub_symlinkat(const char *target, int fd, const char *linkpath)
+{
+	ark_fault.symlinkat_calls++;
+	if (fault_should_fail(ARK_FAULT_SYMLINKAT, ark_fault.symlinkat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (symlinkat(target, fd, linkpath));
 }
 
 int ark_stub_lchown(const char *path, uid_t owner, gid_t group)
@@ -154,6 +233,27 @@ int ark_stub_lchown(const char *path, uid_t owner, gid_t group)
 	return (lchown(path, owner, group));
 }
 
+int ark_stub_fchown(int fd, uid_t owner, gid_t group)
+{
+	ark_fault.fchown_calls++;
+	if (fault_should_fail(ARK_FAULT_FCHOWN, ark_fault.fchown_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fchown(fd, owner, group));
+}
+
+int ark_stub_fchownat(int fd, const char *path, uid_t owner, gid_t group,
+                      int flags)
+{
+	ark_fault.fchownat_calls++;
+	if (fault_should_fail(ARK_FAULT_FCHOWNAT, ark_fault.fchownat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fchownat(fd, path, owner, group, flags));
+}
+
 int ark_stub_chmod(const char *path, mode_t mode)
 {
 	ark_fault.chmod_calls++;
@@ -162,6 +262,26 @@ int ark_stub_chmod(const char *path, mode_t mode)
 		return (-1);
 	}
 	return (chmod(path, mode));
+}
+
+int ark_stub_fchmod(int fd, mode_t mode)
+{
+	ark_fault.fchmod_calls++;
+	if (fault_should_fail(ARK_FAULT_FCHMOD, ark_fault.fchmod_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fchmod(fd, mode));
+}
+
+int ark_stub_fchmodat(int fd, const char *path, mode_t mode, int flags)
+{
+	ark_fault.fchmodat_calls++;
+	if (fault_should_fail(ARK_FAULT_FCHMODAT, ark_fault.fchmodat_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (fchmodat(fd, path, mode, flags));
 }
 
 int ark_stub_utimensat(int fd, const char *path, const struct timespec times[2],
@@ -173,6 +293,16 @@ int ark_stub_utimensat(int fd, const char *path, const struct timespec times[2],
 		return (-1);
 	}
 	return (utimensat(fd, path, times, flags));
+}
+
+int ark_stub_futimens(int fd, const struct timespec times[2])
+{
+	ark_fault.futimens_calls++;
+	if (fault_should_fail(ARK_FAULT_FUTIMENS, ark_fault.futimens_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	return (futimens(fd, times));
 }
 
 DIR *ark_stub_opendir(const char *path)

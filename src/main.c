@@ -84,6 +84,23 @@ typedef struct {
 } modified_path_list_t;
 
 typedef struct {
+	char path[1024];
+	int is_dir;
+} cleanup_entry_t;
+
+typedef struct {
+	cleanup_entry_t *entries;
+	size_t count;
+	size_t capacity;
+} cleanup_tracker_t;
+
+typedef struct {
+	const ark_member_meta_t **items;
+	size_t count;
+	size_t capacity;
+} dir_deferred_meta_t;
+
+typedef struct {
 	char root[PATH_MAX];
 	dev_t root_dev;
 	ark_write_ctx_t *write_ctx;
@@ -111,6 +128,8 @@ static void print_usage(const char *);
 static void copy_msg(char *, size_t, const char *);
 static int parent_dir(const char *, char *, size_t, ark_error_t *);
 static int cmd_create(const ark_args_t *, ark_error_t *);
+static int cmd_extract(const ark_args_t *, int, ark_error_t *);
+static int cmd_list(const ark_args_t *, ark_error_t *);
 static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
                         uint64_t *, modified_path_list_t *, ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
@@ -146,6 +165,32 @@ static int create_serialize_footer(ark_write_ctx_t *, uint64_t, uint64_t,
 static int chevron_error_fail(ark_error_t *, const chevron_error_t *,
                               const char *, const char *);
 static int exit_code_from_err(ark_err_t);
+static int read_full(int, void *, size_t, const char *, ark_error_t *);
+static int write_full(int, const void *, size_t, const char *, ark_error_t *);
+static uint64_t le64_decode(const uint8_t *);
+static int read_archive_index(int, const char *, ark_read_ctx_t *, uint8_t **,
+                              size_t *, ark_error_t *);
+static size_t read_member_count(const ark_read_ctx_t *);
+static int find_member_pos(const ark_read_ctx_t *, const char *, uint32_t *);
+static int build_extract_selection(const ark_args_t *, const ark_read_ctx_t *,
+                                   size_t, unsigned char *, ark_error_t *);
+static int preflight_conflicts(const ark_args_t *, const ark_read_ctx_t *,
+                               size_t, const unsigned char *, int,
+                               ark_error_t *);
+static int cleanup_track(cleanup_tracker_t *, const char *, int, ark_error_t *);
+static void cleanup_run(cleanup_tracker_t *, int);
+static void cleanup_free(cleanup_tracker_t *);
+static int dir_deferred_push(dir_deferred_meta_t *, const ark_member_meta_t *,
+                             ark_error_t *);
+static void dir_deferred_free(dir_deferred_meta_t *);
+static int ensure_parent_dirs(const ark_member_meta_t *, int, int,
+                              cleanup_tracker_t *, ark_error_t *);
+static void decode_mtime(uint64_t, struct timespec[2]);
+static int restore_regular_meta(int, const ark_member_meta_t *, ark_error_t *);
+static void restore_symlink_meta(int, const ark_member_meta_t *);
+static void apply_deferred_dir_meta(int, const dir_deferred_meta_t *);
+static int print_member_row(const ark_member_meta_t *);
+static void print_warning_path(const char *, const char *);
 
 #ifdef __linux__
 static uint64_t landlock_read_rights(void);
@@ -511,6 +556,1080 @@ cleanup:
 	free(index_buf);
 	modified_path_list_free(&modified);
 	ark_write_free(wctx);
+	return rc;
+}
+
+/*
+ * read_full - Read exactly len bytes unless EOF or a hard read error occurs.
+ */
+static int read_full(int fd, void *buf, size_t len, const char *path,
+                     ark_error_t *err)
+{
+	uint8_t *p;
+
+	p = (uint8_t *)buf;
+	while (len > 0U) {
+		ssize_t n;
+
+		n = ARK_READ(fd, p, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return fail_error(err, ARK_ERR_IO_READ,
+			                  "archive read failed", path, errno);
+		}
+		if (n == 0)
+			return fail_error(err, ARK_ERR_FMT_TRUNCATED,
+			                  "archive truncated", path, 0);
+		p += (size_t)n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+/*
+ * write_full - Write exactly len bytes unless a hard write error occurs.
+ */
+static int write_full(int fd, const void *buf, size_t len, const char *path,
+                      ark_error_t *err)
+{
+	const uint8_t *p;
+
+	p = (const uint8_t *)buf;
+	while (len > 0U) {
+		ssize_t n;
+
+		n = ARK_WRITE(fd, p, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return fail_error(err, ARK_ERR_IO_WRITE,
+			                  "output write failed", path, errno);
+		}
+		if (n == 0)
+			return fail_error(err, ARK_ERR_IO_WRITE,
+			                  "output write made no progress", path,
+			                  0);
+		p += (size_t)n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+/*
+ * le64_decode - Decode one little-endian u64 from an unaligned byte buffer.
+ */
+static uint64_t le64_decode(const uint8_t *p)
+{
+	return ((uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+	        ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+	        ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+	        ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56));
+}
+
+/*
+ * read_archive_index - Read and validate header/footer/index for read paths.
+ *
+ * ARCHITECTURE.md section 16.4 defines call order. ARCHITECTURE.md section
+ * 5.1 requires footer-bound checks in main.c before ark_read_init.
+ *
+ * OWNERSHIP: *index_buf is caller-owned on success and freed by caller.
+ */
+static int read_archive_index(int fd, const char *archive_path,
+                              ark_read_ctx_t *rctx, uint8_t **index_buf,
+                              size_t *index_len, ark_error_t *err)
+{
+	struct stat sb;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint64_t file_size;
+	uint64_t index_offset;
+	uint64_t idx_size_u64;
+	uint64_t body_end;
+	uint8_t *idx;
+
+	if (ARK_FSTAT(fd, &sb) != 0)
+		return fail_error(err, ARK_ERR_IO_READ, "archive fstat failed",
+		                  archive_path, errno);
+	if (sb.st_size < 0)
+		return fail_error(err, ARK_ERR_FMT_TRUNCATED,
+		                  "archive size invalid", archive_path, 0);
+	file_size = (uint64_t)sb.st_size;
+
+	if (ARK_LSEEK(fd, (off_t)0, SEEK_SET) == (off_t)-1)
+		return fail_error(err, ARK_ERR_IO_SEEK, "archive seek failed",
+		                  archive_path, errno);
+	if (read_full(fd, header, sizeof(header), archive_path, err) != 0)
+		return -1;
+	if (ark_read_header(rctx, header, sizeof(header), err) != 0)
+		return -1;
+
+	if (file_size < 80U)
+		return fail_error(err, ARK_ERR_FMT_TRUNCATED,
+		                  "archive shorter than minimum size",
+		                  archive_path, 0);
+	if (ARK_LSEEK(fd, (off_t)(file_size - 64U), SEEK_SET) == (off_t)-1)
+		return fail_error(err, ARK_ERR_IO_SEEK, "archive seek failed",
+		                  archive_path, errno);
+	if (read_full(fd, footer, sizeof(footer), archive_path, err) != 0)
+		return -1;
+
+	index_offset = le64_decode(footer + 0U);
+	idx_size_u64 = le64_decode(footer + 8U);
+	if (index_offset < 16U)
+		return fail_error(err, ARK_ERR_FMT_INDEX,
+		                  "index offset overlaps fixed header",
+		                  archive_path, 0);
+	if (!(idx_size_u64 > 0U || index_offset == 16U))
+		return fail_error(err, ARK_ERR_FMT_INDEX,
+		                  "zero index size requires index_offset == 16",
+		                  archive_path, 0);
+	if (UINT64_MAX - index_offset < idx_size_u64)
+		return fail_error(err, ARK_ERR_FMT_INDEX,
+		                  "index offset and size overflow",
+		                  archive_path, 0);
+	body_end = file_size - 64U;
+	if (index_offset + idx_size_u64 != body_end)
+		return fail_error(err, ARK_ERR_FMT_INDEX,
+		                  "index layout mismatch before footer",
+		                  archive_path, 0);
+
+	if (ark_read_init(rctx, footer, sizeof(footer), err) != 0)
+		return -1;
+
+	if (idx_size_u64 > (uint64_t)SIZE_MAX)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "index buffer too large", archive_path, 0);
+	*index_len = (size_t)idx_size_u64;
+	/* OWNERSHIP: caller frees this buffer in command cleanup. */
+	idx = (uint8_t *)malloc(*index_len == 0U ? 1U : *index_len);
+	if (idx == NULL)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "index buffer allocation failed",
+		                  archive_path, 0);
+
+	if (ARK_LSEEK(fd, (off_t)index_offset, SEEK_SET) == (off_t)-1) {
+		free(idx);
+		return fail_error(err, ARK_ERR_IO_SEEK, "archive seek failed",
+		                  archive_path, errno);
+	}
+	if (*index_len > 0U &&
+	    read_full(fd, idx, *index_len, archive_path, err) != 0) {
+		free(idx);
+		return -1;
+	}
+	if (ark_read_index(rctx, idx, *index_len, err) != 0) {
+		free(idx);
+		return -1;
+	}
+	*index_buf = idx;
+	return 0;
+}
+
+/*
+ * read_member_count - Count parsed members exposed by ark_read_member_meta.
+ */
+static size_t read_member_count(const ark_read_ctx_t *rctx)
+{
+	size_t n;
+
+	for (n = 0U; ark_read_member_meta(rctx, (uint32_t)n) != NULL; n++)
+		;
+	return n;
+}
+
+/*
+ * find_member_pos - Locate one member path and return its positional index.
+ */
+static int find_member_pos(const ark_read_ctx_t *rctx, const char *path,
+                           uint32_t *pos)
+{
+	uint32_t i;
+
+	for (i = 0U;; i++) {
+		const ark_member_meta_t *meta;
+
+		meta = ark_read_member_meta(rctx, i);
+		if (meta == NULL)
+			break;
+		if (strcmp(meta->path, path) == 0) {
+			*pos = i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/*
+ * build_extract_selection - Build selected-members bitmap for extraction.
+ *
+ * ARCHITECTURE.md section 12.2: selected hardlinks include their target file.
+ */
+static int build_extract_selection(const ark_args_t *args,
+                                   const ark_read_ctx_t *rctx,
+                                   size_t member_count, unsigned char *selected,
+                                   ark_error_t *err)
+{
+	uint32_t i;
+
+	if (args->member_count == 0U) {
+		for (i = 0U; i < member_count; i++)
+			selected[i] = 1U;
+		return 0;
+	}
+
+	for (i = 0U; i < args->member_count; i++) {
+		uint32_t pos;
+
+		if (find_member_pos(rctx, args->member_paths[i], &pos) != 0)
+			return fail_error(
+			    err, ARK_ERR_FMT_INDEX,
+			    "requested member not found in archive",
+			    args->member_paths[i], 0);
+		selected[pos] = 1U;
+	}
+
+	for (;;) {
+		int changed;
+
+		changed = 0;
+		for (i = 0U; i < member_count; i++) {
+			const ark_member_meta_t *meta;
+			uint32_t target_pos;
+
+			if (selected[i] == 0U)
+				continue;
+			meta = ark_read_member_meta(rctx, i);
+			if (meta->type != 0x04)
+				continue;
+			if (find_member_pos(rctx, meta->link, &target_pos) != 0)
+				return fail_error(
+				    err, ARK_ERR_FMT_INDEX,
+				    "hardlink target missing in archive",
+				    meta->link, 0);
+			if (selected[target_pos] == 0U) {
+				selected[target_pos] = 1U;
+				changed = 1;
+			}
+		}
+		if (!changed)
+			break;
+	}
+	return 0;
+}
+
+/*
+ * conflict_path_seen - Return 1 when a conflict path was already collected.
+ */
+static int conflict_path_seen(const modified_path_list_t *list,
+                              const char *path)
+{
+	size_t i;
+
+	for (i = 0U; i < list->count; i++) {
+		if (strcmp(list->paths[i], path) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * preflight_conflicts - Collect extraction conflicts before side effects.
+ *
+ * ARCHITECTURE.md section 14.2 requires complete conflict reporting when
+ * --overwrite is not used.
+ */
+static int preflight_conflicts(const ark_args_t *args,
+                               const ark_read_ctx_t *rctx, size_t member_count,
+                               const unsigned char *selected, int dest_fd,
+                               ark_error_t *err)
+{
+	modified_path_list_t conflicts = {0};
+	uint32_t i;
+
+	if (args->overwrite)
+		return 0;
+
+	for (i = 0U; i < member_count; i++) {
+		const ark_member_meta_t *meta;
+		struct stat st;
+
+		if (selected[i] == 0U)
+			continue;
+		meta = ark_read_member_meta(rctx, i);
+		if (ARK_FSTATAT(dest_fd, meta->path, &st,
+		                AT_SYMLINK_NOFOLLOW) == 0) {
+			if (!conflict_path_seen(&conflicts, meta->path) &&
+			    modified_path_list_push(&conflicts, meta->path,
+			                            err) != 0) {
+				modified_path_list_free(&conflicts);
+				return -1;
+			}
+		} else if (errno != ENOENT) {
+			modified_path_list_free(&conflicts);
+			return fail_error(err, ARK_ERR_IO_OPEN,
+			                  "preflight stat failed", meta->path,
+			                  errno);
+		}
+
+		if (args->member_count > 0U) {
+			char ancestor[1024];
+			size_t len;
+
+			copy_msg(ancestor, sizeof(ancestor), meta->path);
+			len = strlen(ancestor);
+			while (len > 0U) {
+				char *slash;
+				uint32_t pos;
+
+				slash = strrchr(ancestor, '/');
+				if (slash == NULL)
+					break;
+				*slash = '\0';
+				len = strlen(ancestor);
+				if (find_member_pos(rctx, ancestor, &pos) ==
+				        0 &&
+				    selected[pos] != 0U)
+					continue;
+				if (ARK_FSTATAT(dest_fd, ancestor, &st,
+				                AT_SYMLINK_NOFOLLOW) == 0) {
+					if (!S_ISDIR(st.st_mode) &&
+					    !conflict_path_seen(&conflicts,
+					                        ancestor) &&
+					    modified_path_list_push(&conflicts,
+					                            ancestor,
+					                            err) != 0) {
+						modified_path_list_free(
+						    &conflicts);
+						return -1;
+					}
+				} else if (errno != ENOENT) {
+					modified_path_list_free(&conflicts);
+					return fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "preflight ancestor stat failed",
+					    ancestor, errno);
+				}
+			}
+		}
+	}
+
+	if (conflicts.count > 0U) {
+		size_t j;
+
+		(void)fputs("ark: extraction conflicts found:\n", stderr);
+		for (j = 0U; j < conflicts.count; j++) {
+			(void)fputs("ark:   ", stderr);
+			(void)fputs(conflicts.paths[j], stderr);
+			(void)fputc('\n', stderr);
+		}
+		modified_path_list_free(&conflicts);
+		return fail_error(err, ARK_ERR_IO_OPEN,
+		                  "conflicting output paths found", "", 0);
+	}
+
+	modified_path_list_free(&conflicts);
+	return 0;
+}
+
+/*
+ * cleanup_track - Record one created path for reverse-order fatal cleanup.
+ */
+static int cleanup_track(cleanup_tracker_t *tracker, const char *path,
+                         int is_dir, ark_error_t *err)
+{
+	cleanup_entry_t *new_entries;
+
+	if (tracker->count == tracker->capacity) {
+		size_t new_cap;
+
+		new_cap =
+		    tracker->capacity == 0U ? 64U : tracker->capacity * 2U;
+		/* OWNERSHIP: tracker owns entries and frees them in
+		 * cleanup_free. */
+		new_entries = (cleanup_entry_t *)realloc(
+		    tracker->entries, new_cap * sizeof(tracker->entries[0]));
+		if (new_entries == NULL)
+			return fail_error(err, ARK_ERR_IO_ALLOC,
+			                  "cleanup tracker allocation failed",
+			                  "", 0);
+		tracker->entries = new_entries;
+		tracker->capacity = new_cap;
+	}
+	copy_msg(tracker->entries[tracker->count].path,
+	         sizeof(tracker->entries[tracker->count].path), path);
+	tracker->entries[tracker->count].is_dir = is_dir;
+	tracker->count++;
+	return 0;
+}
+
+/*
+ * cleanup_run - Remove created paths in reverse order on fatal errors.
+ *
+ * ARCHITECTURE.md section 14.3 requires best-effort cleanup while preserving
+ * the original primary error.
+ */
+static void cleanup_run(cleanup_tracker_t *tracker, int dest_fd)
+{
+	ssize_t i;
+
+	for (i = (ssize_t)tracker->count - 1; i >= 0; i--) {
+		int flags;
+
+		flags = tracker->entries[i].is_dir ? AT_REMOVEDIR : 0;
+		if (ARK_UNLINKAT(dest_fd, tracker->entries[i].path, flags) !=
+		        0 &&
+		    errno != ENOENT)
+			print_warning_path("cleanup failed",
+			                   tracker->entries[i].path);
+	}
+}
+
+/*
+ * cleanup_free - Release cleanup tracker storage.
+ */
+static void cleanup_free(cleanup_tracker_t *tracker)
+{
+	free(tracker->entries);
+	tracker->entries = NULL;
+	tracker->count = 0U;
+	tracker->capacity = 0U;
+}
+
+/*
+ * dir_deferred_push - Queue one directory for deferred metadata restore.
+ */
+static int dir_deferred_push(dir_deferred_meta_t *list,
+                             const ark_member_meta_t *meta, ark_error_t *err)
+{
+	const ark_member_meta_t **new_items;
+
+	if (list->count == list->capacity) {
+		size_t new_cap;
+
+		new_cap = list->capacity == 0U ? 32U : list->capacity * 2U;
+		/* OWNERSHIP: list owns pointer array and frees it in
+		 * dir_deferred_free. */
+		new_items = (const ark_member_meta_t **)realloc(
+		    (void *)list->items, new_cap * sizeof(list->items[0]));
+		if (new_items == NULL)
+			return fail_error(
+			    err, ARK_ERR_IO_ALLOC,
+			    "deferred directory list allocation failed", "", 0);
+		list->items = new_items;
+		list->capacity = new_cap;
+	}
+	list->items[list->count++] = meta;
+	return 0;
+}
+
+/*
+ * dir_deferred_free - Release deferred-directory pointer array storage.
+ */
+static void dir_deferred_free(dir_deferred_meta_t *list)
+{
+	free((void *)list->items);
+	list->items = NULL;
+	list->count = 0U;
+	list->capacity = 0U;
+}
+
+/*
+ * ensure_parent_dirs - Handle parent dir precondition for a member path.
+ *
+ * ARCHITECTURE.md section 14.4: full extraction rejects missing parents as
+ * format error; selective extraction may create missing parents with mode 0700.
+ */
+static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
+                              int selective, cleanup_tracker_t *tracker,
+                              ark_error_t *err)
+{
+	char path[1024];
+	char *slash;
+
+	copy_msg(path, sizeof(path), meta->path);
+	for (slash = strchr(path, '/'); slash != NULL;
+	     slash = strchr(slash + 1, '/')) {
+		struct stat st;
+
+		*slash = '\0';
+		if (ARK_FSTATAT(dest_fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+			if (!S_ISDIR(st.st_mode))
+				return fail_error(
+				    err, ARK_ERR_FMT_INDEX,
+				    "ancestor path is not a directory",
+				    meta->path, 0);
+			*slash = '/';
+			continue;
+		}
+		if (errno != ENOENT)
+			return fail_error(err, ARK_ERR_IO_OPEN,
+			                  "ancestor stat failed", meta->path,
+			                  errno);
+		if (!selective)
+			return fail_error(
+			    err, ARK_ERR_FMT_INDEX,
+			    "missing ancestor directory in archive order",
+			    meta->path, 0);
+		if (ARK_MKDIRAT(dest_fd, path, 0700) != 0)
+			return fail_error(err, ARK_ERR_IO_MKDIR,
+			                  "implicit directory creation failed",
+			                  path, errno);
+		/*
+		 * SAFETY: track created object immediately after mkdirat and
+		 * before any subsequent fallible operation. See ARCHITECTURE.md
+		 * section 14.3.
+		 */
+		if (cleanup_track(tracker, path, 1, err) != 0)
+			return -1;
+		*slash = '/';
+	}
+	return 0;
+}
+
+/*
+ * decode_mtime - Convert stored nanoseconds since epoch into timespec pair.
+ */
+static void decode_mtime(uint64_t mtime, struct timespec times[2])
+{
+	int64_t ns_total;
+	int64_t sec;
+	int64_t nsec;
+
+	ns_total = (int64_t)mtime;
+	sec = ns_total / INT64_C(1000000000);
+	nsec = ns_total % INT64_C(1000000000);
+	if (nsec < 0) {
+		sec--;
+		nsec += INT64_C(1000000000);
+	}
+	times[0].tv_sec = 0;
+	times[0].tv_nsec = UTIME_OMIT;
+	times[1].tv_sec = (time_t)sec;
+	times[1].tv_nsec = (long)nsec;
+}
+
+/*
+ * restore_regular_meta - Restore regular file metadata while fd is open.
+ *
+ * SAFETY: ARK_FCHOWN runs before ARK_FCHMOD. See ARCHITECTURE.md section 14.5.
+ */
+static int restore_regular_meta(int fd, const ark_member_meta_t *meta,
+                                ark_error_t *err)
+{
+	struct timespec times[2];
+	int rc;
+
+	decode_mtime(meta->mtime, times);
+	if (geteuid() == 0) {
+		do {
+			rc = ARK_FCHOWN(fd, (uid_t)meta->uid, (gid_t)meta->gid);
+		} while (rc != 0 && errno == EINTR);
+		if (rc != 0 && errno != EPERM)
+			return fail_error(err, ARK_ERR_IO_CHOWN,
+			                  "fchown failed", meta->path, errno);
+		if (rc != 0 && errno == EPERM)
+			print_warning_path("ownership restore not permitted",
+			                   meta->path);
+	}
+	do {
+		rc = ARK_FCHMOD(fd, (mode_t)(meta->mode & 0777U));
+	} while (rc != 0 && errno == EINTR);
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_IO_CHMOD, "fchmod failed",
+		                  meta->path, errno);
+	do {
+		rc = ARK_FUTIMENS(fd, times);
+	} while (rc != 0 && errno == EINTR);
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_IO_UTIMES, "futimens failed",
+		                  meta->path, errno);
+	return 0;
+}
+
+/*
+ * restore_symlink_meta - Best-effort symlink owner/mtime restoration.
+ */
+static void restore_symlink_meta(int dest_fd, const ark_member_meta_t *meta)
+{
+	struct timespec times[2];
+	int rc;
+
+	decode_mtime(meta->mtime, times);
+	if (geteuid() == 0) {
+		do {
+			rc =
+			    ARK_FCHOWNAT(dest_fd, meta->path, (uid_t)meta->uid,
+			                 (gid_t)meta->gid, AT_SYMLINK_NOFOLLOW);
+		} while (rc != 0 && errno == EINTR);
+		if (rc != 0)
+			print_warning_path("symlink ownership restore failed",
+			                   meta->path);
+	}
+	do {
+		rc = ARK_UTIMENSAT(dest_fd, meta->path, times,
+		                   AT_SYMLINK_NOFOLLOW);
+	} while (rc != 0 && errno == EINTR);
+	if (rc != 0)
+		print_warning_path("symlink mtime restore failed", meta->path);
+}
+
+/*
+ * apply_deferred_dir_meta - Restore directory metadata in reverse index order.
+ */
+static void apply_deferred_dir_meta(int dest_fd,
+                                    const dir_deferred_meta_t *list)
+{
+	ssize_t i;
+
+	for (i = (ssize_t)list->count - 1; i >= 0; i--) {
+		const ark_member_meta_t *meta;
+		struct timespec times[2];
+		int rc;
+
+		meta = list->items[i];
+		decode_mtime(meta->mtime, times);
+		if (geteuid() == 0) {
+			do {
+				rc = ARK_FCHOWNAT(dest_fd, meta->path,
+				                  (uid_t)meta->uid,
+				                  (gid_t)meta->gid, 0);
+			} while (rc != 0 && errno == EINTR);
+			if (rc != 0)
+				print_warning_path(
+				    "directory ownership restore failed",
+				    meta->path);
+		}
+		do {
+			rc = ARK_FCHMODAT(dest_fd, meta->path,
+			                  (mode_t)(meta->mode & 0777U), 0);
+		} while (rc != 0 && errno == EINTR);
+		if (rc != 0)
+			print_warning_path("directory mode restore failed",
+			                   meta->path);
+		do {
+			rc = ARK_UTIMENSAT(dest_fd, meta->path, times, 0);
+		} while (rc != 0 && errno == EINTR);
+		if (rc != 0)
+			print_warning_path("directory mtime restore failed",
+			                   meta->path);
+	}
+}
+
+/*
+ * print_member_row - Print one fixed-column list output row.
+ */
+static int print_member_row(const ark_member_meta_t *meta)
+{
+	const char *type;
+
+	switch (meta->type) {
+	case 0x01:
+		type = "file";
+		break;
+	case 0x02:
+		type = "dir";
+		break;
+	case 0x03:
+		type = "symlink";
+		break;
+	case 0x04:
+		type = "hardlink";
+		break;
+	default:
+		type = "unknown";
+		break;
+	}
+	if (printf("%-8s %12llu %04o %20llu %s\n", type,
+	           (unsigned long long)meta->size_original,
+	           (unsigned int)(meta->mode & 0777U),
+	           (unsigned long long)meta->mtime, meta->path) < 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * cmd_list - Validate archive and print member rows from the index.
+ */
+static int cmd_list(const ark_args_t *args, ark_error_t *err)
+{
+	ark_read_ctx_storage_t rstorage = {0};
+	ark_read_ctx_t *rctx;
+	uint8_t *index_buf;
+	int fd;
+	int rc;
+
+	rctx = (ark_read_ctx_t *)rstorage.bytes;
+	index_buf = NULL;
+	rc = -1;
+	fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
+	if (fd == -1)
+		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
+		                  args->archive_path, errno);
+	if (read_archive_index(fd, args->archive_path, rctx, &index_buf,
+	                       &(size_t){0}, err) != 0)
+		goto cleanup;
+
+	if (args->member_count == 0U) {
+		size_t i;
+
+		for (i = 0U;; i++) {
+			const ark_member_meta_t *meta;
+
+			meta = ark_read_member_meta(rctx, (uint32_t)i);
+			if (meta == NULL)
+				break;
+			if (print_member_row(meta) != 0) {
+				(void)fail_error(err, ARK_ERR_IO_WRITE,
+				                 "list output failed", "",
+				                 errno);
+				goto cleanup;
+			}
+		}
+	} else {
+		size_t i;
+
+		for (i = 0U; i < args->member_count; i++) {
+			uint32_t pos;
+			const ark_member_meta_t *meta;
+
+			if (find_member_pos(rctx, args->member_paths[i],
+			                    &pos) != 0) {
+				(void)fail_error(
+				    err, ARK_ERR_FMT_INDEX,
+				    "requested member not found in archive",
+				    args->member_paths[i], 0);
+				goto cleanup;
+			}
+			meta = ark_read_member_meta(rctx, pos);
+			if (print_member_row(meta) != 0) {
+				(void)fail_error(err, ARK_ERR_IO_WRITE,
+				                 "list output failed", "",
+				                 errno);
+				goto cleanup;
+			}
+		}
+	}
+	rc = 0;
+
+cleanup:
+	if (ARK_CLOSE(fd) != 0 && rc == 0)
+		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
+		                args->archive_path, errno);
+	free(index_buf);
+	ark_read_free(rctx);
+	return rc;
+}
+
+/*
+ * cmd_extract - Validate archive and extract selected members in index order.
+ */
+static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
+{
+	ark_read_ctx_storage_t rstorage = {0};
+	ark_read_ctx_t *rctx;
+	cleanup_tracker_t tracker = {0};
+	dir_deferred_meta_t deferred_dirs = {0};
+	uint8_t *index_buf;
+	unsigned char *selected;
+	uint8_t *comp_buf;
+	uint8_t *decomp_buf;
+	size_t index_len;
+	size_t member_count;
+	size_t comp_cap;
+	int archive_fd;
+	int out_fd;
+	int rc;
+
+	rctx = (ark_read_ctx_t *)rstorage.bytes;
+	index_buf = NULL;
+	selected = NULL;
+	comp_buf = NULL;
+	decomp_buf = NULL;
+	out_fd = -1;
+	rc = -1;
+	archive_fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
+	if (archive_fd == -1)
+		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
+		                  args->archive_path, errno);
+	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
+	                       &index_len, err) != 0)
+		goto cleanup;
+
+	member_count = read_member_count(rctx);
+	selected = (unsigned char *)calloc(member_count + 1U, 1U);
+	if (selected == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "selection allocation failed", "", 0);
+		goto cleanup;
+	}
+	if (build_extract_selection(args, rctx, member_count, selected, err) !=
+	    0)
+		goto cleanup;
+	if (preflight_conflicts(args, rctx, member_count, selected, dest_fd,
+	                        err) != 0)
+		goto cleanup;
+
+	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+	/* OWNERSHIP: command cleanup frees both chunk buffers. */
+	comp_buf = (uint8_t *)malloc(comp_cap);
+	decomp_buf = (uint8_t *)malloc(ARK_CHUNK_SIZE);
+	if (comp_buf == NULL || decomp_buf == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "chunk buffer allocation failed", "", 0);
+		goto cleanup;
+	}
+
+	for (uint32_t i = 0U; i < member_count; i++) {
+		const ark_member_meta_t *meta;
+		int selective;
+		struct stat st;
+		int exists;
+
+		if (selected[i] == 0U)
+			continue;
+		meta = ark_read_member_meta(rctx, i);
+		selective = (args->member_count > 0U);
+		if (ensure_parent_dirs(meta, dest_fd, selective, &tracker,
+		                       err) != 0)
+			goto cleanup;
+
+		exists = (ARK_FSTATAT(dest_fd, meta->path, &st,
+		                      AT_SYMLINK_NOFOLLOW) == 0);
+		if (!exists && errno != ENOENT) {
+			(void)fail_error(err, ARK_ERR_IO_OPEN,
+			                 "destination stat failed", meta->path,
+			                 errno);
+			goto cleanup;
+		}
+
+		switch (meta->type) {
+		case 0x02:
+			if (exists) {
+				if (!S_ISDIR(st.st_mode)) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "directory cannot replace "
+					    "non-directory",
+					    meta->path, 0);
+					goto cleanup;
+				}
+			} else {
+				if (ARK_MKDIRAT(dest_fd, meta->path, 0700) !=
+				    0) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_MKDIR,
+					    "directory create failed",
+					    meta->path, errno);
+					goto cleanup;
+				}
+				if (cleanup_track(&tracker, meta->path, 1,
+				                  err) != 0)
+					goto cleanup;
+			}
+			if (dir_deferred_push(&deferred_dirs, meta, err) != 0)
+				goto cleanup;
+			break;
+		case 0x03:
+			if (exists) {
+				if (S_ISDIR(st.st_mode)) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "symlink cannot replace directory",
+					    meta->path, 0);
+					goto cleanup;
+				}
+				if (!args->overwrite) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "destination already exists",
+					    meta->path, EEXIST);
+					goto cleanup;
+				}
+				if (ARK_UNLINKAT(dest_fd, meta->path, 0) != 0) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "overwrite unlink failed",
+					    meta->path, errno);
+					goto cleanup;
+				}
+			}
+			if (ARK_SYMLINKAT(meta->link, dest_fd, meta->path) !=
+			    0) {
+				(void)fail_error(err, ARK_ERR_IO_SYMLINK,
+				                 "symlink create failed",
+				                 meta->path, errno);
+				goto cleanup;
+			}
+			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
+				goto cleanup;
+			restore_symlink_meta(dest_fd, meta);
+			break;
+		case 0x04:
+			if (exists) {
+				if (S_ISDIR(st.st_mode)) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "hardlink cannot replace directory",
+					    meta->path, 0);
+					goto cleanup;
+				}
+				if (!args->overwrite) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "destination already exists",
+					    meta->path, EEXIST);
+					goto cleanup;
+				}
+				if (ARK_UNLINKAT(dest_fd, meta->path, 0) != 0) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "overwrite unlink failed",
+					    meta->path, errno);
+					goto cleanup;
+				}
+			}
+			if (ARK_LINKAT(dest_fd, meta->link, dest_fd, meta->path,
+			               0) != 0) {
+				(void)fail_error(err, ARK_ERR_IO_LINK,
+				                 "hardlink create failed",
+				                 meta->path, errno);
+				goto cleanup;
+			}
+			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
+				goto cleanup;
+			break;
+		case 0x01: {
+			uint32_t chunk;
+			uint64_t chunk_off;
+
+			if (exists) {
+				if (S_ISDIR(st.st_mode)) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "file cannot replace directory",
+					    meta->path, 0);
+					goto cleanup;
+				}
+				if (!args->overwrite) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "destination already exists",
+					    meta->path, EEXIST);
+					goto cleanup;
+				}
+				if (ARK_UNLINKAT(dest_fd, meta->path, 0) != 0) {
+					(void)fail_error(
+					    err, ARK_ERR_IO_OPEN,
+					    "overwrite unlink failed",
+					    meta->path, errno);
+					goto cleanup;
+				}
+			}
+			/*
+			 * SAFETY: O_NOFOLLOW is required on extraction output
+			 * opens to prevent symlink substitution races. See
+			 * ARCHITECTURE.md section 14.2.
+			 */
+			out_fd = ARK_OPENAT(dest_fd, meta->path,
+			                    O_CREAT | O_WRONLY | O_NOFOLLOW |
+			                        O_CLOEXEC |
+			                        (args->overwrite ? 0 : O_EXCL),
+			                    0600);
+			if (out_fd == -1) {
+				(void)fail_error(err, ARK_ERR_IO_OPEN,
+				                 "output open failed",
+				                 meta->path, errno);
+				goto cleanup;
+			}
+			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
+				goto cleanup;
+
+			if (ark_read_verify_member_begin(rctx, meta, err) != 0)
+				goto cleanup;
+			chunk_off = meta->data_offset;
+			for (chunk = 0U; chunk < meta->chunk_count; chunk++) {
+				size_t csz;
+				ssize_t out_len;
+
+				csz = (size_t)meta->chunk_sizes[chunk];
+				if (csz > comp_cap) {
+					(void)fail_error(
+					    err, ARK_ERR_FMT_INDEX,
+					    "chunk size exceeds bound",
+					    meta->path, 0);
+					goto cleanup;
+				}
+				if (ARK_LSEEK(archive_fd, (off_t)chunk_off,
+				              SEEK_SET) == (off_t)-1) {
+					(void)fail_error(err, ARK_ERR_IO_SEEK,
+					                 "archive seek failed",
+					                 meta->path, errno);
+					goto cleanup;
+				}
+				if (read_full(archive_fd, comp_buf, csz,
+				              meta->path, err) != 0)
+					goto cleanup;
+				if (ark_read_verify_member_update(
+				        rctx, meta, chunk, comp_buf, csz,
+				        err) != 0)
+					goto cleanup;
+				out_len = ark_read_chunk(
+				    rctx, meta, chunk, comp_buf, csz,
+				    decomp_buf, ARK_CHUNK_SIZE, err);
+				if (out_len < 0)
+					goto cleanup;
+				if (write_full(out_fd, decomp_buf,
+				               (size_t)out_len, meta->path,
+				               err) != 0)
+					goto cleanup;
+				chunk_off += (uint64_t)csz;
+			}
+			if (ark_read_verify_member_final(rctx, meta, err) != 0)
+				goto cleanup;
+			if (restore_regular_meta(out_fd, meta, err) != 0)
+				goto cleanup;
+			if (ARK_CLOSE(out_fd) != 0) {
+				(void)fail_error(err, ARK_ERR_IO_WRITE,
+				                 "output close failed",
+				                 meta->path, errno);
+				goto cleanup;
+			}
+			out_fd = -1;
+			break;
+		}
+		default:
+			(void)fail_error(err, ARK_ERR_FMT_MEMBER_TYPE,
+			                 "unsupported member type", meta->path,
+			                 0);
+			goto cleanup;
+		}
+	}
+
+	apply_deferred_dir_meta(dest_fd, &deferred_dirs);
+	rc = 0;
+
+cleanup:
+	if (out_fd != -1)
+		(void)ARK_CLOSE(out_fd);
+	if (rc != 0 && tracker.count > 0U) {
+		ark_error_t saved;
+
+		saved = *err;
+		cleanup_run(&tracker, dest_fd);
+		*err = saved;
+	}
+	cleanup_free(&tracker);
+	dir_deferred_free(&deferred_dirs);
+	free(decomp_buf);
+	free(comp_buf);
+	free(selected);
+	free(index_buf);
+	if (ARK_CLOSE(archive_fd) != 0 && rc == 0)
+		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
+		                args->archive_path, errno);
+	(void)index_len;
+	ark_read_free(rctx);
 	return rc;
 }
 
@@ -1026,9 +2145,9 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 		meta.data_offset = *ctx->output_offset;
 
 	/*
-	 * SAFETY: O_NOFOLLOW prevents a file swapped to a symlink after lstat
-	 * from being followed during create traversal. See ARCHITECTURE.md
-	 * section 13.3.
+	 * SAFETY: O_NOFOLLOW is required on extraction output
+	 * opens to prevent symlink substitution races. See
+	 * ARCHITECTURE.md section 14.2.
 	 */
 	fd = ARK_OPEN(abs_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
 	if (fd == -1) {
@@ -2097,7 +3216,8 @@ static int parse_args(int argc, char **argv, ark_args_t *args, ark_error_t *err)
 
 		if (strcmp(argv[i], "--member") == 0) {
 			if (args->cmd != ARK_CMD_EXTRACT &&
-			    args->cmd != ARK_CMD_VERIFY)
+			    args->cmd != ARK_CMD_VERIFY &&
+			    args->cmd != ARK_CMD_LIST)
 				goto fail_usage_member_scope;
 			if (++i >= argc)
 				goto fail_usage_member_missing;
@@ -2177,7 +3297,8 @@ fail_usage_output_missing:
 	(void)usage_error(err, "missing value for --output");
 	goto fail;
 fail_usage_member_scope:
-	(void)usage_error(err, "--member is valid only for extract or verify");
+	(void)usage_error(
+	    err, "--member is valid only for extract, list, or verify");
 	goto fail;
 fail_usage_member_missing:
 	(void)usage_error(err, "missing value for --member");
@@ -2232,13 +3353,42 @@ int main(int argc, char **argv)
 {
 	ark_args_t args;
 	ark_error_t err = {0};
+	int extract_dest_fd;
 	int rc;
+
+	extract_dest_fd = -1;
 
 	if (parse_args(argc, argv, &args, &err) != 0) {
 		if (err.code == ARK_ERR_USAGE)
 			print_usage(err.msg);
 		(void)fputs("ark: argument parsing failed\n", stderr);
 		return 1;
+	}
+
+	if (args.cmd == ARK_CMD_EXTRACT) {
+		/*
+		 * Extract pre-sandbox setup must open destination dirfd before
+		 * sandbox application. See ARCHITECTURE.md section 10.4.
+		 */
+		extract_dest_fd = ARK_OPEN(
+		    args.output_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+		if (extract_dest_fd == -1) {
+			(void)fail_error(&err, ARK_ERR_IO_OPEN,
+			                 "output directory open failed",
+			                 args.output_path, errno);
+			if (err.path[0] != '\0')
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputs(": ", stderr),
+				    (void)fputs(err.path, stderr),
+				    (void)fputc('\n', stderr);
+			else
+				(void)fputs("ark: ", stderr),
+				    (void)fputs(err.msg, stderr),
+				    (void)fputc('\n', stderr);
+			args_free(&args);
+			return exit_code_from_err(err.code);
+		}
 	}
 
 #if defined(__linux__) || defined(__OpenBSD__)
@@ -2271,28 +3421,40 @@ int main(int argc, char **argv)
 			    (void)fputs(err.msg, stderr),
 			    (void)fputc('\n', stderr);
 		args_free(&args);
+		if (extract_dest_fd != -1)
+			(void)ARK_CLOSE(extract_dest_fd);
 		return 1;
 	}
 #endif
 
-	if (args.cmd == ARK_CMD_CREATE) {
+	if (args.cmd == ARK_CMD_CREATE)
 		rc = cmd_create(&args, &err);
-		if (rc != 0) {
-			if (err.path[0] != '\0')
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputs(": ", stderr),
-				    (void)fputs(err.path, stderr),
-				    (void)fputc('\n', stderr);
-			else
-				(void)fputs("ark: ", stderr),
-				    (void)fputs(err.msg, stderr),
-				    (void)fputc('\n', stderr);
-			args_free(&args);
-			return exit_code_from_err(err.code);
-		}
+	else if (args.cmd == ARK_CMD_EXTRACT)
+		rc = cmd_extract(&args, extract_dest_fd, &err);
+	else if (args.cmd == ARK_CMD_LIST)
+		rc = cmd_list(&args, &err);
+	else
+		rc = 0;
+
+	if (rc != 0) {
+		if (err.path[0] != '\0')
+			(void)fputs("ark: ", stderr),
+			    (void)fputs(err.msg, stderr),
+			    (void)fputs(": ", stderr),
+			    (void)fputs(err.path, stderr),
+			    (void)fputc('\n', stderr);
+		else
+			(void)fputs("ark: ", stderr),
+			    (void)fputs(err.msg, stderr),
+			    (void)fputc('\n', stderr);
+		args_free(&args);
+		if (extract_dest_fd != -1)
+			(void)ARK_CLOSE(extract_dest_fd);
+		return exit_code_from_err(err.code);
 	}
 
 	args_free(&args);
+	if (extract_dest_fd != -1)
+		(void)ARK_CLOSE(extract_dest_fd);
 	return 0;
 }
