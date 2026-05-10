@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-10
 **Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.2 - Shared error state
+**Next Task:** Phase 6.3 - Worker threads
 
 ### Phase Summary
 
@@ -657,10 +657,10 @@ TSan clean on Linux.
 - [x] Verify: I/O thread unblocks when abort sentinel is written to the
   awaited slot
 
-**6.2 - Shared error state**
-- [ ] Implement `ark_shared_err_t`: atomic flag (`_Atomic int`) indicating
+**6.2 - Shared error state** ✓ DONE
+- [x] Implement `ark_shared_err_t`: atomic flag (`_Atomic int`) indicating
   an error has been recorded; `ark_error_t` for the first worker error
-- [ ] Implement `error_store_once`: compare-and-swap write; only first
+- [x] Implement `error_store_once`: compare-and-swap write; only first
   worker error is stored; subsequent calls are no-ops
 
 **6.3 - Worker threads**

@@ -122,6 +122,11 @@ typedef struct {
 typedef struct ring_buf ring_buf_t;
 
 typedef struct {
+	_Atomic int recorded;
+	ark_error_t error;
+} ark_shared_err_t;
+
+typedef struct {
 	uint64_t seq;
 	uint8_t *data;
 	size_t len;
@@ -144,6 +149,7 @@ int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
 void ring_buf_free(ring_buf_t *);
+void error_store_once(ark_shared_err_t *, const ark_error_t *);
 
 static int fail_error(ark_error_t *, ark_err_t, const char *, const char *,
                       int);
@@ -406,6 +412,39 @@ void ring_buf_free(ring_buf_t *ring)
 	(void)pthread_mutex_destroy(&ring->mutex);
 	free(ring->slots);
 	free(ring);
+}
+
+/*
+ * error_store_once - Store the first worker error in shared state.
+ *
+ * Uses compare-and-swap so only the first worker publishes an error copy;
+ * subsequent worker failures are intentionally discarded.
+ *
+ * Returns void. Invalid arguments are ignored.
+ *
+ * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.3.
+ */
+void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
+{
+	int expected;
+
+	if (shared == NULL || err == NULL)
+		return;
+
+	expected = 0;
+	/* NOTE: use compiler atomics directly so this path does not depend on
+	 * <stdatomic.h> header availability across toolchains; cast to int *
+	 * matches __atomic_compare_exchange_n argument requirements. */
+	if (!__atomic_compare_exchange_n((int *)&shared->recorded, &expected, 1,
+	                                 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return;
+
+	/*
+	 * SAFETY: only the compare-and-swap winner writes shared->error.
+	 * This preserves first-error-wins semantics for worker-to-I/O error
+	 * propagation from ARCHITECTURE.md section 6.3.
+	 */
+	shared->error = *err;
 }
 
 static int parse_args(int, char **, ark_args_t *, ark_error_t *);
