@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-10
 **Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.6 - Thread pool tests
+**Next Task:** Phase 6.7 - Parallel correctness
 
 ### Phase Summary
 
@@ -35,8 +35,8 @@
 | M10 | Single-threaded extract round-trip: extracted content byte-identical to source | DONE |
 | M11 | Sandboxing: all subcommands operate correctly under pledge/unveil on OpenBSD | DONE |
 | M12 | Sandboxing: all subcommands operate correctly under Landlock on Linux 5.13+ | DONE |
-| M13 | Thread pool: no deadlock on worker error (ring buffer abort sentinel unblocks I/O thread) | NOT STARTED |
-| M14 | Thread pool: TSan clean | NOT STARTED |
+| M13 | Thread pool: no deadlock on worker error (ring buffer abort sentinel unblocks I/O thread) | DONE |
+| M14 | Thread pool: TSan clean | DONE |
 | M15 | Parallel create: output bit-identical to single-threaded create on same input | NOT STARTED |
 | M16 | Fault injection: every create sequence step covered with forced failure | NOT STARTED |
 | M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
@@ -698,13 +698,13 @@ TSan clean on Linux.
 - [x] Verify: `pthread_join` completes for all workers before any cleanup
   filesystem operation
 
-**6.6 - Thread pool tests**
-- [ ] Implement all ring buffer tests per TESTING.md §4.1
-- [ ] Implement all worker error propagation tests per TESTING.md §4.2
-- [ ] Implement all cancellation and quiescence tests per TESTING.md §4.3
-- [ ] All thread tests pass
-- [ ] `make test-tsan` passes: zero data races
-- [ ] Quality milestones M13, M14 confirmed
+**6.6 - Thread pool tests** ✓ DONE
+- [x] Implement all ring buffer tests per TESTING.md §4.1
+- [x] Implement all worker error propagation tests per TESTING.md §4.2
+- [x] Implement all cancellation and quiescence tests per TESTING.md §4.3
+- [x] All thread tests pass
+- [x] `make test-tsan` passes: zero data races
+- [x] Quality milestones M13, M14 confirmed
 
 **6.7 - Parallel correctness**
 - [ ] Verify parallel create output is bit-identical to single-threaded

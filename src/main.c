@@ -1069,6 +1069,20 @@ static void format_u64_dec(uint64_t, char *, size_t);
 static void format_size_human(uint64_t, char *, size_t);
 static void format_mtime_human(uint64_t, char *, size_t);
 
+#ifdef ARK_TEST
+ark_pool_t *pool_test_init(int, int, ark_error_t *);
+int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
+                     ark_deflate_mode_t);
+int pool_test_read(ark_pool_t *, uint64_t, uint8_t **, size_t *, int *,
+                   ark_err_t *, ark_error_t *);
+void pool_test_cancel(ark_pool_t *);
+void pool_test_shutdown(ark_pool_t *);
+int pool_get_cancel_flag(const ark_pool_t *);
+ark_error_t pool_get_shared_err(const ark_pool_t *);
+int pool_get_sentinel_count(const ark_pool_t *);
+void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
+#endif
+
 #ifdef __linux__
 static uint64_t landlock_read_rights(void);
 static uint64_t landlock_create_rights(int);
@@ -4957,6 +4971,111 @@ static void print_usage(const char *problem)
 }
 
 #ifdef ARK_TEST
+/* ARK_TEST only: create a test pool (decompress non-zero selects worker mode).
+ */
+ark_pool_t *pool_test_init(int n_workers, int decompress, ark_error_t *err)
+{
+	ark_pool_mode_t mode;
+
+	mode = decompress ? ARK_POOL_DECOMPRESS : ARK_POOL_COMPRESS;
+	return pool_init(n_workers, mode, err);
+}
+
+/* ARK_TEST only: submit one work item into a test pool queue. */
+int pool_test_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
+                     size_t src_len, ark_deflate_mode_t mode)
+{
+	return pool_submit(pool, seq, src, src_len, mode);
+}
+
+/* ARK_TEST only: read one ring slot through pool-owned ring buffer. */
+int pool_test_read(ark_pool_t *pool, uint64_t seq, uint8_t **data, size_t *len,
+                   int *abort, ark_err_t *worker_err, ark_error_t *err)
+{
+	if (pool == NULL)
+		return -1;
+	return ring_buf_read(pool->ring, seq, data, len, abort, worker_err,
+	                     err);
+}
+
+/* ARK_TEST only: emulate I/O-thread cancellation signaling for tests. */
+void pool_test_cancel(ark_pool_t *pool)
+{
+	if (pool == NULL)
+		return;
+	__atomic_store_n((int *)&pool->cancelled, 1, __ATOMIC_RELEASE);
+	if (pthread_mutex_lock(&pool->mutex) == 0) {
+		(void)pthread_cond_broadcast(&pool->cv_not_empty);
+		(void)pthread_cond_broadcast(&pool->cv_not_full);
+		(void)pthread_mutex_unlock(&pool->mutex);
+	}
+}
+
+/* ARK_TEST only: release test pool and join workers. */
+void pool_test_shutdown(ark_pool_t *pool)
+{
+	pool_shutdown(pool);
+}
+
+/* ARK_TEST only: expose current cancellation flag for thread tests. */
+int pool_get_cancel_flag(const ark_pool_t *pool)
+{
+	if (pool == NULL)
+		return 0;
+	return __atomic_load_n((const int *)&pool->cancelled, __ATOMIC_ACQUIRE);
+}
+
+/* ARK_TEST only: return a snapshot copy of shared first-worker error. */
+ark_error_t pool_get_shared_err(const ark_pool_t *pool)
+{
+	ark_error_t out;
+
+	out = (ark_error_t){0};
+	if (pool == NULL)
+		return out;
+	if (__atomic_load_n((const int *)&pool->shared_err.recorded,
+	                    __ATOMIC_ACQUIRE) == 0)
+		return out;
+	return pool->shared_err.error;
+}
+
+/* ARK_TEST only: count ring slots currently holding abort sentinels. */
+int pool_get_sentinel_count(const ark_pool_t *pool)
+{
+	int count;
+	size_t i;
+
+	if (pool == NULL || pool->ring == NULL)
+		return 0;
+	if (pthread_mutex_lock(&pool->ring->mutex) != 0)
+		return 0;
+	count = 0;
+	for (i = 0U; i < pool->ring->n_slots; i++) {
+		if (pool->ring->slots[i].ready && pool->ring->slots[i].abort)
+			count++;
+	}
+	(void)pthread_mutex_unlock(&pool->ring->mutex);
+	return count;
+}
+
+/* ARK_TEST only: inject worker error + abort sentinel (slot sequence 0). */
+void pool_inject_worker_error(ark_pool_t *pool, ark_err_t code, int errno_value)
+{
+	ark_error_t local_err;
+
+	if (pool == NULL || pool->ring == NULL)
+		return;
+
+	local_err = (ark_error_t){0};
+	(void)fail_error(&local_err, code, "ARK_TEST injected worker error", "",
+	                 errno_value);
+	error_store_once(&pool->shared_err, &local_err);
+	/* SAFETY: publish abort sentinel after shared error is stored so
+	 * the I/O thread observes first-error metadata before abort handling.
+	 * See ARCHITECTURE.md section 6.3. */
+	(void)ring_buf_abort(pool->ring, 0U, code, NULL);
+}
+
 /*
  * ark_test_keep_main_symbols - Keep CLI-only static roots referenced in
  * ARK_TEST builds where main() is intentionally excluded.

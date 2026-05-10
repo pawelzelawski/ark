@@ -141,6 +141,16 @@ int test_ring_out_of_order_completion(void);
 int test_ring_abort_sentinel_written(void);
 int test_ring_io_thread_unblocks_on_abort(void);
 int test_ring_abort_does_not_block(void);
+int test_worker_error_stores_first(void);
+int test_worker_error_subsequent_discarded(void);
+int test_worker_error_then_sentinel(void);
+int test_io_thread_reads_worker_error(void);
+int test_worker_error_triggers_cancel(void);
+int test_cancel_workers_exit_cleanly(void);
+int test_cancel_join_completes(void);
+int test_quiescence_sequence_order(void);
+int test_no_resource_leak_on_cancel(void);
+int test_no_cleanup_race(void);
 
 int test_sha256_empty(void);
 int test_sha256_abc(void);
@@ -350,6 +360,17 @@ static const test_case_t g_tests[] = {
     {"test_ring_io_thread_unblocks_on_abort",
      test_ring_io_thread_unblocks_on_abort},
     {"test_ring_abort_does_not_block", test_ring_abort_does_not_block},
+    {"test_worker_error_stores_first", test_worker_error_stores_first},
+    {"test_worker_error_subsequent_discarded",
+     test_worker_error_subsequent_discarded},
+    {"test_worker_error_then_sentinel", test_worker_error_then_sentinel},
+    {"test_io_thread_reads_worker_error", test_io_thread_reads_worker_error},
+    {"test_worker_error_triggers_cancel", test_worker_error_triggers_cancel},
+    {"test_cancel_workers_exit_cleanly", test_cancel_workers_exit_cleanly},
+    {"test_cancel_join_completes", test_cancel_join_completes},
+    {"test_quiescence_sequence_order", test_quiescence_sequence_order},
+    {"test_no_resource_leak_on_cancel", test_no_resource_leak_on_cancel},
+    {"test_no_cleanup_race", test_no_cleanup_race},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_stub", test_integration_stub},
 };
