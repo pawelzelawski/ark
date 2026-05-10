@@ -116,6 +116,7 @@ typedef struct {
 } dir_deferred_meta_t;
 
 typedef struct ark_pool ark_pool_t;
+typedef struct ark_worker_arg ark_worker_arg_t;
 
 typedef struct {
 	char root[PATH_MAX];
@@ -150,6 +151,7 @@ typedef struct {
 	uint64_t seq;
 	uint8_t *data;
 	size_t len;
+	size_t cap;
 	int ready;
 	int abort;
 	ark_err_t worker_err;
@@ -159,8 +161,23 @@ typedef struct {
 	uint64_t seq;
 	uint8_t *src;
 	size_t src_len;
+	uint8_t *dst;
+	size_t dst_cap;
 	ark_deflate_mode_t mode;
 } pool_work_t;
+
+typedef struct {
+	uint8_t *src;
+	size_t cap;
+} pool_queue_slot_t;
+
+struct ark_worker_arg {
+	ark_pool_t *pool;
+	uint8_t *src;
+	uint8_t *dst;
+	size_t src_cap;
+	size_t dst_cap;
+};
 
 struct ring_buf {
 	size_t n_slots;
@@ -173,6 +190,8 @@ struct ark_pool {
 	int n_workers;
 	ark_pool_mode_t mode;
 	pthread_t *workers;
+	ark_worker_arg_t *worker_args;
+	pool_queue_slot_t *queue_slots;
 	pool_work_t *queue;
 	size_t q_cap;
 	size_t q_head;
@@ -184,14 +203,20 @@ struct ark_pool {
 	_Atomic int cancelled;
 	ring_buf_t *ring;
 	ark_shared_err_t shared_err;
+#ifdef ARK_TEST
+	_Atomic unsigned int event_seq;
+	_Atomic unsigned int error_event;
+	_Atomic unsigned int abort_event;
+#endif
 };
 
 ring_buf_t *ring_buf_init(size_t, ark_error_t *);
-int ring_buf_write(ring_buf_t *, uint64_t, uint8_t *, size_t, ark_err_t,
+int ring_buf_write(ring_buf_t *, uint64_t, const uint8_t *, size_t, ark_err_t,
                    ark_error_t *);
 int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
+static void ring_buf_release(ring_buf_t *, uint64_t);
 void ring_buf_free(ring_buf_t *);
 static void error_store_once(ark_shared_err_t *, const ark_error_t *);
 static ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
@@ -246,8 +271,22 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 		return NULL;
 	}
 	ring->n_slots = n_slots;
-	for (i = 0U; i < n_slots; i++)
+	for (i = 0U; i < n_slots; i++) {
+		ring->slots[i].cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+		/* OWNERSHIP: each ring slot owns one fixed payload buffer until
+		 * ring_buf_free. */
+		ring->slots[i].data = malloc(ring->slots[i].cap);
+		if (ring->slots[i].data == NULL) {
+			while (i > 0U)
+				free(ring->slots[--i].data);
+			free(ring->slots);
+			free(ring);
+			(void)fail_error(err, ARK_ERR_IO_ALLOC,
+			                 "ring payload allocation failed", "", 0);
+			return NULL;
+		}
 		ring->slots[i].seq = UINT64_MAX;
+	}
 
 	rc = pthread_mutex_init(&ring->mutex, NULL);
 	if (rc != 0) {
@@ -274,8 +313,9 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 /*
  * ring_buf_write - Publish one completed worker result into the ring buffer.
  *
- * The caller transfers ownership of data to the ring buffer. The I/O thread
- * receives that same pointer via ring_buf_read and then owns it.
+ * The caller's data bytes are copied into a preallocated ring slot buffer.
+ * The I/O thread receives a borrowed pointer via ring_buf_read and must call
+ * ring_buf_release after consuming the slot.
  *
  * Returns 0 on success, -1 on error.
  * Fails with ARK_ERR_USAGE on invalid arguments or duplicate sequence publish.
@@ -283,11 +323,12 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
  * Preconditions: seq is unique for each published chunk and data is non-NULL
  * when len is non-zero.
  */
-int ring_buf_write(ring_buf_t *ring, uint64_t seq, uint8_t *data, size_t len,
-                   ark_err_t worker_err, ark_error_t *err)
+int ring_buf_write(ring_buf_t *ring, uint64_t seq, const uint8_t *data,
+                   size_t len, ark_err_t worker_err, ark_error_t *err)
 {
 	ring_slot_t *slot;
 	size_t idx;
+	size_t i;
 	int rc;
 
 	if (ring == NULL)
@@ -318,6 +359,11 @@ int ring_buf_write(ring_buf_t *ring, uint64_t seq, uint8_t *data, size_t len,
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "ring sequence already published", "", 0);
 	}
+	if (len > slot->cap) {
+		(void)pthread_mutex_unlock(&ring->mutex);
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "ring slot capacity exceeded", "", 0);
+	}
 
 	/*
 	 * SAFETY: ring slots are reused modulo n_slots. Writers must not
@@ -326,7 +372,8 @@ int ring_buf_write(ring_buf_t *ring, uint64_t seq, uint8_t *data, size_t len,
 	 * section 6.3.
 	 */
 	slot->seq = seq;
-	slot->data = data;
+	for (i = 0U; i < len; i++)
+		slot->data[i] = data[i];
 	slot->len = len;
 	slot->abort = 0;
 	slot->worker_err = worker_err;
@@ -380,7 +427,6 @@ int ring_buf_abort(ring_buf_t *ring, uint64_t seq, ark_err_t worker_err,
 	 * ARCHITECTURE.md section 6.3.
 	 */
 	slot->seq = seq;
-	slot->data = NULL;
 	slot->len = 0U;
 	slot->abort = 1;
 	slot->worker_err = worker_err;
@@ -393,8 +439,8 @@ int ring_buf_abort(ring_buf_t *ring, uint64_t seq, ark_err_t worker_err,
 /*
  * ring_buf_read - Wait for and consume one expected sequence slot.
  *
- * On success, data/len/abort/worker_err are populated for seq. data ownership
- * transfers to the caller, which must free it after use when abort is zero.
+ * On success, data/len/abort/worker_err are populated for seq. data is a
+ * borrowed pointer into the ring slot and remains valid until ring_buf_release.
  *
  * Returns 0 on success, -1 on error.
  * Fails with ARK_ERR_USAGE on invalid arguments or synchronisation failures.
@@ -427,25 +473,37 @@ int ring_buf_read(ring_buf_t *ring, uint64_t seq, uint8_t **data, size_t *len,
 		}
 	}
 
-	*data = slot->data;
+	*data = slot->abort ? NULL : slot->data;
 	*len = slot->len;
 	*abort = slot->abort;
 	*worker_err = slot->worker_err;
-
-	/*
-	 * SAFETY: clear slot ownership only after the awaited sequence is
-	 * consumed. This prevents stale-slot reuse races and preserves strict
-	 * sequence drain. See ARCHITECTURE.md section 6.3.
-	 */
-	slot->data = NULL;
-	slot->len = 0U;
-	slot->abort = 0;
-	slot->worker_err = ARK_OK;
-	slot->seq = UINT64_MAX;
-	slot->ready = 0;
-	(void)pthread_cond_broadcast(&ring->cond);
 	(void)pthread_mutex_unlock(&ring->mutex);
 	return 0;
+}
+
+static void ring_buf_release(ring_buf_t *ring, uint64_t seq)
+{
+	ring_slot_t *slot;
+	size_t idx;
+
+	if (ring == NULL)
+		return;
+	idx = (size_t)(seq % ring->n_slots);
+	slot = &ring->slots[idx];
+	if (pthread_mutex_lock(&ring->mutex) != 0)
+		return;
+	if (slot->ready && slot->seq == seq) {
+		/* SAFETY: release occurs only after the I/O thread consumes the
+		 * borrowed slot payload, allowing modulo slot reuse without racing a
+		 * writer. See ARCHITECTURE.md section 6.3. */
+		slot->len = 0U;
+		slot->abort = 0;
+		slot->worker_err = ARK_OK;
+		slot->seq = UINT64_MAX;
+		slot->ready = 0;
+		(void)pthread_cond_broadcast(&ring->cond);
+	}
+	(void)pthread_mutex_unlock(&ring->mutex);
 }
 
 /*
@@ -546,13 +604,93 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		free(pool);
 		return NULL;
 	}
-	/* OWNERSHIP: pool->queue entries are owned by pool until consumed or
-	 * released by pool_shutdown. */
+	pool->worker_args = (ark_worker_arg_t *)calloc(
+	    (size_t)n_workers, sizeof(pool->worker_args[0]));
+	if (pool->worker_args == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool worker arg allocation failed", "", 0);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+	for (i = 0; i < n_workers; i++) {
+		pool->worker_args[i].pool = pool;
+		pool->worker_args[i].src_cap = ARK_CHUNK_SIZE;
+		pool->worker_args[i].dst_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+		pool->worker_args[i].src = malloc(ARK_CHUNK_SIZE);
+		pool->worker_args[i].dst = malloc(pool->worker_args[i].dst_cap);
+		if (pool->worker_args[i].src == NULL ||
+		    pool->worker_args[i].dst == NULL) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+			while (i > 0) {
+				i--;
+				free(pool->worker_args[i].src);
+				free(pool->worker_args[i].dst);
+			}
+			free(pool->worker_args);
+			free(pool->workers);
+			free(pool);
+			(void)fail_error(err, ARK_ERR_IO_ALLOC,
+			                 "thread pool worker buffer allocation failed",
+			                 "", 0);
+			return NULL;
+		}
+	}
+	/* OWNERSHIP: pool->queue_slots and their buffers are owned by pool until
+	 * pool_shutdown. */
+	pool->queue_slots = (pool_queue_slot_t *)calloc(
+	    (size_t)n_workers, sizeof(pool->queue_slots[0]));
+	if (pool->queue_slots == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool queue slot allocation failed", "", 0);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->worker_args);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+	for (i = 0; i < n_workers; i++) {
+		pool->queue_slots[i].cap = ARK_CHUNK_SIZE;
+		pool->queue_slots[i].src = malloc(ARK_CHUNK_SIZE);
+		if (pool->queue_slots[i].src == NULL) {
+			free(pool->queue_slots[i].src);
+			while (i > 0) {
+				i--;
+				free(pool->queue_slots[i].src);
+			}
+			free(pool->queue_slots);
+			for (i = 0; i < n_workers; i++) {
+				free(pool->worker_args[i].src);
+				free(pool->worker_args[i].dst);
+			}
+			free(pool->worker_args);
+			free(pool->workers);
+			free(pool);
+			(void)fail_error(err, ARK_ERR_IO_ALLOC,
+			                 "thread pool queue buffer allocation failed",
+			                 "", 0);
+			return NULL;
+		}
+	}
+	/* OWNERSHIP: pool->queue descriptors are owned by pool until shutdown. */
 	pool->queue =
 	    (pool_work_t *)calloc((size_t)n_workers, sizeof(pool->queue[0]));
 	if (pool->queue == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "thread pool queue allocation failed", "", 0);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->queue_slots[i].src);
+		}
+		free(pool->queue_slots);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->worker_args);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -564,6 +702,15 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		                 "thread pool mutex initialisation failed", "",
 		                 rc);
 		free(pool->queue);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->queue_slots[i].src);
+		}
+		free(pool->queue_slots);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->worker_args);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -576,6 +723,15 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		    rc);
 		(void)pthread_mutex_destroy(&pool->mutex);
 		free(pool->queue);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->queue_slots[i].src);
+		}
+		free(pool->queue_slots);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->worker_args);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -589,6 +745,15 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		(void)pthread_cond_destroy(&pool->cv_not_empty);
 		(void)pthread_mutex_destroy(&pool->mutex);
 		free(pool->queue);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->queue_slots[i].src);
+		}
+		free(pool->queue_slots);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->worker_args);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -604,6 +769,13 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		(void)pthread_cond_destroy(&pool->cv_not_empty);
 		(void)pthread_mutex_destroy(&pool->mutex);
 		free(pool->queue);
+		for (i = 0; i < n_workers; i++) {
+			free(pool->queue_slots[i].src);
+			free(pool->worker_args[i].src);
+			free(pool->worker_args[i].dst);
+		}
+		free(pool->queue_slots);
+		free(pool->worker_args);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -612,7 +784,8 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 
 	entry = mode == ARK_POOL_COMPRESS ? worker_compress : worker_decompress;
 	for (i = 0; i < n_workers; i++) {
-		rc = pthread_create(&pool->workers[i], NULL, entry, pool);
+		rc = pthread_create(&pool->workers[i], NULL, entry,
+		                    &pool->worker_args[i]);
 		if (rc != 0) {
 			(void)fail_error(err, ARK_ERR_IO_ALLOC,
 			                 "thread pool worker creation failed",
@@ -627,6 +800,13 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			(void)pthread_cond_destroy(&pool->cv_not_empty);
 			(void)pthread_mutex_destroy(&pool->mutex);
 			free(pool->queue);
+			for (i = 0; i < n_workers; i++) {
+				free(pool->queue_slots[i].src);
+				free(pool->worker_args[i].src);
+				free(pool->worker_args[i].dst);
+			}
+			free(pool->queue_slots);
+			free(pool->worker_args);
 			free(pool->workers);
 			free(pool);
 			return NULL;
@@ -641,66 +821,51 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
  *
  * Blocks while the queue is full. Returns -1 if cancellation is active.
  *
- * OWNERSHIP: pool_submit copies src bytes into queue-owned storage. The
- * worker that dequeues the item owns and frees that copy.
+ * pool_submit copies src bytes into a preallocated queue slot. No allocation
+ * occurs on the per-chunk hot path.
  */
 static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
                        size_t src_len, ark_deflate_mode_t mode)
 {
-	uint8_t *src_copy;
+	pool_queue_slot_t *qslot;
 	int rc;
 
 	if (pool == NULL)
 		return -1;
 	if (src_len > 0U && src == NULL)
 		return -1;
+	if (src_len > ARK_CHUNK_SIZE)
+		return -1;
 	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0)
 		return -1;
 
-	/* OWNERSHIP: src_copy moves to queue slot and is freed by the worker.
-	 */
-	src_copy = (uint8_t *)malloc(src_len == 0U ? 1U : src_len);
-	if (src_copy == NULL) {
-		ark_error_t local_err = {0};
-
-		(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
-		                 "thread pool submit allocation failed", "", 0);
-		error_store_once(&pool->shared_err, &local_err);
-		(void)ring_buf_abort(pool->ring, seq, ARK_ERR_IO_ALLOC, NULL);
-		__atomic_store_n((int *)&pool->cancelled, 1, __ATOMIC_RELEASE);
-		return -1;
-	}
-	if (src_len > 0U) {
-		size_t i;
-
-		for (i = 0U; i < src_len; i++)
-			src_copy[i] = src[i];
-	}
-
 	rc = pthread_mutex_lock(&pool->mutex);
-	if (rc != 0) {
-		free(src_copy);
+	if (rc != 0)
 		return -1;
-	}
 	while (pool->q_count == pool->q_cap &&
 	       __atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) ==
 	           0) {
 		rc = pthread_cond_wait(&pool->cv_not_full, &pool->mutex);
 		if (rc != 0) {
 			(void)pthread_mutex_unlock(&pool->mutex);
-			free(src_copy);
 			return -1;
 		}
 	}
 	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0) {
 		(void)pthread_mutex_unlock(&pool->mutex);
-		free(src_copy);
 		return -1;
 	}
 
+	qslot = &pool->queue_slots[pool->q_tail];
+	if (src_len > qslot->cap) {
+		(void)pthread_mutex_unlock(&pool->mutex);
+		return -1;
+	}
+	for (size_t i = 0U; i < src_len; i++)
+		qslot->src[i] = src[i];
 	pool->queue[pool->q_tail] = (pool_work_t){
 	    .seq = seq,
-	    .src = src_copy,
+	    .src = qslot->src,
 	    .src_len = src_len,
 	    .mode = mode,
 	};
@@ -733,21 +898,18 @@ static void pool_shutdown(ark_pool_t *pool)
 	for (i = 0; i < pool->n_workers; i++)
 		(void)pthread_join(pool->workers[i], NULL);
 
-	while (pool->q_count > 0U) {
-		pool_work_t *slot;
-
-		slot = &pool->queue[pool->q_head];
-		free(slot->src);
-		slot->src = NULL;
-		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
-		pool->q_count--;
-	}
-
 	ring_buf_free(pool->ring);
 	(void)pthread_cond_destroy(&pool->cv_not_full);
 	(void)pthread_cond_destroy(&pool->cv_not_empty);
 	(void)pthread_mutex_destroy(&pool->mutex);
 	free(pool->queue);
+	for (i = 0; i < pool->n_workers; i++) {
+		free(pool->queue_slots[i].src);
+		free(pool->worker_args[i].src);
+		free(pool->worker_args[i].dst);
+	}
+	free(pool->queue_slots);
+	free(pool->worker_args);
 	free(pool->workers);
 	free(pool);
 }
@@ -762,11 +924,13 @@ static void pool_shutdown(ark_pool_t *pool)
  */
 static void *worker_compress(void *arg)
 {
+	ark_worker_arg_t *warg;
 	ark_pool_t *pool;
 
-	pool = (ark_pool_t *)arg;
-	if (pool == NULL)
+	warg = (ark_worker_arg_t *)arg;
+	if (warg == NULL || warg->pool == NULL)
 		return NULL;
+	pool = warg->pool;
 
 	for (;;) {
 		pool_work_t work;
@@ -795,6 +959,15 @@ static void *worker_compress(void *arg)
 		}
 
 		work = pool->queue[pool->q_head];
+		if (work.src_len > warg->src_cap) {
+			(void)pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+		for (size_t i = 0U; i < work.src_len; i++)
+			warg->src[i] = work.src[i];
+		work.src = warg->src;
+		work.dst = warg->dst;
+		work.dst_cap = warg->dst_cap;
 		pool->queue[pool->q_head] = (pool_work_t){0};
 		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
 		pool->q_count--;
@@ -803,7 +976,6 @@ static void *worker_compress(void *arg)
 
 		if (__atomic_load_n((int *)&pool->cancelled,
 		                    __ATOMIC_ACQUIRE) != 0) {
-			free(work.src);
 			break;
 		}
 
@@ -812,41 +984,24 @@ static void *worker_compress(void *arg)
 		ssize_t out_len;
 
 		out_cap = ark_deflate_bound(work.src_len);
-		/* OWNERSHIP: out is transferred to ring_buf_write on success;
-		 * on failure it is released in this worker. */
-		out = (uint8_t *)malloc(out_cap == 0U ? 1U : out_cap);
-		if (out == NULL) {
+		out = work.dst;
+		if (out == NULL || out_cap > work.dst_cap) {
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
-			                 "worker output allocation failed", "",
-			                 0);
+			                 "worker output buffer unavailable", "", 0);
 			error_store_once(&pool->shared_err, &local_err);
-			/*
-			 * SAFETY: worker must publish abort sentinel before
-			 * exit or the I/O thread can block forever waiting for
-			 * this sequence slot. See ARCHITECTURE.md section 6.3.
-			 */
 			(void)ring_buf_abort(pool->ring, work.seq,
 			                     ARK_ERR_IO_ALLOC, NULL);
-			free(work.src);
 			break;
 		}
 
 		out_len = ark_deflate_compress(work.src, work.src_len, out,
-		                               out_cap, work.mode);
+		                               work.dst_cap, work.mode);
 		if (out_len < 0) {
-			ark_error_t local_err = {0};
-
-			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
-			                 "worker compression failed", "", 0);
-			error_store_once(&pool->shared_err, &local_err);
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
-			(void)ring_buf_abort(pool->ring, work.seq,
-			                     ARK_ERR_IO_WRITE, NULL);
-			free(out);
-			free(work.src);
+			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK, NULL);
 			break;
 		}
 
@@ -859,12 +1014,8 @@ static void *worker_compress(void *arg)
 			error_store_once(&pool->shared_err, &local_err);
 			(void)ring_buf_abort(pool->ring, work.seq,
 			                     ARK_ERR_IO_WRITE, NULL);
-			free(out);
-			free(work.src);
 			break;
 		}
-
-		free(work.src);
 	}
 
 	return NULL;
@@ -881,11 +1032,13 @@ static void *worker_compress(void *arg)
  */
 static void *worker_decompress(void *arg)
 {
+	ark_worker_arg_t *warg;
 	ark_pool_t *pool;
 
-	pool = (ark_pool_t *)arg;
-	if (pool == NULL)
+	warg = (ark_worker_arg_t *)arg;
+	if (warg == NULL || warg->pool == NULL)
 		return NULL;
+	pool = warg->pool;
 
 	for (;;) {
 		pool_work_t work;
@@ -916,6 +1069,14 @@ static void *worker_decompress(void *arg)
 		}
 
 		work = pool->queue[pool->q_head];
+		if (work.src_len > warg->src_cap) {
+			(void)pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+		for (size_t i = 0U; i < work.src_len; i++)
+			warg->src[i] = work.src[i];
+		work.src = warg->src;
+		work.dst = warg->dst;
 		pool->queue[pool->q_head] = (pool_work_t){0};
 		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
 		pool->q_count--;
@@ -924,45 +1085,17 @@ static void *worker_decompress(void *arg)
 
 		if (__atomic_load_n((int *)&pool->cancelled,
 		                    __ATOMIC_ACQUIRE) != 0) {
-			free(work.src);
 			break;
 		}
 
-		/* OWNERSHIP: out is transferred to ring_buf_write on success.
-		 */
-		out = (uint8_t *)malloc(ARK_CHUNK_SIZE);
-		if (out == NULL) {
-			ark_error_t local_err = {0};
-
-			(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
-			                 "worker output allocation failed", "",
-			                 0);
-			error_store_once(&pool->shared_err, &local_err);
-			/*
-			 * SAFETY: worker must publish abort sentinel before
-			 * exit or the I/O thread can block forever waiting for
-			 * this sequence slot. See ARCHITECTURE.md section 6.3.
-			 */
-			(void)ring_buf_abort(pool->ring, work.seq,
-			                     ARK_ERR_IO_ALLOC, NULL);
-			free(work.src);
-			break;
-		}
+		out = work.dst;
 
 		out_len = ark_deflate_decompress(work.src, work.src_len, out,
 		                                 ARK_CHUNK_SIZE);
 		if (out_len < 0) {
-			ark_error_t local_err = {0};
-
-			(void)fail_error(&local_err, ARK_ERR_FMT_DATA,
-			                 "worker decompression failed", "", 0);
-			error_store_once(&pool->shared_err, &local_err);
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
-			(void)ring_buf_abort(pool->ring, work.seq,
-			                     ARK_ERR_FMT_DATA, NULL);
-			free(out);
-			free(work.src);
+			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK, NULL);
 			break;
 		}
 
@@ -975,12 +1108,8 @@ static void *worker_decompress(void *arg)
 			error_store_once(&pool->shared_err, &local_err);
 			(void)ring_buf_abort(pool->ring, work.seq,
 			                     ARK_ERR_IO_WRITE, NULL);
-			free(out);
-			free(work.src);
 			break;
 		}
-
-		free(work.src);
 	}
 
 	return NULL;
@@ -1080,6 +1209,8 @@ void pool_test_shutdown(ark_pool_t *);
 int pool_get_cancel_flag(const ark_pool_t *);
 ark_error_t pool_get_shared_err(const ark_pool_t *);
 int pool_get_sentinel_count(const ark_pool_t *);
+unsigned int pool_get_error_event(const ark_pool_t *);
+unsigned int pool_get_abort_event(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
 #endif
 
@@ -2917,7 +3048,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 							    "extract worker "
 							    "aborted",
 							    meta->path, 0);
-						free(out_buf);
+						ring_buf_release(pool->ring, drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
@@ -2940,17 +3071,17 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 						    "decompressed chunk length "
 						    "mismatch",
 						    meta->path, 0);
-						free(out_buf);
+						ring_buf_release(pool->ring, drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
 					if (write_full(out_fd, out_buf, out_len,
 					               meta->path, err) != 0) {
-						free(out_buf);
+						ring_buf_release(pool->ring, drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
-					free(out_buf);
+					ring_buf_release(pool->ring, drain_seq);
 					out_buf = NULL;
 					drain_seq++;
 					in_flight--;
@@ -2983,7 +3114,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 						    err, ARK_ERR_FMT_DATA,
 						    "extract worker aborted",
 						    meta->path, 0);
-					free(out_buf);
+					ring_buf_release(pool->ring, drain_seq);
 					out_buf = NULL;
 					goto cleanup;
 				}
@@ -3003,17 +3134,17 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 					                 "decompressed chunk "
 					                 "length mismatch",
 					                 meta->path, 0);
-					free(out_buf);
+					ring_buf_release(pool->ring, drain_seq);
 					out_buf = NULL;
 					goto cleanup;
 				}
 				if (write_full(out_fd, out_buf, out_len,
 				               meta->path, err) != 0) {
-					free(out_buf);
+					ring_buf_release(pool->ring, drain_seq);
 					out_buf = NULL;
 					goto cleanup;
 				}
-				free(out_buf);
+				ring_buf_release(pool->ring, drain_seq);
 				out_buf = NULL;
 				drain_seq++;
 				in_flight--;
@@ -3060,7 +3191,6 @@ cleanup:
 	}
 	cleanup_free(&tracker);
 	dir_deferred_free(&deferred_dirs);
-	free(out_buf);
 	free(comp_buf);
 	free(selected);
 	free(index_buf);
@@ -3731,7 +3861,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 					    err, ARK_ERR_IO_WRITE,
 					    "create worker aborted", abs_path,
 					    0);
-				free(slot_data);
+				ring_buf_release(ctx->pool->ring, drain_seq);
 				goto cleanup;
 			}
 			/*
@@ -3743,25 +3873,25 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			    ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
 			                    ctx->write_buf, ctx->comp_cap, err);
 			if (written < 0) {
-				free(slot_data);
+				ring_buf_release(ctx->pool->ring, drain_seq);
 				goto cleanup;
 			}
 			if (chevron_write_or_fail(
 			        ctx->chev_handle, ctx->write_buf,
 			        (size_t)written, abs_path, err) != 0) {
-				free(slot_data);
+				ring_buf_release(ctx->pool->ring, drain_seq);
 				goto cleanup;
 			}
 			if (UINT64_MAX - *ctx->output_offset <
 			    (uint64_t)written) {
-				free(slot_data);
+				ring_buf_release(ctx->pool->ring, drain_seq);
 				rc = fail_error(err, ARK_ERR_USAGE,
 				                "archive offset overflow",
 				                abs_path, 0);
 				goto cleanup;
 			}
 			*ctx->output_offset += (uint64_t)written;
-			free(slot_data);
+			ring_buf_release(ctx->pool->ring, drain_seq);
 			drain_seq++;
 			in_flight--;
 		}
@@ -3786,29 +3916,29 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 				(void)fail_error(err, ARK_ERR_IO_WRITE,
 				                 "create worker aborted",
 				                 abs_path, 0);
-			free(slot_data);
+			ring_buf_release(ctx->pool->ring, drain_seq);
 			goto cleanup;
 		}
 		written = ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
 		                          ctx->write_buf, ctx->comp_cap, err);
 		if (written < 0) {
-			free(slot_data);
+			ring_buf_release(ctx->pool->ring, drain_seq);
 			goto cleanup;
 		}
 		if (chevron_write_or_fail(ctx->chev_handle, ctx->write_buf,
 		                          (size_t)written, abs_path,
 		                          err) != 0) {
-			free(slot_data);
+			ring_buf_release(ctx->pool->ring, drain_seq);
 			goto cleanup;
 		}
 		if (UINT64_MAX - *ctx->output_offset < (uint64_t)written) {
-			free(slot_data);
+			ring_buf_release(ctx->pool->ring, drain_seq);
 			rc = fail_error(err, ARK_ERR_USAGE,
 			                "archive offset overflow", abs_path, 0);
 			goto cleanup;
 		}
 		*ctx->output_offset += (uint64_t)written;
-		free(slot_data);
+		ring_buf_release(ctx->pool->ring, drain_seq);
 		drain_seq++;
 		in_flight--;
 	}
@@ -5101,6 +5231,22 @@ int pool_get_sentinel_count(const ark_pool_t *pool)
 	return count;
 }
 
+unsigned int pool_get_error_event(const ark_pool_t *pool)
+{
+	if (pool == NULL)
+		return 0U;
+	return __atomic_load_n((const unsigned int *)&pool->error_event,
+	                       __ATOMIC_ACQUIRE);
+}
+
+unsigned int pool_get_abort_event(const ark_pool_t *pool)
+{
+	if (pool == NULL)
+		return 0U;
+	return __atomic_load_n((const unsigned int *)&pool->abort_event,
+	                       __ATOMIC_ACQUIRE);
+}
+
 /* ARK_TEST only: inject worker error + abort sentinel (slot sequence 0). */
 void pool_inject_worker_error(ark_pool_t *pool, ark_err_t code, int errno_value)
 {
@@ -5113,10 +5259,18 @@ void pool_inject_worker_error(ark_pool_t *pool, ark_err_t code, int errno_value)
 	(void)fail_error(&local_err, code, "ARK_TEST injected worker error", "",
 	                 errno_value);
 	error_store_once(&pool->shared_err, &local_err);
+	__atomic_store_n((unsigned int *)&pool->error_event,
+	                 __atomic_add_fetch((unsigned int *)&pool->event_seq, 1U,
+	                                    __ATOMIC_ACQ_REL),
+	                 __ATOMIC_RELEASE);
 	/* SAFETY: publish abort sentinel after shared error is stored so
 	 * the I/O thread observes first-error metadata before abort handling.
 	 * See ARCHITECTURE.md section 6.3. */
 	(void)ring_buf_abort(pool->ring, 0U, code, NULL);
+	__atomic_store_n((unsigned int *)&pool->abort_event,
+	                 __atomic_add_fetch((unsigned int *)&pool->event_seq, 1U,
+	                                    __ATOMIC_ACQ_REL),
+	                 __ATOMIC_RELEASE);
 }
 
 /*

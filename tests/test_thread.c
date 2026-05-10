@@ -25,7 +25,7 @@ typedef struct ring_buf ring_buf_t;
 typedef struct ark_pool ark_pool_t;
 
 ring_buf_t *ring_buf_init(size_t, ark_error_t *);
-int ring_buf_write(ring_buf_t *, uint64_t, uint8_t *, size_t, ark_err_t,
+int ring_buf_write(ring_buf_t *, uint64_t, const uint8_t *, size_t, ark_err_t,
                    ark_error_t *);
 int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
@@ -42,6 +42,8 @@ void pool_test_shutdown(ark_pool_t *);
 int pool_get_cancel_flag(const ark_pool_t *);
 ark_error_t pool_get_shared_err(const ark_pool_t *);
 int pool_get_sentinel_count(const ark_pool_t *);
+unsigned int pool_get_error_event(const ark_pool_t *);
+unsigned int pool_get_abort_event(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
 int ark_test_create_archive(const char *, const char **, size_t, int,
                             ark_hash_alg_t, ark_deflate_mode_t, ark_error_t *);
@@ -382,6 +384,7 @@ int test_ring_normal_produce_consume(void)
 		ring_buf_free(ring);
 		return 1;
 	}
+	free(in);
 	if (ring_buf_read(ring, 0U, &out, &out_len, &is_abort, &worker_err,
 	                  &err) != 0) {
 		ring_buf_free(ring);
@@ -389,11 +392,9 @@ int test_ring_normal_produce_consume(void)
 	}
 	if (is_abort || worker_err != ARK_OK || out_len != sizeof(src) ||
 	    memcmp(out, src, sizeof(src)) != 0) {
-		free(out);
 		ring_buf_free(ring);
 		return 1;
 	}
-	free(out);
 	ring_buf_free(ring);
 	return 0;
 }
@@ -424,30 +425,32 @@ int test_ring_out_of_order_completion(void)
 	}
 	if (ring_buf_write(ring, 1U, in1, sizeof(s1), ARK_OK, &err) != 0)
 		goto fail;
+	free(in1);
+	in1 = NULL;
 	if (ring_buf_write(ring, 0U, in0, sizeof(s0), ARK_OK, &err) != 0)
 		goto fail;
+	free(in0);
+	in0 = NULL;
 	if (ring_buf_read(ring, 0U, &out, &out_len, &is_abort, &worker_err,
 	                  &err) != 0)
 		goto fail;
 	if (is_abort || worker_err != ARK_OK || out_len != sizeof(s0) ||
 	    memcmp(out, s0, sizeof(s0)) != 0) {
-		free(out);
 		goto fail;
 	}
-	free(out);
 	if (ring_buf_read(ring, 1U, &out, &out_len, &is_abort, &worker_err,
 	                  &err) != 0)
 		goto fail;
 	if (is_abort || worker_err != ARK_OK || out_len != sizeof(s1) ||
 	    memcmp(out, s1, sizeof(s1)) != 0) {
-		free(out);
 		goto fail;
 	}
-	free(out);
 	ring_buf_free(ring);
 	return 0;
 
 fail:
+	free(in0);
+	free(in1);
 	ring_buf_free(ring);
 	return 1;
 }
@@ -475,7 +478,6 @@ int test_ring_abort_sentinel_written(void)
 	}
 	if (!is_abort || worker_err != ARK_ERR_IO_WRITE || out != NULL ||
 	    out_len != 0U) {
-		free(out);
 		ring_buf_free(ring);
 		return 1;
 	}
@@ -517,7 +519,6 @@ int test_ring_io_thread_unblocks_on_abort(void)
 	}
 	if (arg.rc != 0 || !arg.abort || arg.worker_err != ARK_ERR_FMT_DATA ||
 	    arg.data != NULL || arg.len != 0U) {
-		free(arg.data);
 		ring_buf_free(ring);
 		return 1;
 	}
@@ -617,7 +618,10 @@ int test_worker_error_then_sentinel(void)
 	pool_inject_worker_error(pool, ARK_ERR_IO_WRITE, EIO);
 	shared = pool_get_shared_err(pool);
 	if (shared.code != ARK_ERR_IO_WRITE ||
-	    pool_get_sentinel_count(pool) < 1) {
+	    pool_get_sentinel_count(pool) < 1 ||
+	    pool_get_error_event(pool) == 0U ||
+	    pool_get_abort_event(pool) == 0U ||
+	    pool_get_error_event(pool) >= pool_get_abort_event(pool)) {
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -648,7 +652,6 @@ int test_io_thread_reads_worker_error(void)
 	}
 	if (!is_abort || worker_err != ARK_ERR_FMT_DATA || data != NULL ||
 	    len != 0U) {
-		free(data);
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -683,7 +686,6 @@ int test_worker_error_triggers_cancel(void)
 		return 1;
 	}
 	if (!is_abort || worker_err != ARK_ERR_IO_WRITE) {
-		free(data);
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -773,36 +775,97 @@ int test_quiescence_sequence_order(void)
 {
 	ark_error_t err = {0};
 	ark_pool_t *pool;
+	char root[] = "/tmp/ark-thread-quiet-XXXXXX";
+	char cleanup_file[1024];
+	const char *tmp;
 	uint8_t *data;
 	size_t len;
+	unsigned int step;
+	unsigned int cancel_step;
+	unsigned int stop_step;
+	unsigned int join_step;
+	unsigned int close_step;
+	unsigned int cleanup_step;
+	int fd;
 	int is_abort;
 	ark_err_t worker_err;
 
-	pool = pool_test_init(1, 0, &err);
-	if (pool == NULL)
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
 		return 1;
+	if (path_join(cleanup_file, sizeof(cleanup_file), tmp,
+	              "created-output") != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	fd = open(cleanup_file, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+	if (fd == -1) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+
+	pool = pool_test_init(1, 0, &err);
+	if (pool == NULL) {
+		(void)close(fd);
+		(void)remove_tree(tmp);
+		return 1;
+	}
 
 	pool_inject_worker_error(pool, ARK_ERR_IO_WRITE, EIO);
 	if (pool_test_read(pool, 0U, &data, &len, &is_abort, &worker_err,
 	                   &err) != 0) {
 		pool_test_shutdown(pool);
+		(void)close(fd);
+		(void)remove_tree(tmp);
 		return 1;
 	}
 	if (!is_abort) {
 		pool_test_shutdown(pool);
+		(void)close(fd);
+		(void)remove_tree(tmp);
 		return 1;
 	}
 
 	/*
-	 * SAFETY: test the thread-pool quiescence prefix order from
-	 * ARCHITECTURE.md section 14.3: cancel first, then join via shutdown.
+	 * SAFETY: test the complete quiescence order from ARCHITECTURE.md
+	 * section 14.3: cancel, stop submit, join, close fd, cleanup.
 	 */
+	step = 0U;
 	pool_test_cancel(pool);
+	cancel_step = ++step;
 	if (pool_get_cancel_flag(pool) == 0) {
 		pool_test_shutdown(pool);
+		(void)close(fd);
+		(void)remove_tree(tmp);
 		return 1;
 	}
+	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
+	                     ARK_DEFLATE_DEFAULT) == 0) {
+		pool_test_shutdown(pool);
+		(void)close(fd);
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	stop_step = ++step;
 	pool_test_shutdown(pool);
+	join_step = ++step;
+	if (close(fd) != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	close_step = ++step;
+	if (unlink(cleanup_file) != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	cleanup_step = ++step;
+	if (!(cancel_step < stop_step && stop_step < join_step &&
+	    join_step < close_step && close_step < cleanup_step)) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	if (remove_tree(tmp) != 0)
+		return 1;
 	return 0;
 }
 
