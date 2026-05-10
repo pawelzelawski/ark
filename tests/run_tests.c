@@ -151,6 +151,8 @@ int test_cancel_join_completes(void);
 int test_quiescence_sequence_order(void);
 int test_no_resource_leak_on_cancel(void);
 int test_no_cleanup_race(void);
+int test_create_deterministic_single_worker(void);
+int test_create_deterministic_multi_worker_matches_single(void);
 
 int test_sha256_empty(void);
 int test_sha256_abc(void);
@@ -371,6 +373,10 @@ static const test_case_t g_tests[] = {
     {"test_quiescence_sequence_order", test_quiescence_sequence_order},
     {"test_no_resource_leak_on_cancel", test_no_resource_leak_on_cancel},
     {"test_no_cleanup_race", test_no_cleanup_race},
+    {"test_create_deterministic_single_worker",
+     test_create_deterministic_single_worker},
+    {"test_create_deterministic_multi_worker_matches_single",
+     test_create_deterministic_multi_worker_matches_single},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_stub", test_integration_stub},
 };

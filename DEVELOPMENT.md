@@ -3,8 +3,8 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-10
-**Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.7 - Parallel correctness
+**Current Phase:** Phase 7 - Test suite completion (not started)
+**Next Task:** Phase 7.1 - Integration tests
 
 ### Phase Summary
 
@@ -15,7 +15,7 @@
 | 3 | Deflate component | DONE | 3.1-3.4 complete | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
 | 5 | CLI: core operations | DONE | 5.1-5.10 complete | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
-| 6 | Thread pool | IN PROGRESS | 6.1-6.5 complete | Ring buffer, workers, cancellation, error propagation; TSan required |
+| 6 | Thread pool | DONE | 6.1-6.7 complete | Ring buffer, workers, cancellation, error propagation; TSan required; parallel correctness confirmed |
 | 7 | Test suite completion | NOT STARTED | - | Integration tests, coverage verification |
 | 8 | Hardening and release | NOT STARTED | - | Valgrind, TSan final, static analysis, README |
 
@@ -37,7 +37,7 @@
 | M12 | Sandboxing: all subcommands operate correctly under Landlock on Linux 5.13+ | DONE |
 | M13 | Thread pool: no deadlock on worker error (ring buffer abort sentinel unblocks I/O thread) | DONE |
 | M14 | Thread pool: TSan clean | DONE |
-| M15 | Parallel create: output bit-identical to single-threaded create on same input | NOT STARTED |
+| M15 | Parallel create: output bit-identical to single-threaded create on same input | DONE |
 | M16 | Fault injection: every create sequence step covered with forced failure | NOT STARTED |
 | M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
 | M18 | All sixteen §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
@@ -707,18 +707,18 @@ TSan clean on Linux.
 - [x] Quality milestones M13, M14 confirmed
 
 **6.7 - Parallel correctness**
-- [ ] Verify parallel create output is bit-identical to single-threaded
+- [x] Verify parallel create output is bit-identical to single-threaded
   create: run both on same input; compare archives byte-by-byte
-- [ ] Quality milestone M15 confirmed
+- [x] Quality milestone M15 confirmed
 
 ### Phase 6 Completion Criteria
 
-- [ ] All thread pool tests pass
-- [ ] `make test-tsan` passes on Linux
-- [ ] Parallel and single-threaded create produce identical archives
-- [ ] All Phase 5 tests still pass after threading integration
-- [ ] Valgrind clean; ASan/UBSan clean on Linux
-- [ ] Quality milestones M13, M14, M15 confirmed
+- [x] All thread pool tests pass
+- [x] `make test-tsan` passes on Linux
+- [x] Parallel and single-threaded create produce identical archives
+- [x] All Phase 5 tests still pass after threading integration
+- [x] Valgrind clean; ASan/UBSan clean on Linux
+- [x] Quality milestones M13, M14, M15 confirmed
 
 ---
 

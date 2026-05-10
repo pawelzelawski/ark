@@ -5,14 +5,21 @@
  * TESTING.md section 4.
  */
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "archive.h"
+#include "deflate.h"
 
 typedef struct ring_buf ring_buf_t;
 typedef struct ark_pool ark_pool_t;
@@ -36,6 +43,8 @@ int pool_get_cancel_flag(const ark_pool_t *);
 ark_error_t pool_get_shared_err(const ark_pool_t *);
 int pool_get_sentinel_count(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
+int ark_test_create_archive(const char *, const char **, size_t, int,
+                            ark_hash_alg_t, ark_deflate_mode_t, ark_error_t *);
 
 typedef struct {
 	ring_buf_t *ring;
@@ -91,6 +100,262 @@ static uint64_t monotonic_ns(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0U;
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/*
+ * path_join - Join dir/name into dst as "dir/name".
+ */
+static int path_join(char *dst, size_t dst_sz, const char *dir,
+                     const char *name)
+{
+	int n;
+
+	n = snprintf(dst, dst_sz, "%s/%s", dir, name);
+	if (n < 0)
+		return -1;
+	if ((size_t)n >= dst_sz)
+		return -1;
+	return 0;
+}
+
+/*
+ * write_full_fd - Write all bytes to fd unless a hard write error occurs.
+ */
+static int write_full_fd(int fd, const uint8_t *buf, size_t len)
+{
+	while (len > 0U) {
+		ssize_t n;
+
+		n = write(fd, buf, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		buf += (size_t)n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+/*
+ * write_pattern_file - Write deterministic byte pattern of exactly total bytes.
+ */
+static int write_pattern_file(const char *path, size_t total)
+{
+	uint8_t block[4096];
+	int fd;
+	size_t i;
+	size_t rem;
+
+	for (i = 0U; i < sizeof(block); i++)
+		block[i] = (uint8_t)(i & 0xffU);
+
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if (fd < 0)
+		return -1;
+
+	rem = total;
+	while (rem > 0U) {
+		size_t chunk;
+
+		chunk = rem < sizeof(block) ? rem : sizeof(block);
+		if (write_full_fd(fd, block, chunk) != 0) {
+			(void)close(fd);
+			return -1;
+		}
+		rem -= chunk;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * read_file_bytes - Read one file into a newly allocated buffer.
+ *
+ * OWNERSHIP: on success *out is owned by the caller and must be freed.
+ */
+static int read_file_bytes(const char *path, uint8_t **out, size_t *out_len)
+{
+	struct stat st;
+	uint8_t *buf;
+	int fd;
+	size_t off;
+
+	if (stat(path, &st) != 0 || st.st_size < 0)
+		return -1;
+	buf = malloc((size_t)st.st_size == 0U ? 1U : (size_t)st.st_size);
+	if (buf == NULL)
+		return -1;
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		free(buf);
+		return -1;
+	}
+	off = 0U;
+	while (off < (size_t)st.st_size) {
+		ssize_t n;
+
+		n = read(fd, buf + off, (size_t)st.st_size - off);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			(void)close(fd);
+			free(buf);
+			return -1;
+		}
+		if (n == 0) {
+			(void)close(fd);
+			free(buf);
+			return -1;
+		}
+		off += (size_t)n;
+	}
+	if (close(fd) != 0) {
+		free(buf);
+		return -1;
+	}
+	*out = buf;
+	*out_len = (size_t)st.st_size;
+	return 0;
+}
+
+/*
+ * remove_tree - Recursively remove one test directory subtree.
+ */
+static int remove_tree(const char *path)
+{
+	struct stat st;
+	DIR *dir;
+	const struct dirent *de;
+
+	if (lstat(path, &st) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (!S_ISDIR(st.st_mode))
+		return unlink(path);
+
+	dir = opendir(path);
+	if (dir == NULL)
+		return -1;
+	while ((de = readdir(dir)) != NULL) {
+		char child[1024];
+
+		if (strcmp(de->d_name, ".") == 0 ||
+		    strcmp(de->d_name, "..") == 0)
+			continue;
+		if (path_join(child, sizeof(child), path, de->d_name) != 0) {
+			(void)closedir(dir);
+			return -1;
+		}
+		if (remove_tree(child) != 0) {
+			(void)closedir(dir);
+			return -1;
+		}
+	}
+	if (closedir(dir) != 0)
+		return -1;
+	return rmdir(path);
+}
+
+/*
+ * prepare_source_tree - Create a fixed input tree for create determinism tests.
+ */
+static int prepare_source_tree(const char *root, char *src_dir, size_t src_sz)
+{
+	char subdir[1024];
+	char tiny[1024];
+	char medium[1024];
+	char large[1024];
+	static const uint8_t tiny_data[] = "thread-pool-determinism\n";
+
+	if (path_join(src_dir, src_sz, root, "src") != 0)
+		return -1;
+	if (mkdir(src_dir, 0755) != 0)
+		return -1;
+	if (path_join(subdir, sizeof(subdir), src_dir, "nested") != 0)
+		return -1;
+	if (mkdir(subdir, 0755) != 0)
+		return -1;
+
+	if (path_join(tiny, sizeof(tiny), src_dir, "a.txt") != 0)
+		return -1;
+	if (path_join(medium, sizeof(medium), subdir, "b.bin") != 0)
+		return -1;
+	if (path_join(large, sizeof(large), subdir, "c.large") != 0)
+		return -1;
+
+	{
+		int fd;
+
+		fd = open(tiny, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+		if (fd < 0)
+			return -1;
+		if (write_full_fd(fd, tiny_data, sizeof(tiny_data) - 1U) != 0) {
+			(void)close(fd);
+			return -1;
+		}
+		if (close(fd) != 0)
+			return -1;
+	}
+	if (write_pattern_file(medium, 131072U) != 0)
+		return -1;
+	if (write_pattern_file(large, ARK_CHUNK_SIZE * 5U + 17U) != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * create_and_compare_archives - Run create and compare archive bytes.
+ */
+static int create_and_compare_archives(const char *src_dir, const char *a_path,
+                                       int a_workers, const char *b_path,
+                                       int b_workers)
+{
+	ark_error_t err = {0};
+	const char *sources[1];
+	uint8_t *a_bytes;
+	uint8_t *b_bytes;
+	size_t a_len;
+	size_t b_len;
+
+	a_bytes = NULL;
+	b_bytes = NULL;
+	a_len = 0U;
+	b_len = 0U;
+	sources[0] = src_dir;
+
+	/*
+	 * ARCHITECTURE.md section 6.3: deterministic in-order drain must yield
+	 * byte-identical output regardless of worker completion order.
+	 */
+	if (ark_test_create_archive(a_path, sources, 1U, a_workers,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT,
+	                            &err) != 0)
+		goto fail;
+	if (ark_test_create_archive(b_path, sources, 1U, b_workers,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT,
+	                            &err) != 0)
+		goto fail;
+	if (read_file_bytes(a_path, &a_bytes, &a_len) != 0)
+		goto fail;
+	if (read_file_bytes(b_path, &b_bytes, &b_len) != 0)
+		goto fail;
+	if (a_len != b_len)
+		goto fail;
+	if (memcmp(a_bytes, b_bytes, a_len) != 0)
+		goto fail;
+
+	free(b_bytes);
+	free(a_bytes);
+	return 0;
+
+fail:
+	free(b_bytes);
+	free(a_bytes);
+	return 1;
 }
 
 int test_ring_normal_produce_consume(void)
@@ -590,4 +855,59 @@ int test_no_cleanup_race(void)
 	pool_test_cancel(pool);
 	pool_test_shutdown(pool);
 	return 0;
+}
+
+int test_create_deterministic_single_worker(void)
+{
+	char root[] = "/tmp/ark-thread-det-XXXXXX";
+	char src[1024];
+	char out_a[1024];
+	char out_b[1024];
+	const char *tmp;
+	int rc;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_source_tree(tmp, src, sizeof(src)) != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	if (path_join(out_a, sizeof(out_a), tmp, "single-a.ark") != 0 ||
+	    path_join(out_b, sizeof(out_b), tmp, "single-b.ark") != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	rc = create_and_compare_archives(src, out_a, 1, out_b, 1);
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+int test_create_deterministic_multi_worker_matches_single(void)
+{
+	char root[] = "/tmp/ark-thread-det-XXXXXX";
+	char src[1024];
+	char out_single[1024];
+	char out_parallel[1024];
+	const char *tmp;
+	int rc;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_source_tree(tmp, src, sizeof(src)) != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	if (path_join(out_single, sizeof(out_single), tmp, "single.ark") != 0 ||
+	    path_join(out_parallel, sizeof(out_parallel), tmp,
+	              "parallel.ark") != 0) {
+		(void)remove_tree(tmp);
+		return 1;
+	}
+	rc = create_and_compare_archives(src, out_single, 1, out_parallel, 4);
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
 }

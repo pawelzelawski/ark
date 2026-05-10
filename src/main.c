@@ -5017,6 +5017,49 @@ void pool_test_shutdown(ark_pool_t *pool)
 	pool_shutdown(pool);
 }
 
+/*
+ * ark_test_create_archive - Run create with explicit pool width in tests.
+ *
+ * Uses the same worker-pool create path as production so tests can verify
+ * byte-identical archive output across worker counts. See ARCHITECTURE.md
+ * section 6.3.
+ *
+ * Returns 0 on success, -1 on error with details in err.
+ *
+ * Preconditions:
+ * - archive_path != NULL
+ * - create_paths != NULL
+ * - create_path_count > 0
+ * - n_workers > 0
+ */
+int ark_test_create_archive(const char *archive_path, const char **create_paths,
+                            size_t create_path_count, int n_workers,
+                            ark_hash_alg_t hash_alg,
+                            ark_deflate_mode_t deflate_mode, ark_error_t *err)
+{
+	ark_args_t args;
+	ark_pool_t *pool;
+
+	if (archive_path == NULL || create_paths == NULL ||
+	    create_path_count == 0U || n_workers <= 0)
+		return fail_error(
+		    err, ARK_ERR_USAGE,
+		    "ARK_TEST create helper received invalid arguments", "", 0);
+
+	args = (ark_args_t){0};
+	args.cmd = ARK_CMD_CREATE;
+	args.hash_alg = hash_alg;
+	args.deflate_mode = deflate_mode;
+	args.archive_path = archive_path;
+	args.create_paths = create_paths;
+	args.create_path_count = create_path_count;
+
+	pool = pool_init(n_workers, ARK_POOL_COMPRESS, err);
+	if (pool == NULL)
+		return -1;
+	return cmd_create(&args, pool, err);
+}
+
 /* ARK_TEST only: expose current cancellation flag for thread tests. */
 int pool_get_cancel_flag(const ark_pool_t *pool)
 {
@@ -5087,6 +5130,7 @@ void ark_test_keep_main_symbols(void)
 	(void)&pool_init;
 	(void)&pool_submit;
 	(void)&pool_shutdown;
+	(void)&ark_test_create_archive;
 	(void)&print_usage;
 	(void)&cmd_create;
 	(void)&cmd_extract;
