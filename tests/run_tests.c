@@ -136,7 +136,11 @@ int test_fault_deflate_output_buffer_too_small(void);
 int test_fault_injection_no_effect_on_archive_component(void);
 int test_fault_injection_no_effect_on_deflate_component(void);
 int test_integration_stub(void);
-int test_thread_stub(void);
+int test_ring_normal_produce_consume(void);
+int test_ring_out_of_order_completion(void);
+int test_ring_abort_sentinel_written(void);
+int test_ring_io_thread_unblocks_on_abort(void);
+int test_ring_abort_does_not_block(void);
 
 int test_sha256_empty(void);
 int test_sha256_abc(void);
@@ -340,7 +344,12 @@ static const test_case_t g_tests[] = {
      test_adv_nonzero_chunk_count_empty_file},
     {"test_adv_corrupt_index_hash", test_adv_corrupt_index_hash},
     {"test_adv_corrupt_member_data", test_adv_corrupt_member_data},
-    {"test_thread_stub", test_thread_stub},
+    {"test_ring_normal_produce_consume", test_ring_normal_produce_consume},
+    {"test_ring_out_of_order_completion", test_ring_out_of_order_completion},
+    {"test_ring_abort_sentinel_written", test_ring_abort_sentinel_written},
+    {"test_ring_io_thread_unblocks_on_abort",
+     test_ring_io_thread_unblocks_on_abort},
+    {"test_ring_abort_does_not_block", test_ring_abort_does_not_block},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_stub", test_integration_stub},
 };

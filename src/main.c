@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,12 +119,299 @@ typedef struct {
 	int permission_error;
 } traverse_ctx_t;
 
+typedef struct ring_buf ring_buf_t;
+
+typedef struct {
+	uint64_t seq;
+	uint8_t *data;
+	size_t len;
+	int ready;
+	int abort;
+	ark_err_t worker_err;
+} ring_slot_t;
+
+struct ring_buf {
+	size_t n_slots;
+	ring_slot_t *slots;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+};
+
+ring_buf_t *ring_buf_init(size_t, ark_error_t *);
+int ring_buf_write(ring_buf_t *, uint64_t, uint8_t *, size_t, ark_err_t,
+                   ark_error_t *);
+int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
+int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
+                  ark_err_t *, ark_error_t *);
+void ring_buf_free(ring_buf_t *);
+
+static int fail_error(ark_error_t *, ark_err_t, const char *, const char *,
+                      int);
+
+/*
+ * ring_buf_init - Allocate a fixed-size ring buffer for worker results.
+ *
+ * n_slots must be greater than zero and typically matches worker count.
+ *
+ * Returns a new ring buffer pointer on success, NULL on error.
+ * Failure details are reported through err when err is non-NULL.
+ *
+ * OWNERSHIP: the returned ring pointer is owned by the caller and must be
+ * released with ring_buf_free.
+ */
+ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
+{
+	ring_buf_t *ring;
+	size_t i;
+	int rc;
+
+	if (n_slots == 0U) {
+		(void)fail_error(
+		    err, ARK_ERR_USAGE,
+		    "ring buffer slot count must be greater than zero", "", 0);
+		return NULL;
+	}
+
+	/* OWNERSHIP: ring is released by ring_buf_free. */
+	ring = (ring_buf_t *)calloc(1U, sizeof(*ring));
+	if (ring == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "ring buffer allocation failed", "", 0);
+		return NULL;
+	}
+	/* OWNERSHIP: ring->slots is owned by ring and released by
+	 * ring_buf_free. */
+	ring->slots = (ring_slot_t *)calloc(n_slots, sizeof(ring->slots[0]));
+	if (ring->slots == NULL) {
+		free(ring);
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "ring slot allocation failed", "", 0);
+		return NULL;
+	}
+	ring->n_slots = n_slots;
+	for (i = 0U; i < n_slots; i++)
+		ring->slots[i].seq = UINT64_MAX;
+
+	rc = pthread_mutex_init(&ring->mutex, NULL);
+	if (rc != 0) {
+		free(ring->slots);
+		free(ring);
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "ring mutex initialisation failed", "", rc);
+		return NULL;
+	}
+	rc = pthread_cond_init(&ring->cond, NULL);
+	if (rc != 0) {
+		(void)pthread_mutex_destroy(&ring->mutex);
+		free(ring->slots);
+		free(ring);
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "ring condition initialisation failed", "",
+		                 rc);
+		return NULL;
+	}
+
+	return ring;
+}
+
+/*
+ * ring_buf_write - Publish one completed worker result into the ring buffer.
+ *
+ * The caller transfers ownership of data to the ring buffer. The I/O thread
+ * receives that same pointer via ring_buf_read and then owns it.
+ *
+ * Returns 0 on success, -1 on error.
+ * Fails with ARK_ERR_USAGE on invalid arguments or duplicate sequence publish.
+ *
+ * Preconditions: seq is unique for each published chunk and data is non-NULL
+ * when len is non-zero.
+ */
+int ring_buf_write(ring_buf_t *ring, uint64_t seq, uint8_t *data, size_t len,
+                   ark_err_t worker_err, ark_error_t *err)
+{
+	ring_slot_t *slot;
+	size_t idx;
+	int rc;
+
+	if (ring == NULL)
+		return fail_error(err, ARK_ERR_USAGE, "ring buffer is null", "",
+		                  0);
+	if (len > 0U && data == NULL)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "ring write data is null for non-zero length",
+		                  "", 0);
+
+	idx = (size_t)(seq % ring->n_slots);
+	slot = &ring->slots[idx];
+
+	rc = pthread_mutex_lock(&ring->mutex);
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
+		                  "", rc);
+	while (slot->ready && slot->seq != seq) {
+		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		if (rc != 0) {
+			(void)pthread_mutex_unlock(&ring->mutex);
+			return fail_error(err, ARK_ERR_USAGE,
+			                  "ring condition wait failed", "", rc);
+		}
+	}
+	if (slot->ready && slot->seq == seq) {
+		(void)pthread_mutex_unlock(&ring->mutex);
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "ring sequence already published", "", 0);
+	}
+
+	/*
+	 * SAFETY: ring slots are reused modulo n_slots. Writers must not
+	 * overwrite a still-owned slot for another sequence; waiting here
+	 * preserves strict in-order drain semantics from ARCHITECTURE.md
+	 * section 6.3.
+	 */
+	slot->seq = seq;
+	slot->data = data;
+	slot->len = len;
+	slot->abort = 0;
+	slot->worker_err = worker_err;
+	slot->ready = 1;
+	(void)pthread_cond_broadcast(&ring->cond);
+	(void)pthread_mutex_unlock(&ring->mutex);
+	return 0;
+}
+
+/*
+ * ring_buf_abort - Publish an abort sentinel for one sequence slot.
+ *
+ * Returns 0 on success, -1 on error.
+ * Fails with ARK_ERR_USAGE on invalid arguments or duplicate sequence publish.
+ */
+int ring_buf_abort(ring_buf_t *ring, uint64_t seq, ark_err_t worker_err,
+                   ark_error_t *err)
+{
+	ring_slot_t *slot;
+	size_t idx;
+	int rc;
+
+	if (ring == NULL)
+		return fail_error(err, ARK_ERR_USAGE, "ring buffer is null", "",
+		                  0);
+
+	idx = (size_t)(seq % ring->n_slots);
+	slot = &ring->slots[idx];
+
+	rc = pthread_mutex_lock(&ring->mutex);
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
+		                  "", rc);
+	while (slot->ready && slot->seq != seq) {
+		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		if (rc != 0) {
+			(void)pthread_mutex_unlock(&ring->mutex);
+			return fail_error(err, ARK_ERR_USAGE,
+			                  "ring condition wait failed", "", rc);
+		}
+	}
+	if (slot->ready && slot->seq == seq) {
+		(void)pthread_mutex_unlock(&ring->mutex);
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "ring sequence already published", "", 0);
+	}
+
+	/*
+	 * SAFETY: worker error paths must publish abort before worker exit to
+	 * unblock the I/O thread waiting on this sequence slot. See
+	 * ARCHITECTURE.md section 6.3.
+	 */
+	slot->seq = seq;
+	slot->data = NULL;
+	slot->len = 0U;
+	slot->abort = 1;
+	slot->worker_err = worker_err;
+	slot->ready = 1;
+	(void)pthread_cond_broadcast(&ring->cond);
+	(void)pthread_mutex_unlock(&ring->mutex);
+	return 0;
+}
+
+/*
+ * ring_buf_read - Wait for and consume one expected sequence slot.
+ *
+ * On success, data/len/abort/worker_err are populated for seq. data ownership
+ * transfers to the caller, which must free it after use when abort is zero.
+ *
+ * Returns 0 on success, -1 on error.
+ * Fails with ARK_ERR_USAGE on invalid arguments or synchronisation failures.
+ */
+int ring_buf_read(ring_buf_t *ring, uint64_t seq, uint8_t **data, size_t *len,
+                  int *abort, ark_err_t *worker_err, ark_error_t *err)
+{
+	ring_slot_t *slot;
+	size_t idx;
+	int rc;
+
+	if (ring == NULL || data == NULL || len == NULL || abort == NULL ||
+	    worker_err == NULL)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "ring read argument is null", "", 0);
+
+	idx = (size_t)(seq % ring->n_slots);
+	slot = &ring->slots[idx];
+
+	rc = pthread_mutex_lock(&ring->mutex);
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
+		                  "", rc);
+	while (!slot->ready || slot->seq != seq) {
+		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		if (rc != 0) {
+			(void)pthread_mutex_unlock(&ring->mutex);
+			return fail_error(err, ARK_ERR_USAGE,
+			                  "ring condition wait failed", "", rc);
+		}
+	}
+
+	*data = slot->data;
+	*len = slot->len;
+	*abort = slot->abort;
+	*worker_err = slot->worker_err;
+
+	/*
+	 * SAFETY: clear slot ownership only after the awaited sequence is
+	 * consumed. This prevents stale-slot reuse races and preserves strict
+	 * sequence drain. See ARCHITECTURE.md section 6.3.
+	 */
+	slot->data = NULL;
+	slot->len = 0U;
+	slot->abort = 0;
+	slot->worker_err = ARK_OK;
+	slot->seq = UINT64_MAX;
+	slot->ready = 0;
+	(void)pthread_cond_broadcast(&ring->cond);
+	(void)pthread_mutex_unlock(&ring->mutex);
+	return 0;
+}
+
+/*
+ * ring_buf_free - Release a ring buffer and any still-owned slot payloads.
+ */
+void ring_buf_free(ring_buf_t *ring)
+{
+	size_t i;
+
+	if (ring == NULL)
+		return;
+	for (i = 0U; i < ring->n_slots; i++)
+		free(ring->slots[i].data);
+	(void)pthread_cond_destroy(&ring->cond);
+	(void)pthread_mutex_destroy(&ring->mutex);
+	free(ring->slots);
+	free(ring);
+}
+
 static int parse_args(int, char **, ark_args_t *, ark_error_t *);
 static void args_init(ark_args_t *);
 static void args_free(ark_args_t *);
 static int usage_error(ark_error_t *, const char *);
-static int fail_error(ark_error_t *, ark_err_t, const char *, const char *,
-                      int);
 static int parse_subcommand(const char *, ark_cmd_t *, ark_error_t *);
 static int parse_hash(const char *, ark_hash_alg_t *, ark_error_t *);
 static int push_member(ark_args_t *, const char *, int, ark_error_t *);
@@ -3757,6 +4045,27 @@ static void print_usage(const char *problem)
 	exit(1);
 }
 
+#ifdef ARK_TEST
+/*
+ * ark_test_keep_main_symbols - Keep CLI-only static roots referenced in
+ * ARK_TEST builds where main() is intentionally excluded.
+ */
+void ark_test_keep_main_symbols(void)
+{
+	(void)&parse_args;
+	(void)&print_usage;
+	(void)&cmd_create;
+	(void)&cmd_extract;
+	(void)&cmd_list;
+	(void)&cmd_verify;
+	(void)&cmd_generate_reader;
+	(void)&sandbox_apply;
+	(void)&exit_code_from_err;
+	(void)&print_error;
+}
+#endif
+
+#ifndef ARK_TEST
 int main(int argc, char **argv)
 {
 	ark_args_t args;
@@ -3878,3 +4187,4 @@ int main(int argc, char **argv)
 	closelog();
 	return 0;
 }
+#endif

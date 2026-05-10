@@ -2,9 +2,9 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-09
+**Last Updated:** 2026-05-10
 **Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.1 - Ring buffer
+**Next Task:** Phase 6.2 - Shared error state
 
 ### Phase Summary
 
@@ -56,6 +56,9 @@
 | M31 | clang-format clean | NOT STARTED |
 | M32 | All tests pass on OpenBSD x86_64 | NOT STARTED |
 | M33 | All tests pass on OpenBSD ARM64 | NOT STARTED |
+| M34 | Deflate optimisation pass is format-preserving and deterministic (same input, same binary, identical output) | NOT STARTED |
+| M35 | Deflate optimisation pass improves compression ratio on the reference benchmark dataset | NOT STARTED |
+| M36 | Deflate optimisation pass improves create throughput or stays within an explicitly accepted regression threshold while improving ratio | NOT STARTED |
 
 ---
 
@@ -637,21 +640,21 @@ TSan clean on Linux.
 
 ### Tasks
 
-**6.1 - Ring buffer**
-- [ ] Implement `ring_buf_t` struct: fixed-size array of slots; each slot
+**6.1 - Ring buffer** ✓ DONE
+- [x] Implement `ring_buf_t` struct: fixed-size array of slots; each slot
   holds: sequence number, compressed data pointer, compressed length, abort
   flag, worker error; a mutex and condition variable for synchronisation
-- [ ] Implement `ring_buf_init(n_slots)`: allocate ring buffer with `n_slots`
+- [x] Implement `ring_buf_init(n_slots)`: allocate ring buffer with `n_slots`
   (one per worker thread)
-- [ ] Implement `ring_buf_write(ring, seq, data, len, err)`: worker path;
+- [x] Implement `ring_buf_write(ring, seq, data, len, err)`: worker path;
   write compressed result to slot `seq % n_slots`; signal I/O thread
-- [ ] Implement `ring_buf_abort(ring, seq, err)`: worker error path; write
+- [x] Implement `ring_buf_abort(ring, seq, err)`: worker error path; write
   abort flag and error to slot; signal I/O thread; see ARCHITECTURE.md §6.3
-- [ ] Implement `ring_buf_read(ring, seq)`: I/O thread path; block until
+- [x] Implement `ring_buf_read(ring, seq)`: I/O thread path; block until
   slot `seq % n_slots` is ready; return slot data or abort flag
-- [ ] Implement `ring_buf_free(ring)`: release ring buffer and all slot
+- [x] Implement `ring_buf_free(ring)`: release ring buffer and all slot
   memory
-- [ ] Verify: I/O thread unblocks when abort sentinel is written to the
+- [x] Verify: I/O thread unblocks when abort sentinel is written to the
   awaited slot
 
 **6.2 - Shared error state**
@@ -716,6 +719,70 @@ TSan clean on Linux.
 - [ ] All Phase 5 tests still pass after threading integration
 - [ ] Valgrind clean; ASan/UBSan clean on Linux
 - [ ] Quality milestones M13, M14, M15 confirmed
+
+---
+
+### Post-Phase 6 Follow-up - Deflate Optimisation Backlog
+
+**Goal:** After Phase 6 threading is stable, improve Deflate ratio and CPU
+cost without changing archive format, API, or determinism guarantees.
+
+**Prerequisite:** Phase 6 complete.
+
+**Reference documents:**
+- ARCHITECTURE.md §6.2 - fixed 1MB independent chunk streams (must remain)
+- ARCHITECTURE.md §7.2 - compressor quality targets
+- ARCHITECTURE.md §13.1 - determinism scope
+- ARCHITECTURE.md §15.3 - decompressor boundary required for recovery amalgamation
+
+#### Tasks
+
+**P6F.1 - Baseline freeze**
+- [ ] Capture baseline benchmark on a fixed dataset: source size, archive
+  size, create wall/user/sys time, verify wall/user/sys time
+- [ ] Capture parallel-vs-single-threaded byte-identity baseline for create
+  (same input, same binary)
+
+**P6F.2 - O1 fixed decode table caching (decompress path)**
+- [ ] Prebuild and reuse fixed-Huffman decode tables instead of rebuilding
+  per block
+- [ ] Verify no decompression output regressions on existing tests
+
+**P6F.3 - O2 reset-cost reduction in match finder (compress path)**
+- [ ] Replace full hash-chain table clears with a deterministic cheaper
+  reset strategy (e.g. generation stamping)
+- [ ] Verify deterministic output unchanged for identical input and mode
+
+**P6F.4 - O3 remove repeated parse passes for chosen dynamic block**
+- [ ] Refactor default-mode block pipeline to avoid redundant full
+  parse_block passes for the selected block
+- [ ] Keep block-boundary selection deterministic
+
+**P6F.5 - O4 length-limited Huffman builder**
+- [ ] Replace rank-based heuristic code-length assignment with a proper
+  Deflate-compliant length-limited builder for lit/dist trees
+- [ ] Enforce Deflate max code-length constraints and preserve RFC 1951 validity
+
+**P6F.6 - O5 dynamic-header code-length RLE**
+- [ ] Encode dynamic header code lengths with symbols 16/17/18 when beneficial
+- [ ] Keep header emission deterministic and standards-compliant
+
+**P6F.7 - Regression + determinism gate**
+- [ ] Re-run full Linux validation gate in required order
+- [ ] Re-verify parallel create output remains bit-identical to single-threaded
+  create (same input, same binary)
+- [ ] Re-run fixed benchmark matrix from P6F.1 and record deltas
+
+**P6F.8 - OpenBSD verification**
+- [ ] Provide OpenBSD command set for the same benchmark + tests
+- [ ] Confirm OpenBSD pass before marking the optimisation pass complete
+
+#### Completion Criteria
+
+- [ ] No format changes (header/index/footer/chunk model unchanged)
+- [ ] No public API changes in `deflate.h`
+- [ ] Determinism scope from ARCHITECTURE.md §13.1 preserved
+- [ ] Quality milestones M34, M35, M36 confirmed
 
 ---
 

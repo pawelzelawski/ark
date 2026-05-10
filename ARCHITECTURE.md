@@ -2526,6 +2526,22 @@ configurable. Archives produced by v1 always use 1MB chunks. A future format
 version may introduce a different chunk size but v1 readers are not required
 to support it.
 
+**Deflate optimisation guardrails (implementation-level only).** Future
+compressor/decompressor optimisations are permitted only when they preserve
+all v1 format invariants. In particular, the following must not change:
+- 1MB fixed chunk size and one independent Deflate stream per chunk
+  (see §6.2)
+- raw-store fallback semantics for incompressible content (see §6.4, §7.2)
+- determinism scope for identical input on the same binary (see §13.1)
+- public Deflate API contract in `deflate.h` (see §7.4)
+- decompressor/compiler boundary required by recovery amalgamation
+  (`deflate.c` decompressor subset remains standalone; see §15.3)
+
+Within those constraints, the implementation may improve Huffman code-length
+assignment quality, dynamic-header coding efficiency, parsing-pass count,
+and internal match-finder/reset costs, provided RFC 1951 validity is
+preserved and output remains deterministic within the documented scope.
+
 **Partial modification detection during archiving.** The writer detects
 modifications to a file only while that specific file is being read, and
 only when mtime or st_size changes. Files modified within one timestamp

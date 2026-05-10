@@ -23,11 +23,7 @@ TEST_BIN_VG = $(TEST_DIR)/run_tests_vg
 
 RECOVERY_HEADER = $(BUILD_DIR)/recovery_template_data.h
 
-LDFLAGS_COMMON != if [ "$(OS)" = "Linux" ]; then \
-	echo "-lpthread"; \
-else \
-	echo ""; \
-fi
+LDFLAGS_COMMON = -pthread
 
 SANITIZERS != if [ "$(OS)" = "Linux" ]; then \
 	echo "-fsanitize=address,undefined"; \
@@ -65,7 +61,7 @@ INCLUDES = -I. -I./src -I./vendor/libchevron/include -I./$(BUILD_DIR)
 APP_SRCS = src/archive.c src/blake3.c src/deflate.c src/main.c \
 	src/sha256.c vendor/libchevron/src/chevron.c
 
-CORE_SRCS = src/archive.c src/blake3.c src/deflate.c src/sha256.c \
+CORE_SRCS = src/archive.c src/blake3.c src/deflate.c src/main.c src/sha256.c \
 	vendor/libchevron/src/chevron.c
 
 TEST_SRCS = tests/run_tests.c tests/ark_stubs.c tests/test_archive.c \
