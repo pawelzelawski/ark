@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-10
 **Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.3 - Worker threads
+**Next Task:** Phase 6.4 - I/O thread integration
 
 ### Phase Summary
 
@@ -663,17 +663,17 @@ TSan clean on Linux.
 - [x] Implement `error_store_once`: compare-and-swap write; only first
   worker error is stored; subsequent calls are no-ops
 
-**6.3 - Worker threads**
-- [ ] Implement `worker_compress(arg)`: receive chunk from queue; call
+**6.3 - Worker threads** ✓ DONE
+- [x] Implement `worker_compress(arg)`: receive chunk from queue; call
   `ark_deflate_compress`; on success: call `ring_buf_write`; on failure:
   call `error_store_once` then `ring_buf_abort`; check cancellation flag
   between chunks
-- [ ] Implement `worker_decompress(arg)`: same pattern for the extract path
-- [ ] Implement `pool_init(n_workers)`: allocate thread pool; create
+- [x] Implement `worker_decompress(arg)`: same pattern for the extract path
+- [x] Implement `pool_init(n_workers)`: allocate thread pool; create
   `n_workers` pthreads; each thread waits on a work queue
-- [ ] Implement `pool_submit(pool, chunk)`: enqueue a chunk for compression
+- [x] Implement `pool_submit(pool, chunk)`: enqueue a chunk for compression
   or decompression; block if queue is full
-- [ ] Implement `pool_shutdown(pool)`: set cancellation flag; join all
+- [x] Implement `pool_shutdown(pool)`: set cancellation flag; join all
   workers; free pool
 
 **6.4 - I/O thread integration**

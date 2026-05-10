@@ -121,6 +121,13 @@ typedef struct {
 
 typedef struct ring_buf ring_buf_t;
 
+typedef enum {
+	ARK_POOL_COMPRESS = 0,
+	ARK_POOL_DECOMPRESS,
+} ark_pool_mode_t;
+
+typedef struct ark_pool ark_pool_t;
+
 typedef struct {
 	_Atomic int recorded;
 	ark_error_t error;
@@ -135,11 +142,35 @@ typedef struct {
 	ark_err_t worker_err;
 } ring_slot_t;
 
+typedef struct {
+	uint64_t seq;
+	uint8_t *src;
+	size_t src_len;
+	ark_deflate_mode_t mode;
+} pool_work_t;
+
 struct ring_buf {
 	size_t n_slots;
 	ring_slot_t *slots;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
+};
+
+struct ark_pool {
+	int n_workers;
+	ark_pool_mode_t mode;
+	pthread_t *workers;
+	pool_work_t *queue;
+	size_t q_cap;
+	size_t q_head;
+	size_t q_tail;
+	size_t q_count;
+	pthread_mutex_t mutex;
+	pthread_cond_t cv_not_empty;
+	pthread_cond_t cv_not_full;
+	_Atomic int cancelled;
+	ring_buf_t *ring;
+	ark_shared_err_t shared_err;
 };
 
 ring_buf_t *ring_buf_init(size_t, ark_error_t *);
@@ -149,7 +180,14 @@ int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
 void ring_buf_free(ring_buf_t *);
-void error_store_once(ark_shared_err_t *, const ark_error_t *);
+static void error_store_once(ark_shared_err_t *, const ark_error_t *);
+ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
+int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
+                ark_deflate_mode_t);
+void pool_shutdown(ark_pool_t *);
+
+static void *worker_compress(void *);
+static void *worker_decompress(void *);
 
 static int fail_error(ark_error_t *, ark_err_t, const char *, const char *,
                       int);
@@ -424,7 +462,7 @@ void ring_buf_free(ring_buf_t *ring)
  *
  * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.3.
  */
-void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
+static void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
 {
 	int expected;
 
@@ -445,6 +483,493 @@ void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
 	 * propagation from ARCHITECTURE.md section 6.3.
 	 */
 	shared->error = *err;
+}
+
+/*
+ * pool_init - Allocate and initialise a worker pool bound to one mode.
+ *
+ * mode selects a fixed worker routine for the lifetime of the pool:
+ * compress pools run worker_compress, decompress pools run
+ * worker_decompress. Mixing modes in one pool is intentionally unsupported.
+ *
+ * Returns a new pool on success, NULL on failure.
+ *
+ * OWNERSHIP: returned pool is owned by the caller and must be released with
+ * pool_shutdown.
+ *
+ * See ARCHITECTURE.md section 6.3.
+ */
+ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, ark_error_t *err)
+{
+	ark_pool_t *pool;
+	void *(*entry)(void *);
+	int i;
+	int rc;
+
+	if (n_workers <= 0)
+		return NULL;
+	if (mode != ARK_POOL_COMPRESS && mode != ARK_POOL_DECOMPRESS)
+		return NULL;
+
+	/* OWNERSHIP: pool is released only by pool_shutdown. */
+	pool = (ark_pool_t *)calloc(1U, sizeof(*pool));
+	if (pool == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool allocation failed", "", 0);
+		return NULL;
+	}
+	pool->n_workers = n_workers;
+	pool->mode = mode;
+	pool->q_cap = (size_t)n_workers;
+
+	/* OWNERSHIP: pool->workers is released by pool_shutdown. */
+	pool->workers =
+	    (pthread_t *)calloc((size_t)n_workers, sizeof(pool->workers[0]));
+	if (pool->workers == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool worker array allocation failed",
+		                 "", 0);
+		free(pool);
+		return NULL;
+	}
+	/* OWNERSHIP: pool->queue entries are owned by pool until consumed or
+	 * released by pool_shutdown. */
+	pool->queue =
+	    (pool_work_t *)calloc((size_t)n_workers, sizeof(pool->queue[0]));
+	if (pool->queue == NULL) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool queue allocation failed", "", 0);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+
+	rc = pthread_mutex_init(&pool->mutex, NULL);
+	if (rc != 0) {
+		(void)fail_error(err, ARK_ERR_IO_ALLOC,
+		                 "thread pool mutex initialisation failed", "",
+		                 rc);
+		free(pool->queue);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+	rc = pthread_cond_init(&pool->cv_not_empty, NULL);
+	if (rc != 0) {
+		(void)fail_error(
+		    err, ARK_ERR_IO_ALLOC,
+		    "thread pool queue condition initialisation failed", "",
+		    rc);
+		(void)pthread_mutex_destroy(&pool->mutex);
+		free(pool->queue);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+	rc = pthread_cond_init(&pool->cv_not_full, NULL);
+	if (rc != 0) {
+		(void)fail_error(
+		    err, ARK_ERR_IO_ALLOC,
+		    "thread pool queue condition initialisation failed", "",
+		    rc);
+		(void)pthread_cond_destroy(&pool->cv_not_empty);
+		(void)pthread_mutex_destroy(&pool->mutex);
+		free(pool->queue);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+
+	/*
+	 * ARCHITECTURE.md section 6.3 requires a fixed-size result ring with
+	 * one slot per worker.
+	 */
+	pool->ring = ring_buf_init((size_t)n_workers, err);
+	if (pool->ring == NULL) {
+		(void)pthread_cond_destroy(&pool->cv_not_full);
+		(void)pthread_cond_destroy(&pool->cv_not_empty);
+		(void)pthread_mutex_destroy(&pool->mutex);
+		free(pool->queue);
+		free(pool->workers);
+		free(pool);
+		return NULL;
+	}
+	pool->shared_err.recorded = 0;
+
+	entry = mode == ARK_POOL_COMPRESS ? worker_compress : worker_decompress;
+	for (i = 0; i < n_workers; i++) {
+		rc = pthread_create(&pool->workers[i], NULL, entry, pool);
+		if (rc != 0) {
+			(void)fail_error(err, ARK_ERR_IO_ALLOC,
+			                 "thread pool worker creation failed",
+			                 "", rc);
+			__atomic_store_n((int *)&pool->cancelled, 1,
+			                 __ATOMIC_RELEASE);
+			(void)pthread_cond_broadcast(&pool->cv_not_empty);
+			while (--i >= 0)
+				(void)pthread_join(pool->workers[i], NULL);
+			ring_buf_free(pool->ring);
+			(void)pthread_cond_destroy(&pool->cv_not_full);
+			(void)pthread_cond_destroy(&pool->cv_not_empty);
+			(void)pthread_mutex_destroy(&pool->mutex);
+			free(pool->queue);
+			free(pool->workers);
+			free(pool);
+			return NULL;
+		}
+	}
+
+	return pool;
+}
+
+/*
+ * pool_submit - Enqueue one chunk for processing by a mode-bound worker pool.
+ *
+ * Blocks while the queue is full. Returns -1 if cancellation is active.
+ *
+ * OWNERSHIP: pool_submit copies src bytes into queue-owned storage. The
+ * worker that dequeues the item owns and frees that copy.
+ */
+int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
+                size_t src_len, ark_deflate_mode_t mode)
+{
+	uint8_t *src_copy;
+	int rc;
+
+	if (pool == NULL)
+		return -1;
+	if (src_len > 0U && src == NULL)
+		return -1;
+	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0)
+		return -1;
+
+	/* OWNERSHIP: src_copy moves to queue slot and is freed by the worker.
+	 */
+	src_copy = (uint8_t *)malloc(src_len == 0U ? 1U : src_len);
+	if (src_copy == NULL) {
+		ark_error_t local_err = {0};
+
+		(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
+		                 "thread pool submit allocation failed", "", 0);
+		error_store_once(&pool->shared_err, &local_err);
+		(void)ring_buf_abort(pool->ring, seq, ARK_ERR_IO_ALLOC, NULL);
+		__atomic_store_n((int *)&pool->cancelled, 1, __ATOMIC_RELEASE);
+		return -1;
+	}
+	if (src_len > 0U) {
+		size_t i;
+
+		for (i = 0U; i < src_len; i++)
+			src_copy[i] = src[i];
+	}
+
+	rc = pthread_mutex_lock(&pool->mutex);
+	if (rc != 0) {
+		free(src_copy);
+		return -1;
+	}
+	while (pool->q_count == pool->q_cap &&
+	       __atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) ==
+	           0) {
+		rc = pthread_cond_wait(&pool->cv_not_full, &pool->mutex);
+		if (rc != 0) {
+			(void)pthread_mutex_unlock(&pool->mutex);
+			free(src_copy);
+			return -1;
+		}
+	}
+	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0) {
+		(void)pthread_mutex_unlock(&pool->mutex);
+		free(src_copy);
+		return -1;
+	}
+
+	pool->queue[pool->q_tail] = (pool_work_t){
+	    .seq = seq,
+	    .src = src_copy,
+	    .src_len = src_len,
+	    .mode = mode,
+	};
+	pool->q_tail = (pool->q_tail + 1U) % pool->q_cap;
+	pool->q_count++;
+	(void)pthread_cond_signal(&pool->cv_not_empty);
+	(void)pthread_mutex_unlock(&pool->mutex);
+	return 0;
+}
+
+/*
+ * pool_shutdown - Cancel all workers, join, and release all pool resources.
+ *
+ * See ARCHITECTURE.md section 6.3 for cancellation and worker lifetime rules.
+ */
+void pool_shutdown(ark_pool_t *pool)
+{
+	int i;
+
+	if (pool == NULL)
+		return;
+
+	__atomic_store_n((int *)&pool->cancelled, 1, __ATOMIC_RELEASE);
+	if (pthread_mutex_lock(&pool->mutex) == 0) {
+		(void)pthread_cond_broadcast(&pool->cv_not_empty);
+		(void)pthread_cond_broadcast(&pool->cv_not_full);
+		(void)pthread_mutex_unlock(&pool->mutex);
+	}
+
+	for (i = 0; i < pool->n_workers; i++)
+		(void)pthread_join(pool->workers[i], NULL);
+
+	while (pool->q_count > 0U) {
+		pool_work_t *slot;
+
+		slot = &pool->queue[pool->q_head];
+		free(slot->src);
+		slot->src = NULL;
+		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
+		pool->q_count--;
+	}
+
+	ring_buf_free(pool->ring);
+	(void)pthread_cond_destroy(&pool->cv_not_full);
+	(void)pthread_cond_destroy(&pool->cv_not_empty);
+	(void)pthread_mutex_destroy(&pool->mutex);
+	free(pool->queue);
+	free(pool->workers);
+	free(pool);
+}
+
+/*
+ * worker_compress - Worker thread loop for compress-mode pools.
+ *
+ * Each dequeued input chunk is compressed with ark_deflate_compress and
+ * published to the ring buffer slot identified by seq.
+ *
+ * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.1.
+ */
+static void *worker_compress(void *arg)
+{
+	ark_pool_t *pool;
+
+	pool = (ark_pool_t *)arg;
+	if (pool == NULL)
+		return NULL;
+
+	for (;;) {
+		pool_work_t work;
+		int rc;
+
+		if (__atomic_load_n((int *)&pool->cancelled,
+		                    __ATOMIC_ACQUIRE) != 0)
+			break;
+
+		rc = pthread_mutex_lock(&pool->mutex);
+		if (rc != 0)
+			break;
+		while (pool->q_count == 0U &&
+		       __atomic_load_n((int *)&pool->cancelled,
+		                       __ATOMIC_ACQUIRE) == 0) {
+			rc = pthread_cond_wait(&pool->cv_not_empty,
+			                       &pool->mutex);
+			if (rc != 0)
+				break;
+		}
+		if (rc != 0 || (pool->q_count == 0U &&
+		                __atomic_load_n((int *)&pool->cancelled,
+		                                __ATOMIC_ACQUIRE) != 0)) {
+			(void)pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+
+		work = pool->queue[pool->q_head];
+		pool->queue[pool->q_head] = (pool_work_t){0};
+		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
+		pool->q_count--;
+		(void)pthread_cond_signal(&pool->cv_not_full);
+		(void)pthread_mutex_unlock(&pool->mutex);
+
+		if (__atomic_load_n((int *)&pool->cancelled,
+		                    __ATOMIC_ACQUIRE) != 0) {
+			free(work.src);
+			break;
+		}
+
+		size_t out_cap;
+		uint8_t *out;
+		ssize_t out_len;
+
+		out_cap = ark_deflate_bound(work.src_len);
+		/* OWNERSHIP: out is transferred to ring_buf_write on success;
+		 * on failure it is released in this worker. */
+		out = (uint8_t *)malloc(out_cap == 0U ? 1U : out_cap);
+		if (out == NULL) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
+			                 "worker output allocation failed", "",
+			                 0);
+			error_store_once(&pool->shared_err, &local_err);
+			/*
+			 * SAFETY: worker must publish abort sentinel before
+			 * exit or the I/O thread can block forever waiting for
+			 * this sequence slot. See ARCHITECTURE.md section 6.3.
+			 */
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_IO_ALLOC, NULL);
+			free(work.src);
+			break;
+		}
+
+		out_len = ark_deflate_compress(work.src, work.src_len, out,
+		                               out_cap, work.mode);
+		if (out_len < 0) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
+			                 "worker compression failed", "", 0);
+			error_store_once(&pool->shared_err, &local_err);
+			/* SAFETY: publish abort before worker exit. See
+			 * ARCHITECTURE.md section 6.3. */
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_IO_WRITE, NULL);
+			free(out);
+			free(work.src);
+			break;
+		}
+
+		if (ring_buf_write(pool->ring, work.seq, out, (size_t)out_len,
+		                   ARK_OK, NULL) != 0) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
+			                 "worker ring publish failed", "", 0);
+			error_store_once(&pool->shared_err, &local_err);
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_IO_WRITE, NULL);
+			free(out);
+			free(work.src);
+			break;
+		}
+
+		free(work.src);
+	}
+
+	return NULL;
+}
+
+/*
+ * worker_decompress - Worker thread loop for decompress-mode pools.
+ *
+ * Each dequeued compressed chunk is decompressed with
+ * ark_deflate_decompress and published to the ring buffer slot identified by
+ * seq.
+ *
+ * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.1.
+ */
+static void *worker_decompress(void *arg)
+{
+	ark_pool_t *pool;
+
+	pool = (ark_pool_t *)arg;
+	if (pool == NULL)
+		return NULL;
+
+	for (;;) {
+		pool_work_t work;
+		uint8_t *out;
+		ssize_t out_len;
+		int rc;
+
+		if (__atomic_load_n((int *)&pool->cancelled,
+		                    __ATOMIC_ACQUIRE) != 0)
+			break;
+
+		rc = pthread_mutex_lock(&pool->mutex);
+		if (rc != 0)
+			break;
+		while (pool->q_count == 0U &&
+		       __atomic_load_n((int *)&pool->cancelled,
+		                       __ATOMIC_ACQUIRE) == 0) {
+			rc = pthread_cond_wait(&pool->cv_not_empty,
+			                       &pool->mutex);
+			if (rc != 0)
+				break;
+		}
+		if (rc != 0 || (pool->q_count == 0U &&
+		                __atomic_load_n((int *)&pool->cancelled,
+		                                __ATOMIC_ACQUIRE) != 0)) {
+			(void)pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+
+		work = pool->queue[pool->q_head];
+		pool->queue[pool->q_head] = (pool_work_t){0};
+		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
+		pool->q_count--;
+		(void)pthread_cond_signal(&pool->cv_not_full);
+		(void)pthread_mutex_unlock(&pool->mutex);
+
+		if (__atomic_load_n((int *)&pool->cancelled,
+		                    __ATOMIC_ACQUIRE) != 0) {
+			free(work.src);
+			break;
+		}
+
+		/* OWNERSHIP: out is transferred to ring_buf_write on success.
+		 */
+		out = (uint8_t *)malloc(ARK_CHUNK_SIZE);
+		if (out == NULL) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
+			                 "worker output allocation failed", "",
+			                 0);
+			error_store_once(&pool->shared_err, &local_err);
+			/*
+			 * SAFETY: worker must publish abort sentinel before
+			 * exit or the I/O thread can block forever waiting for
+			 * this sequence slot. See ARCHITECTURE.md section 6.3.
+			 */
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_IO_ALLOC, NULL);
+			free(work.src);
+			break;
+		}
+
+		out_len = ark_deflate_decompress(work.src, work.src_len, out,
+		                                 ARK_CHUNK_SIZE);
+		if (out_len < 0) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_FMT_DATA,
+			                 "worker decompression failed", "", 0);
+			error_store_once(&pool->shared_err, &local_err);
+			/* SAFETY: publish abort before worker exit. See
+			 * ARCHITECTURE.md section 6.3. */
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_FMT_DATA, NULL);
+			free(out);
+			free(work.src);
+			break;
+		}
+
+		if (ring_buf_write(pool->ring, work.seq, out, (size_t)out_len,
+		                   ARK_OK, NULL) != 0) {
+			ark_error_t local_err = {0};
+
+			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
+			                 "worker ring publish failed", "", 0);
+			error_store_once(&pool->shared_err, &local_err);
+			(void)ring_buf_abort(pool->ring, work.seq,
+			                     ARK_ERR_IO_WRITE, NULL);
+			free(out);
+			free(work.src);
+			break;
+		}
+
+		free(work.src);
+	}
+
+	return NULL;
 }
 
 static int parse_args(int, char **, ark_args_t *, ark_error_t *);
