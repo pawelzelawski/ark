@@ -4,7 +4,7 @@
 
 **Last Updated:** 2026-05-10
 **Current Phase:** Phase 6 - Thread pool (in progress)
-**Next Task:** Phase 6.4 - I/O thread integration
+**Next Task:** Phase 6.6 - Thread pool tests
 
 ### Phase Summary
 
@@ -15,7 +15,7 @@
 | 3 | Deflate component | DONE | 3.1-3.4 complete | Compress, decompress, bound; round-trip correctness |
 | 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
 | 5 | CLI: core operations | DONE | 5.1-5.10 complete | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
-| 6 | Thread pool | NOT STARTED | - | Ring buffer, workers, cancellation, error propagation; TSan required |
+| 6 | Thread pool | IN PROGRESS | 6.1-6.5 complete | Ring buffer, workers, cancellation, error propagation; TSan required |
 | 7 | Test suite completion | NOT STARTED | - | Integration tests, coverage verification |
 | 8 | Hardening and release | NOT STARTED | - | Valgrind, TSan final, static analysis, README |
 
@@ -676,26 +676,26 @@ TSan clean on Linux.
 - [x] Implement `pool_shutdown(pool)`: set cancellation flag; join all
   workers; free pool
 
-**6.4 - I/O thread integration**
-- [ ] In `cmd_create`: replace single-threaded compression loop with:
+**6.4 - I/O thread integration** ✓ DONE
+- [x] In `cmd_create`: replace single-threaded compression loop with:
   submit chunk to pool; drain ring buffer in sequence order; call
   `ark_write_chunk` with each delivered compressed result; on abort
   sentinel: read shared error, proceed to cancel + join + cleanup
-- [ ] In `cmd_extract`: same pattern for decompression
-- [ ] Number of worker threads: default `nproc` on Linux,
+- [x] In `cmd_extract`: same pattern for decompression
+- [x] Number of worker threads: default `nproc` on Linux,
   `sysctl hw.ncpu` on OpenBSD; capped at a reasonable maximum (e.g. 16);
   not user-configurable
 
-**6.5 - Thread quiescence on error**
-- [ ] On any fatal error in `cmd_create` or `cmd_extract`: apply the five-
+**6.5 - Thread quiescence on error** ✓ DONE
+- [x] On any fatal error in `cmd_create` or `cmd_extract`: apply the five-
   step quiescence sequence per ARCHITECTURE.md §14.3:
   (1) set cancellation flag,
   (2) stop submitting new work,
   (3) join all workers,
   (4) close current output fd,
   (5) run cleanup
-- [ ] Verify: no filesystem cleanup races an active worker
-- [ ] Verify: `pthread_join` completes for all workers before any cleanup
+- [x] Verify: no filesystem cleanup races an active worker
+- [x] Verify: `pthread_join` completes for all workers before any cleanup
   filesystem operation
 
 **6.6 - Thread pool tests**

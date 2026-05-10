@@ -17,6 +17,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "archive.h"
 #include "ark_internal.h"
@@ -34,7 +35,17 @@ extern long syscall(long, ...);
 #ifdef __OpenBSD__
 extern int pledge(const char *, const char *);
 extern int unveil(const char *, const char *);
+extern int sysctl(int *, unsigned int, void *, size_t *, const void *, size_t);
+
+/* OpenBSD sysctl namespace constants (sys/sysctl.h):
+ * CTL_HW = 6, HW_NCPU = 3. */
+enum {
+	ARK_CTL_HW = 6,
+	ARK_HW_NCPU = 3,
+};
 #endif
+
+#define ARK_MAX_WORKERS 16
 
 typedef enum {
 	ARK_CMD_NONE = 0,
@@ -104,11 +115,15 @@ typedef struct {
 	size_t capacity;
 } dir_deferred_meta_t;
 
+typedef struct ark_pool ark_pool_t;
+
 typedef struct {
 	char root[PATH_MAX];
 	dev_t root_dev;
 	ark_write_ctx_t *write_ctx;
 	chevron_handle_t *chev_handle;
+	ark_pool_t *pool;
+	ark_deflate_mode_t deflate_mode;
 	modified_path_list_t *modified_paths;
 	inode_table_t inodes;
 	uint8_t *input_buf;
@@ -125,8 +140,6 @@ typedef enum {
 	ARK_POOL_COMPRESS = 0,
 	ARK_POOL_DECOMPRESS,
 } ark_pool_mode_t;
-
-typedef struct ark_pool ark_pool_t;
 
 typedef struct {
 	_Atomic int recorded;
@@ -181,10 +194,10 @@ int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
 void ring_buf_free(ring_buf_t *);
 static void error_store_once(ark_shared_err_t *, const ark_error_t *);
-ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
-int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
-                ark_deflate_mode_t);
-void pool_shutdown(ark_pool_t *);
+static ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
+static int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
+                       ark_deflate_mode_t);
+static void pool_shutdown(ark_pool_t *);
 
 static void *worker_compress(void *);
 static void *worker_decompress(void *);
@@ -499,7 +512,8 @@ static void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
  *
  * See ARCHITECTURE.md section 6.3.
  */
-ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, ark_error_t *err)
+static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
+                             ark_error_t *err)
 {
 	ark_pool_t *pool;
 	void *(*entry)(void *);
@@ -630,8 +644,8 @@ ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, ark_error_t *err)
  * OWNERSHIP: pool_submit copies src bytes into queue-owned storage. The
  * worker that dequeues the item owns and frees that copy.
  */
-int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
-                size_t src_len, ark_deflate_mode_t mode)
+static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
+                       size_t src_len, ark_deflate_mode_t mode)
 {
 	uint8_t *src_copy;
 	int rc;
@@ -702,7 +716,7 @@ int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
  *
  * See ARCHITECTURE.md section 6.3 for cancellation and worker lifetime rules.
  */
-void pool_shutdown(ark_pool_t *pool)
+static void pool_shutdown(ark_pool_t *pool)
 {
 	int i;
 
@@ -975,6 +989,7 @@ static void *worker_decompress(void *arg)
 static int parse_args(int, char **, ark_args_t *, ark_error_t *);
 static void args_init(ark_args_t *);
 static void args_free(ark_args_t *);
+static int default_worker_count(void);
 static int usage_error(ark_error_t *, const char *);
 static int parse_subcommand(const char *, ark_cmd_t *, ark_error_t *);
 static int parse_hash(const char *, ark_hash_alg_t *, ark_error_t *);
@@ -982,13 +997,14 @@ static int push_member(ark_args_t *, const char *, int, ark_error_t *);
 static void print_usage(const char *);
 static void copy_msg(char *, size_t, const char *);
 static int parent_dir(const char *, char *, size_t, ark_error_t *);
-static int cmd_create(const ark_args_t *, ark_error_t *);
-static int cmd_extract(const ark_args_t *, int, ark_error_t *);
+static int cmd_create(const ark_args_t *, ark_pool_t *, ark_error_t *);
+static int cmd_extract(const ark_args_t *, int, ark_pool_t *, ark_error_t *);
 static int cmd_list(const ark_args_t *, ark_error_t *);
 static int cmd_verify(const ark_args_t *, ark_error_t *);
 static int cmd_generate_reader(const ark_args_t *, ark_error_t *);
 static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
-                        uint64_t *, modified_path_list_t *, ark_error_t *);
+                        ark_pool_t *, ark_deflate_mode_t, uint64_t *,
+                        modified_path_list_t *, ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
                           ark_error_t *);
 static int traverse_directory_abs(traverse_ctx_t *, const char *, const char *,
@@ -1195,6 +1211,47 @@ static int create_validate_destination_outside_sources(const char *archive_path,
 }
 
 /*
+ * default_worker_count - Derive default pool width from host CPU count.
+ *
+ * Linux uses sysconf(_SC_NPROCESSORS_ONLN). OpenBSD uses sysctl hw.ncpu.
+ * Result is clamped to [1, ARK_MAX_WORKERS] and is not user-configurable.
+ * See DEVELOPMENT.md task 6.4.
+ */
+static int default_worker_count(void)
+{
+	long ncpu;
+
+#ifdef __linux__
+	ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpu < 1)
+		ncpu = 1;
+#elif defined(__OpenBSD__)
+	int mib[2];
+	int value;
+	size_t vlen;
+
+	mib[0] = ARK_CTL_HW;
+	mib[1] = ARK_HW_NCPU;
+	value = 1;
+	vlen = sizeof(value);
+	ncpu = 1;
+	/*
+	 * OpenBSD worker-count source required by DEVELOPMENT.md task 6.4:
+	 * query "hw.ncpu" from the sysctl namespace.
+	 */
+	if (sysctl(mib, 2U, &value, &vlen, NULL, 0) == 0 &&
+	    vlen == sizeof(value) && value > 0)
+		ncpu = value;
+#else
+	ncpu = 1;
+#endif
+
+	if (ncpu > ARK_MAX_WORKERS)
+		ncpu = ARK_MAX_WORKERS;
+	return (int)ncpu;
+}
+
+/*
  * create_serialize_index - Allocate and serialize the index block.
  *
  * OWNERSHIP: on success *out_buf transfers to caller and is freed by
@@ -1304,13 +1361,15 @@ static int chevron_error_fail(ark_error_t *err, const chevron_error_t *cerr,
 }
 
 /*
- * cmd_create - Execute single-threaded archive creation.
+ * cmd_create - Execute archive creation with worker-pool compression.
  *
  * Runs the write sequence from ARCHITECTURE.md section 16.3, streams bytes
  * through libchevron per section 9, enforces destination preconditions per
  * section 13.5, and performs source-modification checks per section 13.4.
+ * Parallel chunk compression and in-order I/O drain follow section 6.3.
  */
-static int cmd_create(const ark_args_t *args, ark_error_t *err)
+static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
+                      ark_error_t *err)
 {
 	ark_write_ctx_storage_t wstorage = {0};
 	ark_write_ctx_t *wctx;
@@ -1329,11 +1388,12 @@ static int cmd_create(const ark_args_t *args, ark_error_t *err)
 	int rc;
 	size_t i;
 
-	if (args == NULL || args->archive_path == NULL ||
+	if (args == NULL || pool == NULL || args->archive_path == NULL ||
 	    args->create_path_count == 0U)
-		return fail_error(
-		    err, ARK_ERR_USAGE,
-		    "create requires archive path and source paths", "", 0);
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "create requires worker pool, archive path, "
+		                  "and source paths",
+		                  "", 0);
 
 	if (create_validate_destination_outside_sources(
 	        args->archive_path, args->create_paths, args->create_path_count,
@@ -1365,8 +1425,9 @@ static int cmd_create(const ark_args_t *args, ark_error_t *err)
 	output_offset = (uint64_t)n;
 
 	for (i = 0U; i < args->create_path_count; i++) {
-		if (traverse_dir(args->create_paths[i], wctx, &handle,
-		                 &output_offset, &modified, err) != 0)
+		if (traverse_dir(args->create_paths[i], wctx, &handle, pool,
+		                 args->deflate_mode, &output_offset, &modified,
+		                 err) != 0)
 			goto cleanup;
 	}
 
@@ -1413,6 +1474,12 @@ static int cmd_create(const ark_args_t *args, ark_error_t *err)
 	rc = 0;
 
 cleanup:
+	/*
+	 * SAFETY: quiesce workers before archive handle teardown so no worker
+	 * can race output finalisation on failure paths. See ARCHITECTURE.md
+	 * sections 6.3 and 14.3.
+	 */
+	pool_shutdown(pool);
 	if (rc != 0 && opened)
 		chevron_abort(&handle);
 	free(footer_buf);
@@ -1649,6 +1716,11 @@ static int build_extract_selection(const ark_args_t *args,
 			    err, ARK_ERR_FMT_INDEX,
 			    "requested member not found in archive",
 			    args->member_paths[i], 0);
+		if ((size_t)pos >= member_count)
+			return fail_error(
+			    err, ARK_ERR_FMT_INDEX,
+			    "requested member index out of bounds",
+			    args->member_paths[i], 0);
 		selected[pos] = 1U;
 	}
 
@@ -1669,6 +1741,11 @@ static int build_extract_selection(const ark_args_t *args,
 				return fail_error(
 				    err, ARK_ERR_FMT_INDEX,
 				    "hardlink target missing in archive",
+				    meta->link, 0);
+			if ((size_t)target_pos >= member_count)
+				return fail_error(
+				    err, ARK_ERR_FMT_INDEX,
+				    "hardlink target index out of bounds",
 				    meta->link, 0);
 			if (selected[target_pos] == 0U) {
 				selected[target_pos] = 1U;
@@ -2505,8 +2582,13 @@ static int cmd_generate_reader(const ark_args_t *args, ark_error_t *err)
 
 /*
  * cmd_extract - Validate archive and extract selected members in index order.
+ *
+ * Uses worker-pool decompression with I/O-thread ordered drain from the ring
+ * buffer per ARCHITECTURE.md section 6.3. Fatal paths quiesce workers before
+ * filesystem cleanup per section 14.3.
  */
-static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
+static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
+                       ark_error_t *err)
 {
 	ark_read_ctx_storage_t rstorage = {0};
 	ark_read_ctx_t *rctx;
@@ -2515,10 +2597,11 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 	uint8_t *index_buf;
 	unsigned char *selected;
 	uint8_t *comp_buf;
-	uint8_t *decomp_buf;
+	uint8_t *out_buf;
 	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
+	size_t max_in_flight;
 	int archive_fd;
 	int out_fd;
 	int rc;
@@ -2527,9 +2610,18 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 	index_buf = NULL;
 	selected = NULL;
 	comp_buf = NULL;
-	decomp_buf = NULL;
+	out_buf = NULL;
 	out_fd = -1;
 	rc = -1;
+	if (pool == NULL)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "extract worker pool is required", "", 0);
+	max_in_flight = (size_t)pool->n_workers;
+	if (max_in_flight == 0U)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "extract worker pool has zero workers", "",
+		                  0);
+
 	archive_fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
 	if (archive_fd == -1)
 		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
@@ -2553,10 +2645,9 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 		goto cleanup;
 
 	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
-	/* OWNERSHIP: command cleanup frees both chunk buffers. */
+	/* OWNERSHIP: command cleanup frees comp_buf and any drained out_buf. */
 	comp_buf = (uint8_t *)malloc(comp_cap);
-	decomp_buf = (uint8_t *)malloc(ARK_CHUNK_SIZE);
-	if (comp_buf == NULL || decomp_buf == NULL) {
+	if (comp_buf == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "chunk buffer allocation failed", "", 0);
 		goto cleanup;
@@ -2683,7 +2774,10 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 			break;
 		case 0x01: {
 			uint32_t chunk;
+			uint64_t submit_seq;
+			uint64_t drain_seq;
 			uint64_t chunk_off;
+			size_t in_flight;
 
 			if (exists) {
 				if (S_ISDIR(st.st_mode)) {
@@ -2730,9 +2824,11 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 			if (ark_read_verify_member_begin(rctx, meta, err) != 0)
 				goto cleanup;
 			chunk_off = meta->data_offset;
+			submit_seq = 0U;
+			drain_seq = 0U;
+			in_flight = 0U;
 			for (chunk = 0U; chunk < meta->chunk_count; chunk++) {
 				size_t csz;
-				ssize_t out_len;
 
 				csz = (size_t)meta->chunk_sizes[chunk];
 				if (csz > comp_cap) {
@@ -2756,16 +2852,157 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 				        rctx, meta, chunk, comp_buf, csz,
 				        err) != 0)
 					goto cleanup;
-				out_len = ark_read_chunk(
-				    rctx, meta, chunk, comp_buf, csz,
-				    decomp_buf, ARK_CHUNK_SIZE, err);
-				if (out_len < 0)
+				if (pool_submit(pool, submit_seq, comp_buf, csz,
+				                ARK_DEFLATE_DEFAULT) != 0) {
+					if (__atomic_load_n(
+					        (int *)&pool->shared_err
+					            .recorded,
+					        __ATOMIC_ACQUIRE) != 0)
+						*err = pool->shared_err.error;
+					else
+						(void)fail_error(
+						    err, ARK_ERR_FMT_DATA,
+						    "extract worker submit "
+						    "failed",
+						    meta->path, 0);
 					goto cleanup;
-				if (write_full(out_fd, decomp_buf,
-				               (size_t)out_len, meta->path,
-				               err) != 0)
-					goto cleanup;
+				}
+				submit_seq++;
+				in_flight++;
 				chunk_off += (uint64_t)csz;
+
+				while (in_flight >= max_in_flight) {
+					int is_abort;
+					ark_err_t worker_err;
+					size_t out_len;
+					size_t expected_len;
+
+					out_buf = NULL;
+					if (ring_buf_read(
+					        pool->ring, drain_seq, &out_buf,
+					        &out_len, &is_abort,
+					        &worker_err, err) != 0)
+						goto cleanup;
+					if (is_abort) {
+						if (__atomic_load_n(
+						        (int *)&pool->shared_err
+						            .recorded,
+						        __ATOMIC_ACQUIRE) != 0)
+							*err = pool->shared_err
+							           .error;
+						else if (worker_err != ARK_OK)
+							(void)fail_error(
+							    err, worker_err,
+							    "extract worker "
+							    "aborted",
+							    meta->path, 0);
+						else
+							(void)fail_error(
+							    err,
+							    ARK_ERR_FMT_DATA,
+							    "extract worker "
+							    "aborted",
+							    meta->path, 0);
+						free(out_buf);
+						out_buf = NULL;
+						goto cleanup;
+					}
+
+					if ((uint32_t)(drain_seq + 1U) <
+					    meta->chunk_count)
+						expected_len = ARK_CHUNK_SIZE;
+					else {
+						expected_len =
+						    (size_t)(meta->size_original %
+						             (uint64_t)
+						                 ARK_CHUNK_SIZE);
+						if (expected_len == 0U)
+							expected_len =
+							    ARK_CHUNK_SIZE;
+					}
+					if (out_len != expected_len) {
+						(void)fail_error(
+						    err, ARK_ERR_FMT_DATA,
+						    "decompressed chunk length "
+						    "mismatch",
+						    meta->path, 0);
+						free(out_buf);
+						out_buf = NULL;
+						goto cleanup;
+					}
+					if (write_full(out_fd, out_buf, out_len,
+					               meta->path, err) != 0) {
+						free(out_buf);
+						out_buf = NULL;
+						goto cleanup;
+					}
+					free(out_buf);
+					out_buf = NULL;
+					drain_seq++;
+					in_flight--;
+				}
+			}
+			while (in_flight > 0U) {
+				int is_abort;
+				ark_err_t worker_err;
+				size_t out_len;
+				size_t expected_len;
+
+				out_buf = NULL;
+				if (ring_buf_read(pool->ring, drain_seq,
+				                  &out_buf, &out_len, &is_abort,
+				                  &worker_err, err) != 0)
+					goto cleanup;
+				if (is_abort) {
+					if (__atomic_load_n(
+					        (int *)&pool->shared_err
+					            .recorded,
+					        __ATOMIC_ACQUIRE) != 0)
+						*err = pool->shared_err.error;
+					else if (worker_err != ARK_OK)
+						(void)fail_error(
+						    err, worker_err,
+						    "extract worker aborted",
+						    meta->path, 0);
+					else
+						(void)fail_error(
+						    err, ARK_ERR_FMT_DATA,
+						    "extract worker aborted",
+						    meta->path, 0);
+					free(out_buf);
+					out_buf = NULL;
+					goto cleanup;
+				}
+
+				if ((uint32_t)(drain_seq + 1U) <
+				    meta->chunk_count)
+					expected_len = ARK_CHUNK_SIZE;
+				else {
+					expected_len =
+					    (size_t)(meta->size_original %
+					             (uint64_t)ARK_CHUNK_SIZE);
+					if (expected_len == 0U)
+						expected_len = ARK_CHUNK_SIZE;
+				}
+				if (out_len != expected_len) {
+					(void)fail_error(err, ARK_ERR_FMT_DATA,
+					                 "decompressed chunk "
+					                 "length mismatch",
+					                 meta->path, 0);
+					free(out_buf);
+					out_buf = NULL;
+					goto cleanup;
+				}
+				if (write_full(out_fd, out_buf, out_len,
+				               meta->path, err) != 0) {
+					free(out_buf);
+					out_buf = NULL;
+					goto cleanup;
+				}
+				free(out_buf);
+				out_buf = NULL;
+				drain_seq++;
+				in_flight--;
 			}
 			if (ark_read_verify_member_final(rctx, meta, err) != 0)
 				goto cleanup;
@@ -2792,6 +3029,12 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_error_t *err)
 	rc = 0;
 
 cleanup:
+	/*
+	 * SAFETY: apply quiescence sequence before cleanup filesystem work:
+	 * cancel/join workers, close current output fd, then run cleanup.
+	 * See ARCHITECTURE.md section 14.3.
+	 */
+	pool_shutdown(pool);
 	if (out_fd != -1)
 		(void)ARK_CLOSE(out_fd);
 	if (rc != 0 && tracker.count > 0U) {
@@ -2803,7 +3046,7 @@ cleanup:
 	}
 	cleanup_free(&tracker);
 	dir_deferred_free(&deferred_dirs);
-	free(decomp_buf);
+	free(out_buf);
 	free(comp_buf);
 	free(selected);
 	free(index_buf);
@@ -3355,13 +3598,20 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	ark_member_meta_t meta;
 	struct stat meta_sb;
 	ssize_t n;
-	ssize_t clen;
 	ssize_t written;
 	uint64_t remaining;
+	uint64_t submit_seq;
+	uint64_t drain_seq;
 	size_t want;
 	size_t got;
+	size_t in_flight;
+	size_t max_in_flight;
 	int fd = -1;
 	int rc = -1;
+	uint8_t *slot_data;
+	size_t slot_len;
+	int slot_abort;
+	ark_err_t slot_worker_err;
 
 	if (sb->st_size < 0)
 		return fail_error(err, ARK_ERR_IO_READ, "negative file size",
@@ -3397,6 +3647,16 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	 * allocation.
 	 */
 	remaining = meta.size_original;
+	submit_seq = 0U;
+	drain_seq = 0U;
+	in_flight = 0U;
+	max_in_flight = (size_t)ctx->pool->n_workers;
+	if (max_in_flight == 0U) {
+		rc = fail_error(err, ARK_ERR_USAGE,
+		                "create worker pool has zero workers", abs_path,
+		                0);
+		goto cleanup;
+	}
 	while (remaining > 0U) {
 		want = remaining > (uint64_t)ARK_CHUNK_SIZE
 		           ? (size_t)ARK_CHUNK_SIZE
@@ -3421,39 +3681,122 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			got += (size_t)n;
 		}
 
-		clen = ark_deflate_compress(ctx->input_buf, want, ctx->comp_buf,
-		                            ctx->comp_cap, ARK_DEFLATE_DEFAULT);
-		if (clen < 0) {
-			rc = fail_error(err, ARK_ERR_IO_READ,
-			                "member compression failed", abs_path,
-			                0);
+		if (pool_submit(ctx->pool, submit_seq, ctx->input_buf, want,
+		                ctx->deflate_mode) != 0) {
+			if (__atomic_load_n(
+			        (int *)&ctx->pool->shared_err.recorded,
+			        __ATOMIC_ACQUIRE) != 0)
+				*err = ctx->pool->shared_err.error;
+			else
+				rc = fail_error(err, ARK_ERR_IO_WRITE,
+				                "create worker submit failed",
+				                abs_path, 0);
 			goto cleanup;
 		}
-		/*
-		 * SAFETY: ark_write_chunk is called only for the active
-		 * regular-file member and in read order. See ARCHITECTURE.md
-		 * section 16.3.
-		 */
-		written =
-		    ark_write_chunk(ctx->write_ctx, ctx->comp_buf, (size_t)clen,
-		                    ctx->write_buf, ctx->comp_cap, err);
+		submit_seq++;
+		in_flight++;
+
+		while (in_flight >= max_in_flight) {
+			slot_data = NULL;
+			if (ring_buf_read(ctx->pool->ring, drain_seq,
+			                  &slot_data, &slot_len, &slot_abort,
+			                  &slot_worker_err, err) != 0)
+				goto cleanup;
+			if (slot_abort) {
+				if (__atomic_load_n(
+				        (int *)&ctx->pool->shared_err.recorded,
+				        __ATOMIC_ACQUIRE) != 0)
+					*err = ctx->pool->shared_err.error;
+				else if (slot_worker_err != ARK_OK)
+					(void)fail_error(
+					    err, slot_worker_err,
+					    "create worker aborted", abs_path,
+					    0);
+				else
+					(void)fail_error(
+					    err, ARK_ERR_IO_WRITE,
+					    "create worker aborted", abs_path,
+					    0);
+				free(slot_data);
+				goto cleanup;
+			}
+			/*
+			 * SAFETY: ark_write_chunk is called only by the I/O
+			 * path and ring slots are drained strictly in sequence
+			 * order. See ARCHITECTURE.md sections 6.3 and 16.3.
+			 */
+			written =
+			    ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
+			                    ctx->write_buf, ctx->comp_cap, err);
+			if (written < 0) {
+				free(slot_data);
+				goto cleanup;
+			}
+			if (chevron_write_or_fail(
+			        ctx->chev_handle, ctx->write_buf,
+			        (size_t)written, abs_path, err) != 0) {
+				free(slot_data);
+				goto cleanup;
+			}
+			if (UINT64_MAX - *ctx->output_offset <
+			    (uint64_t)written) {
+				free(slot_data);
+				rc = fail_error(err, ARK_ERR_USAGE,
+				                "archive offset overflow",
+				                abs_path, 0);
+				goto cleanup;
+			}
+			*ctx->output_offset += (uint64_t)written;
+			free(slot_data);
+			drain_seq++;
+			in_flight--;
+		}
+		remaining -= want;
+	}
+	while (in_flight > 0U) {
+		slot_data = NULL;
+		if (ring_buf_read(ctx->pool->ring, drain_seq, &slot_data,
+		                  &slot_len, &slot_abort, &slot_worker_err,
+		                  err) != 0)
+			goto cleanup;
+		if (slot_abort) {
+			if (__atomic_load_n(
+			        (int *)&ctx->pool->shared_err.recorded,
+			        __ATOMIC_ACQUIRE) != 0)
+				*err = ctx->pool->shared_err.error;
+			else if (slot_worker_err != ARK_OK)
+				(void)fail_error(err, slot_worker_err,
+				                 "create worker aborted",
+				                 abs_path, 0);
+			else
+				(void)fail_error(err, ARK_ERR_IO_WRITE,
+				                 "create worker aborted",
+				                 abs_path, 0);
+			free(slot_data);
+			goto cleanup;
+		}
+		written = ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
+		                          ctx->write_buf, ctx->comp_cap, err);
 		if (written < 0) {
-			rc = -1;
+			free(slot_data);
 			goto cleanup;
 		}
 		if (chevron_write_or_fail(ctx->chev_handle, ctx->write_buf,
 		                          (size_t)written, abs_path,
 		                          err) != 0) {
-			rc = -1;
+			free(slot_data);
 			goto cleanup;
 		}
 		if (UINT64_MAX - *ctx->output_offset < (uint64_t)written) {
+			free(slot_data);
 			rc = fail_error(err, ARK_ERR_USAGE,
 			                "archive offset overflow", abs_path, 0);
 			goto cleanup;
 		}
 		*ctx->output_offset += (uint64_t)written;
-		remaining -= want;
+		free(slot_data);
+		drain_seq++;
+		in_flight--;
 	}
 
 	/*
@@ -3810,7 +4153,9 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
  * sections 13.1, 13.2, 13.6, and 16.3.
  */
 static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
-                        chevron_handle_t *chev_handle, uint64_t *output_offset,
+                        chevron_handle_t *chev_handle, ark_pool_t *pool,
+                        ark_deflate_mode_t deflate_mode,
+                        uint64_t *output_offset,
                         modified_path_list_t *modified_paths, ark_error_t *err)
 {
 	traverse_ctx_t ctx;
@@ -3821,11 +4166,13 @@ static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 	ctx = (traverse_ctx_t){0};
 	ctx.write_ctx = write_ctx;
 	ctx.chev_handle = chev_handle;
+	ctx.pool = pool;
+	ctx.deflate_mode = deflate_mode;
 	ctx.output_offset = output_offset;
 	ctx.modified_paths = modified_paths;
 
 	if (src_path == NULL || write_ctx == NULL || chev_handle == NULL ||
-	    output_offset == NULL || modified_paths == NULL)
+	    pool == NULL || output_offset == NULL || modified_paths == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "invalid traversal argument", "", 0);
 	if (ARK_REALPATH(src_path, ctx.root) == NULL)
@@ -4617,6 +4964,10 @@ static void print_usage(const char *problem)
 void ark_test_keep_main_symbols(void)
 {
 	(void)&parse_args;
+	(void)&default_worker_count;
+	(void)&pool_init;
+	(void)&pool_submit;
+	(void)&pool_shutdown;
 	(void)&print_usage;
 	(void)&cmd_create;
 	(void)&cmd_extract;
@@ -4634,9 +4985,11 @@ int main(int argc, char **argv)
 {
 	ark_args_t args;
 	ark_error_t err = {0};
+	ark_pool_t *io_pool;
 	int extract_dest_fd;
 	int rc;
 
+	io_pool = NULL;
 	extract_dest_fd = -1;
 	openlog("ark", LOG_PID, LOG_USER);
 
@@ -4695,6 +5048,28 @@ int main(int argc, char **argv)
 		(void)ARK_CLOSE(parent_fd);
 	}
 
+#if defined(__OpenBSD__) && !defined(__linux__)
+	/*
+	 * SAFETY: OpenBSD requires thread-pool creation before pledge for
+	 * create/extract. See ARCHITECTURE.md sections 6.3 and 10.4.
+	 */
+	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT) {
+		io_pool =
+		    pool_init(default_worker_count(),
+		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
+		                                         : ARK_POOL_DECOMPRESS,
+		              &err);
+		if (io_pool == NULL) {
+			print_error(&err);
+			args_free(&args);
+			if (extract_dest_fd != -1)
+				(void)ARK_CLOSE(extract_dest_fd);
+			closelog();
+			return exit_code_from_err(err.code);
+		}
+	}
+#endif
+
 #if defined(__linux__) || defined(__OpenBSD__)
 	const char *sandbox_dst;
 
@@ -4716,6 +5091,8 @@ int main(int argc, char **argv)
 			print_usage(err.msg);
 		print_error(&err);
 		args_free(&args);
+		if (io_pool != NULL)
+			pool_shutdown(io_pool);
 		if (extract_dest_fd != -1)
 			(void)ARK_CLOSE(extract_dest_fd);
 		closelog();
@@ -4723,10 +5100,34 @@ int main(int argc, char **argv)
 	}
 #endif
 
+#if defined(__linux__) && !defined(__OpenBSD__)
+	/*
+	 * SAFETY: Linux requires sandbox application before worker creation so
+	 * workers inherit Landlock at thread start. See ARCHITECTURE.md
+	 * sections 6.3 and 10.4.
+	 */
+	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT) {
+		io_pool =
+		    pool_init(default_worker_count(),
+		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
+		                                         : ARK_POOL_DECOMPRESS,
+		              &err);
+		if (io_pool == NULL) {
+			print_error(&err);
+			args_free(&args);
+			if (extract_dest_fd != -1)
+				(void)ARK_CLOSE(extract_dest_fd);
+			closelog();
+			return exit_code_from_err(err.code);
+		}
+	}
+#endif
+
 	if (args.cmd == ARK_CMD_CREATE)
-		rc = cmd_create(&args, &err);
+		rc = cmd_create(&args, io_pool, &err), io_pool = NULL;
 	else if (args.cmd == ARK_CMD_EXTRACT)
-		rc = cmd_extract(&args, extract_dest_fd, &err);
+		rc = cmd_extract(&args, extract_dest_fd, io_pool, &err),
+		io_pool = NULL;
 	else if (args.cmd == ARK_CMD_LIST)
 		rc = cmd_list(&args, &err);
 	else if (args.cmd == ARK_CMD_VERIFY)
@@ -4739,6 +5140,8 @@ int main(int argc, char **argv)
 	if (rc != 0) {
 		print_error(&err);
 		args_free(&args);
+		if (io_pool != NULL)
+			pool_shutdown(io_pool);
 		if (extract_dest_fd != -1)
 			(void)ARK_CLOSE(extract_dest_fd);
 		closelog();
@@ -4746,6 +5149,8 @@ int main(int argc, char **argv)
 	}
 
 	args_free(&args);
+	if (io_pool != NULL)
+		pool_shutdown(io_pool);
 	if (extract_dest_fd != -1)
 		(void)ARK_CLOSE(extract_dest_fd);
 	closelog();
