@@ -751,15 +751,15 @@ cost without changing archive format, API, or determinism guarantees.
   reset strategy (e.g. generation stamping)
 - [x] Verify deterministic output unchanged for identical input and mode
 
-**P6F.4 - O3 remove repeated parse passes for chosen dynamic block**
-- [ ] Refactor default-mode block pipeline to avoid redundant full
+**P6F.4 - O3 remove repeated parse passes for chosen dynamic block** ✓ DONE
+- [x] Refactor default-mode block pipeline to avoid redundant full
   parse_block passes for the selected block
-- [ ] Keep block-boundary selection deterministic
+- [x] Keep block-boundary selection deterministic
 
-**P6F.5 - O4 length-limited Huffman builder**
-- [ ] Replace rank-based heuristic code-length assignment with a proper
+**P6F.5 - O4 length-limited Huffman builder** ✓ DONE
+- [x] Replace rank-based heuristic code-length assignment with a proper
   Deflate-compliant length-limited builder for lit/dist trees
-- [ ] Enforce Deflate max code-length constraints and preserve RFC 1951 validity
+- [x] Enforce Deflate max code-length constraints and preserve RFC 1951 validity
 
 **P6F.6 - O5 dynamic-header code-length RLE**
 - [ ] Encode dynamic header code lengths with symbols 16/17/18 when beneficial

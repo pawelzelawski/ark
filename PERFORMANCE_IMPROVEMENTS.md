@@ -70,5 +70,7 @@ Add one entry per task (`P6F.2`, `P6F.3`, ...):
 | P6F.1 (baseline) | 2026-05-11 | 175306086 | 33.97 | 29.51 | 2.02 | 0 | 0.00 | yes |
 | P6F.2 (fixed decode table caching) | 2026-05-11 | 175306086 | 33.97 | 28.54 | 2.34 | 0 | -0.97 | yes |
 | P6F.3 (match-finder reset-cost reduction) | 2026-05-11 | 175306086 | 33.97 | 32.17 | 2.30 | 0 | +2.66 | yes |
+| P6F.4 (selected dynamic-block parse reuse) | 2026-05-11 | 175306086 | 33.97 | 26.69 | 2.28 | 0 | -2.82 | yes |
+| P6F.5 (length-limited Huffman builder) | 2026-05-11 | 161047746 | 31.21 | 25.72 | 2.68 | -14258340 | -3.79 | yes |
 
 

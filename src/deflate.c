@@ -64,9 +64,24 @@ typedef struct {
 } ark_freq_t;
 
 typedef struct {
+	size_t len;
+	ark_freq_t freq;
+	uint8_t lit_len[286];
+	uint8_t dist_len[30];
+	size_t hlit_count;
+	size_t hdist_count;
+} ark_dynamic_plan_t;
+
+typedef struct {
 	uint16_t code[288];
 	uint8_t len[288];
 } ark_codebook_t;
+
+typedef struct {
+	uint64_t freq;
+	int16_t parent;
+	uint16_t min_sym;
+} ark_huff_node_t;
 
 /* RFC 1951 length code base values and extra-bit widths (257..285). */
 static const uint16_t g_len_base[29] = {
@@ -613,54 +628,184 @@ static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
 	return best;
 }
 
-/* Choose Deflate code lengths by frequency rank with a valid Kraft budget. */
-static void assign_rank_lengths(const uint32_t *freq, size_t n_symbols,
-                                uint8_t *lengths, int is_dist)
+/* Deterministic symbol ordering: lower frequency first, then symbol id. */
+static void sort_symbols_by_freq(const uint32_t *freq, const uint16_t *sym,
+                                 size_t count, uint16_t *out)
 {
-	uint16_t order[288];
-	size_t used;
 	size_t i;
+
+	for (i = 0; i < count; i++) {
+		size_t j;
+
+		out[i] = sym[i];
+		j = i;
+		while (j > 0 && (freq[out[j - 1U]] > freq[out[j]] ||
+		                 (freq[out[j - 1U]] == freq[out[j]] &&
+		                  out[j - 1U] > out[j]))) {
+			uint16_t tmp;
+
+			tmp = out[j - 1U];
+			out[j - 1U] = out[j];
+			out[j] = tmp;
+			j--;
+		}
+	}
+}
+
+/* Pick and remove the smallest active Huffman node. */
+static int16_t pick_smallest_node(int16_t *active, size_t *active_count,
+                                  const ark_huff_node_t *nodes)
+{
+	int16_t best;
+	size_t best_i;
+	size_t i;
+
+	best = active[0];
+	best_i = 0U;
+	for (i = 1U; i < *active_count; i++) {
+		int16_t idx;
+
+		idx = active[i];
+		if (nodes[idx].freq < nodes[best].freq ||
+		    (nodes[idx].freq == nodes[best].freq &&
+		     nodes[idx].min_sym < nodes[best].min_sym)) {
+			best = idx;
+			best_i = i;
+		}
+	}
+	active[best_i] = active[*active_count - 1U];
+	(*active_count)--;
+	return best;
+}
+
+/*
+ * Build Deflate-compliant length-limited code lengths from symbol frequencies.
+ * Uses deterministic Huffman construction then enforces max_bits constraints.
+ * See ARCHITECTURE.md §7.2 and RFC 1951 limits.
+ */
+static int build_length_limited_lengths(const uint32_t *freq, size_t n_symbols,
+                                        uint8_t *lengths, unsigned int max_bits)
+{
+	ark_huff_node_t nodes[2U * 288U - 1U];
+	uint16_t used_sym[288];
+	uint16_t order[288];
+	int16_t active[2U * 288U - 1U];
+	uint16_t leaf_node[288];
+	uint16_t bl_count[16];
+	size_t used;
+	size_t active_count;
+	size_t node_count;
+	size_t i;
+	size_t overflow;
+	size_t idx;
+
+	if (n_symbols > 288U || max_bits == 0U || max_bits > 15U)
+		return -1;
 
 	for (i = 0; i < n_symbols; i++)
 		lengths[i] = 0;
+	for (i = 0; i < 16U; i++)
+		bl_count[i] = 0;
+	overflow = 0U;
 
-	used = 0;
+	used = 0U;
 	for (i = 0; i < n_symbols; i++) {
-		size_t j;
-
 		if (freq[i] == 0U)
 			continue;
-		j = used;
-		while (j > 0 && (freq[order[j - 1U]] < freq[i] ||
-		                 (freq[order[j - 1U]] == freq[i] &&
-		                  order[j - 1U] > i))) {
-			order[j] = order[j - 1U];
-			j--;
-		}
-		order[j] = (uint16_t)i;
-		used++;
+		used_sym[used++] = (uint16_t)i;
 	}
 
 	if (used == 0U) {
-		lengths[0] = is_dist ? 5U : 9U;
-		return;
+		lengths[0] = 1U;
+		return 0;
+	}
+	if (used == 1U) {
+		lengths[used_sym[0]] = 1U;
+		return 0;
+	}
+
+	node_count = 0U;
+	active_count = 0U;
+	for (i = 0; i < used; i++) {
+		uint16_t s;
+
+		s = used_sym[i];
+		nodes[node_count].freq = freq[s];
+		nodes[node_count].parent = -1;
+		nodes[node_count].min_sym = s;
+		leaf_node[i] = (uint16_t)node_count;
+		active[active_count++] = (int16_t)node_count;
+		node_count++;
+	}
+
+	while (active_count > 1U) {
+		int16_t a;
+		int16_t b;
+		int16_t p;
+
+		a = pick_smallest_node(active, &active_count, nodes);
+		b = pick_smallest_node(active, &active_count, nodes);
+		p = (int16_t)node_count;
+		nodes[p].freq = nodes[a].freq + nodes[b].freq;
+		nodes[p].parent = -1;
+		nodes[p].min_sym = nodes[a].min_sym < nodes[b].min_sym
+		                       ? nodes[a].min_sym
+		                       : nodes[b].min_sym;
+		nodes[a].parent = p;
+		nodes[b].parent = p;
+		active[active_count++] = p;
+		node_count++;
 	}
 
 	for (i = 0; i < used; i++) {
-		if (is_dist) {
-			if (i < 4U)
-				lengths[order[i]] = 4U;
-			else
-				lengths[order[i]] = 6U;
-		} else {
-			if (i < 4U)
-				lengths[order[i]] = 5U;
-			else if (i < 16U)
-				lengths[order[i]] = 7U;
-			else
-				lengths[order[i]] = 9U;
+		unsigned int depth;
+		int16_t n;
+
+		depth = 0U;
+		n = (int16_t)leaf_node[i];
+		while (nodes[n].parent >= 0) {
+			depth++;
+			n = nodes[n].parent;
+		}
+		if (depth == 0U)
+			depth = 1U;
+		if (depth > max_bits)
+			overflow = (overflow + 1U);
+		if (depth < 16U)
+			bl_count[depth]++;
+	}
+
+	while (overflow > 0U) {
+		int bits;
+
+		bits = (int)max_bits - 1;
+		while (bits > 0 && bl_count[bits] == 0U)
+			bits--;
+		if (bits == 0)
+			return -1;
+		if (overflow < 2U || bl_count[max_bits] == 0U)
+			return -1;
+		bl_count[bits]--;
+		bl_count[bits + 1] += 2U;
+		bl_count[max_bits]--;
+		overflow -= 2U;
+	}
+
+	sort_symbols_by_freq(freq, used_sym, used, order);
+	idx = 0U;
+	for (i = max_bits; i > 0U; i--) {
+		size_t n;
+
+		n = bl_count[i];
+		while (n-- > 0U) {
+			if (idx >= used)
+				return -1;
+			lengths[order[idx++]] = (uint8_t)i;
 		}
 	}
+	if (idx != used)
+		return -1;
+	return 0;
 }
 
 /* Parse a block once, optionally collecting frequencies or emitting symbols. */
@@ -960,48 +1105,61 @@ static size_t dynamic_header_bits(size_t hlit_count, size_t hdist_count)
 	return 3U + 5U + 5U + 4U + 19U * 3U + (hlit_count + hdist_count) * 4U;
 }
 
-static size_t estimate_dynamic_bits(const uint8_t *src, size_t src_len)
+/*
+ * Build one dynamic-block coding plan for src[0..src_len) from a single
+ * frequency parse. The plan is reused for selected-block emission to avoid
+ * redundant full parse_block passes. See ARCHITECTURE.md §7.2.
+ */
+static int build_dynamic_plan(const uint8_t *src, size_t src_len,
+                              ark_dynamic_plan_t *plan, size_t *bits_out)
 {
-	ark_freq_t freq;
-	uint8_t lit_len[286];
-	uint8_t dist_len[30];
-	size_t hlit_count;
-	size_t hdist_count;
 	size_t i;
 
-	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &freq, NULL, NULL,
-	                NULL) != 0)
-		return (size_t)-1;
-	assign_rank_lengths(freq.lit, 286U, lit_len, 0);
-	assign_rank_lengths(freq.dist, 30U, dist_len, 1);
+	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &plan->freq, NULL,
+	                NULL, NULL) != 0)
+		return -1;
+	if (build_length_limited_lengths(plan->freq.lit, 286U, plan->lit_len,
+	                                 15U) != 0)
+		return -1;
+	if (build_length_limited_lengths(plan->freq.dist, 30U, plan->dist_len,
+	                                 15U) != 0)
+		return -1;
 
-	hlit_count = 257U;
+	plan->hlit_count = 257U;
 	for (i = 257U; i < 286U; i++) {
-		if (lit_len[i] != 0U)
-			hlit_count = i + 1U;
+		if (plan->lit_len[i] != 0U)
+			plan->hlit_count = i + 1U;
 	}
-	hdist_count = 1U;
+	plan->hdist_count = 1U;
 	for (i = 1U; i < 30U; i++) {
-		if (dist_len[i] != 0U)
-			hdist_count = i + 1U;
+		if (plan->dist_len[i] != 0U)
+			plan->hdist_count = i + 1U;
 	}
 
-	return dynamic_header_bits(hlit_count, hdist_count) +
-	       huff_data_bits(&freq, lit_len, dist_len);
+	*bits_out = dynamic_header_bits(plan->hlit_count, plan->hdist_count) +
+	            huff_data_bits(&plan->freq, plan->lit_len, plan->dist_len);
+	return 0;
 }
 
-static size_t choose_default_block_len(const uint8_t *src, size_t remaining)
+/*
+ * Select a default-mode block plan from deterministic candidate lengths.
+ * Candidate enumeration order and strict-better replacement preserve stable
+ * block boundary selection. See ARCHITECTURE.md §7.2 and §13.1.
+ */
+static int choose_default_block_plan(const uint8_t *src, size_t remaining,
+                                     ark_dynamic_plan_t *best_plan)
 {
-	size_t best_len;
+	ark_dynamic_plan_t best;
 	size_t best_score;
 	size_t i;
 
-	best_len = remaining;
+	best.len = remaining;
 	best_score = (size_t)-1;
 
 	for (i = 0; i < sizeof(g_default_block_candidates) /
 	                    sizeof(g_default_block_candidates[0]);
 	     i++) {
+		ark_dynamic_plan_t cand;
 		size_t len;
 		size_t bits;
 		size_t score;
@@ -1009,19 +1167,22 @@ static size_t choose_default_block_len(const uint8_t *src, size_t remaining)
 		len = g_default_block_candidates[i];
 		if (len > remaining)
 			len = remaining;
-		bits = estimate_dynamic_bits(src, len);
-		if (bits == (size_t)-1)
+		cand.len = len;
+		if (build_dynamic_plan(src, len, &cand, &bits) != 0)
 			continue;
 		score = (bits * 65536U) / (len == 0U ? 1U : len);
 		if (score < best_score) {
 			best_score = score;
-			best_len = len;
+			best = cand;
 		}
 		if (len == remaining)
 			break;
 	}
 
-	return best_len;
+	if (best_score == (size_t)-1)
+		return -1;
+	*best_plan = best;
+	return 0;
 }
 
 static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
@@ -1067,43 +1228,21 @@ static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
 }
 
 static int emit_dynamic_block(ark_bit_writer_t *bw, const uint8_t *src,
-                              size_t src_len, int final)
+                              const ark_dynamic_plan_t *plan, int final)
 {
 	ark_codebook_t lit_book;
 	ark_codebook_t dist_book;
-	ark_freq_t freq;
-	uint8_t lit_len[286];
-	uint8_t dist_len[30];
-	size_t hlit_count;
-	size_t hdist_count;
-	size_t i;
-
-	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &freq, NULL, NULL,
-	                NULL) != 0)
-		return -1;
-	assign_rank_lengths(freq.lit, 286U, lit_len, 0);
-	assign_rank_lengths(freq.dist, 30U, dist_len, 1);
-
-	hlit_count = 257U;
-	for (i = 257U; i < 286U; i++) {
-		if (lit_len[i] != 0U)
-			hlit_count = i + 1U;
-	}
-	hdist_count = 1U;
-	for (i = 1U; i < 30U; i++) {
-		if (dist_len[i] != 0U)
-			hdist_count = i + 1U;
-	}
 
 	if (bw_put_bits(bw, final ? 1U : 0U, 1U) != 0)
 		return -1;
 	if (bw_put_bits(bw, 2U, 2U) != 0)
 		return -1;
-	if (emit_dynamic_header(bw, lit_len, dist_len, hlit_count, hdist_count,
-	                        &lit_book, &dist_book) != 0)
+	if (emit_dynamic_header(bw, plan->lit_len, plan->dist_len,
+	                        plan->hlit_count, plan->hdist_count, &lit_book,
+	                        &dist_book) != 0)
 		return -1;
-	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, NULL, bw, &lit_book,
-	                &dist_book) != 0)
+	if (parse_block(src, plan->len, ARK_DEFLATE_DEFAULT, NULL, bw,
+	                &lit_book, &dist_book) != 0)
 		return -1;
 	return 0;
 }
@@ -1130,14 +1269,18 @@ static int compress_dynamic_default(const uint8_t *src, size_t src_len,
 	bw.nbits = 0;
 
 	while (off < src_len) {
+		ark_dynamic_plan_t plan;
 		size_t len;
 		int final;
 
-		len = choose_default_block_len(src + off, src_len - off);
+		if (choose_default_block_plan(src + off, src_len - off,
+		                              &plan) != 0)
+			return -1;
+		len = plan.len;
 		if (len == 0U || len > src_len - off)
 			return -1;
 		final = off + len == src_len;
-		if (emit_dynamic_block(&bw, src + off, len, final) != 0)
+		if (emit_dynamic_block(&bw, src + off, &plan, final) != 0)
 			return -1;
 		off += len;
 	}
