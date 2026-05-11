@@ -494,6 +494,15 @@ static unsigned int hash3(const uint8_t *p)
 	return (h >> (32U - ARK_DEFLATE_HASH_BITS)) & ARK_DEFLATE_HASH_MASK;
 }
 
+/* Read 8 bytes from p as a little-endian 64-bit value without memcpy. */
+static uint64_t load_u64_le(const uint8_t *p)
+{
+	return ((uint64_t)p[0]) | ((uint64_t)p[1] << 8) |
+	       ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+	       ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+	       ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
 /* Start a fresh parse generation without clearing full hash/chain tables. */
 static void match_finder_begin_parse(ark_match_finder_t *mf)
 {
@@ -611,6 +620,15 @@ static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
 			size_t len;
 
 			len = 3U;
+			while (len + 8U <= max_len) {
+				uint64_t a, b;
+
+				a = load_u64_le(src + cand + len);
+				b = load_u64_le(src + pos + len);
+				if (a != b)
+					break;
+				len += 8U;
+			}
 			while (len < max_len &&
 			       src[cand + len] == src[pos + len])
 				len++;

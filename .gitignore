@@ -15,6 +15,10 @@
 *.gcda
 *.gcov
 
+# Profiling artifacts
+perf.data
+perf.data.*
+
 # Editor/IDE metadata
 .idea/
 .vscode/

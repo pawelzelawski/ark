@@ -73,5 +73,6 @@ Add one entry per task (`P6F.2`, `P6F.3`, ...):
 | P6F.4 (selected dynamic-block parse reuse) | 2026-05-11 | 175306086 | 33.97 | 26.69 | 2.28 | 0 | -2.82 | yes |
 | P6F.5 (length-limited Huffman builder) | 2026-05-11 | 161047746 | 31.21 | 25.72 | 2.68 | -14258340 | -3.79 | yes |
 | P6F.5 tuning trial (max_chain=128; full matrix) | 2026-05-11 | 161379463 | 31.27 | 15.98 | 2.76 | -13926623 | -13.53 | yes |
+| P6F.5 tuning trial (max_chain=128 + word-at-a-time find_match; create+determinism) | 2026-05-11 | 161379463 | 31.27 | 15.61 | n/a | -13926623 | -13.90 | yes |
 
 
