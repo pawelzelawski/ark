@@ -746,10 +746,10 @@ cost without changing archive format, API, or determinism guarantees.
   per block
 - [x] Verify no decompression output regressions on existing tests
 
-**P6F.3 - O2 reset-cost reduction in match finder (compress path)**
-- [ ] Replace full hash-chain table clears with a deterministic cheaper
+**P6F.3 - O2 reset-cost reduction in match finder (compress path)** ✓ DONE
+- [x] Replace full hash-chain table clears with a deterministic cheaper
   reset strategy (e.g. generation stamping)
-- [ ] Verify deterministic output unchanged for identical input and mode
+- [x] Verify deterministic output unchanged for identical input and mode
 
 **P6F.4 - O3 remove repeated parse passes for chosen dynamic block**
 - [ ] Refactor default-mode block pipeline to avoid redundant full

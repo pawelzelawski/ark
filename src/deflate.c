@@ -51,6 +51,14 @@ typedef struct {
 } ark_match_t;
 
 typedef struct {
+	int32_t head[ARK_DEFLATE_HASH_SIZE];
+	int32_t prev[ARK_DEFLATE_WINDOW_SIZE];
+	uint32_t head_gen[ARK_DEFLATE_HASH_SIZE];
+	uint32_t prev_gen[ARK_DEFLATE_WINDOW_SIZE];
+	uint32_t generation;
+} ark_match_finder_t;
+
+typedef struct {
 	uint32_t lit[286];
 	uint32_t dist[30];
 } ark_freq_t;
@@ -93,6 +101,12 @@ static const size_t g_default_block_candidates[] = {
     (size_t)64U * 1024U,
     (size_t)128U * 1024U,
 };
+
+/*
+ * Match-finder state is thread-local so worker threads never share mutable
+ * compressor state. See ARCHITECTURE.md §6.3.
+ */
+static _Thread_local ark_match_finder_t g_match_finder;
 
 /* Reverse the low n bits of v for Deflate's LSB-first bitstream. */
 static uint16_t bit_reverse(uint16_t v, unsigned int n)
@@ -465,9 +479,72 @@ static unsigned int hash3(const uint8_t *p)
 	return (h >> (32U - ARK_DEFLATE_HASH_BITS)) & ARK_DEFLATE_HASH_MASK;
 }
 
+/* Start a fresh parse generation without clearing full hash/chain tables. */
+static void match_finder_begin_parse(ark_match_finder_t *mf)
+{
+	uint32_t next;
+
+	if (mf->generation == UINT32_MAX) {
+		size_t i;
+
+		/*
+		 * SAFETY: on generation wrap, clear all stamps before reusing
+		 * generation values. Reusing wrapped generations without
+		 * clearing would make stale hash/chain slots appear valid for
+		 * the current parse.
+		 */
+		for (i = 0; i < ARK_DEFLATE_HASH_SIZE; i++)
+			mf->head_gen[i] = 0U;
+		for (i = 0; i < ARK_DEFLATE_WINDOW_SIZE; i++)
+			mf->prev_gen[i] = 0U;
+		next = 1U;
+	} else
+		next = mf->generation + 1U;
+	mf->generation = next;
+}
+
+/* Return hash-head candidate only if it was written in this parse. */
+static int32_t match_finder_head_get(const ark_match_finder_t *mf,
+                                     unsigned int h)
+{
+	if (mf->head_gen[h] != mf->generation)
+		return -1;
+	return mf->head[h];
+}
+
+/* Store hash-head candidate for the current parse generation. */
+static void match_finder_head_set(ark_match_finder_t *mf, unsigned int h,
+                                  int32_t pos)
+{
+	mf->head[h] = pos;
+	mf->head_gen[h] = mf->generation;
+}
+
+/* Return chain predecessor only if it was written in this parse. */
+static int32_t match_finder_prev_get(const ark_match_finder_t *mf, size_t pos)
+{
+	size_t slot;
+
+	slot = pos & (ARK_DEFLATE_WINDOW_SIZE - 1U);
+	if (mf->prev_gen[slot] != mf->generation)
+		return -1;
+	return mf->prev[slot];
+}
+
+/* Store chain predecessor for the current parse generation. */
+static void match_finder_prev_set(ark_match_finder_t *mf, size_t pos,
+                                  int32_t prev)
+{
+	size_t slot;
+
+	slot = pos & (ARK_DEFLATE_WINDOW_SIZE - 1U);
+	mf->prev[slot] = prev;
+	mf->prev_gen[slot] = mf->generation;
+}
+
 /* Insert one position into hash chain and return previous head candidate. */
 static int insert_hash(const uint8_t *src, size_t src_len, size_t pos,
-                       int32_t *head, int32_t *prev)
+                       ark_match_finder_t *mf)
 {
 	unsigned int h;
 	int32_t old;
@@ -475,9 +552,9 @@ static int insert_hash(const uint8_t *src, size_t src_len, size_t pos,
 	if (pos + 2U >= src_len)
 		return -1;
 	h = hash3(src + pos);
-	old = head[h];
-	prev[pos & (ARK_DEFLATE_WINDOW_SIZE - 1U)] = old;
-	head[h] = (int32_t)pos;
+	old = match_finder_head_get(mf, h);
+	match_finder_prev_set(mf, pos, old);
+	match_finder_head_set(mf, h, (int32_t)pos);
 	return old;
 }
 
@@ -486,7 +563,7 @@ static int insert_hash(const uint8_t *src, size_t src_len, size_t pos,
  * See ARCHITECTURE.md section 7.2 (hash-chain finding + lazy matching).
  */
 static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
-                              int32_t candidate, const int32_t *prev,
+                              int32_t candidate, const ark_match_finder_t *mf,
                               unsigned int max_chain, size_t nice_len)
 {
 	ark_match_t best;
@@ -529,7 +606,7 @@ static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
 					break;
 			}
 		}
-		candidate = prev[cand & (ARK_DEFLATE_WINDOW_SIZE - 1U)];
+		candidate = match_finder_prev_get(mf, cand);
 		tries++;
 	}
 
@@ -592,8 +669,7 @@ static int parse_block(const uint8_t *src, size_t src_len,
                        ark_bit_writer_t *bw, const ark_codebook_t *lit_book,
                        const ark_codebook_t *dist_book)
 {
-	int32_t head[ARK_DEFLATE_HASH_SIZE];
-	int32_t prev[ARK_DEFLATE_WINDOW_SIZE];
+	ark_match_finder_t *mf;
 	unsigned int max_chain;
 	size_t nice_len;
 	size_t pos;
@@ -602,10 +678,13 @@ static int parse_block(const uint8_t *src, size_t src_len,
 	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 1024U;
 	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
 
-	for (i = 0; i < ARK_DEFLATE_HASH_SIZE; i++)
-		head[i] = -1;
-	for (i = 0; i < ARK_DEFLATE_WINDOW_SIZE; i++)
-		prev[i] = -1;
+	/*
+	 * Reset match-finder visibility via generation stamping instead of full
+	 * table clears. This keeps hash-chain lazy matching deterministic while
+	 * reducing reset cost. See ARCHITECTURE.md §7.2 and §13.1.
+	 */
+	mf = &g_match_finder;
+	match_finder_begin_parse(mf);
 
 	if (freq != NULL) {
 		for (i = 0; i < 286U; i++)
@@ -619,8 +698,8 @@ static int parse_block(const uint8_t *src, size_t src_len,
 		ark_match_t m;
 		int32_t candidate;
 
-		candidate = insert_hash(src, src_len, pos, head, prev);
-		m = find_match(src, src_len, pos, candidate, prev, max_chain,
+		candidate = insert_hash(src, src_len, pos, mf);
+		m = find_match(src, src_len, pos, candidate, mf, max_chain,
 		               nice_len);
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
@@ -634,10 +713,10 @@ static int parse_block(const uint8_t *src, size_t src_len,
 				int32_t cnext;
 
 				hnext = hash3(src + pos + 1U);
-				cnext = head[hnext];
+				cnext = match_finder_head_get(mf, hnext);
 				m_next =
 				    find_match(src, src_len, pos + 1U, cnext,
-				               prev, max_chain, nice_len);
+				               mf, max_chain, nice_len);
 			}
 			if (m_next.len > m.len + 1U) {
 				if (freq != NULL)
@@ -683,8 +762,7 @@ static int parse_block(const uint8_t *src, size_t src_len,
 			}
 
 			for (i = 1; i < m.len; i++)
-				(void)insert_hash(src, src_len, pos + i, head,
-				                  prev);
+				(void)insert_hash(src, src_len, pos + i, mf);
 			pos += m.len;
 			continue;
 		}
@@ -758,8 +836,7 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
                           size_t dst_cap, ark_deflate_mode_t mode)
 {
 	ark_bit_writer_t bw;
-	int32_t head[ARK_DEFLATE_HASH_SIZE];
-	int32_t prev[ARK_DEFLATE_WINDOW_SIZE];
+	ark_match_finder_t *mf;
 	unsigned int max_chain;
 	size_t nice_len;
 	size_t pos;
@@ -767,11 +844,8 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 256U;
 	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : 128U;
-
-	for (i = 0; i < ARK_DEFLATE_HASH_SIZE; i++)
-		head[i] = -1;
-	for (i = 0; i < ARK_DEFLATE_WINDOW_SIZE; i++)
-		prev[i] = -1;
+	mf = &g_match_finder;
+	match_finder_begin_parse(mf);
 
 	bw.dst = dst;
 	bw.cap = dst_cap;
@@ -789,8 +863,8 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 		ark_match_t m;
 		int32_t candidate;
 
-		candidate = insert_hash(src, src_len, pos, head, prev);
-		m = find_match(src, src_len, pos, candidate, prev, max_chain,
+		candidate = insert_hash(src, src_len, pos, mf);
+		m = find_match(src, src_len, pos, candidate, mf, max_chain,
 		               nice_len);
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
@@ -806,9 +880,10 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 					int32_t cnext;
 
 					hnext = hash3(src + pos + 1U);
-					cnext = head[hnext];
+					cnext =
+					    match_finder_head_get(mf, hnext);
 					m_next = find_match(
-					    src, src_len, pos + 1U, cnext, prev,
+					    src, src_len, pos + 1U, cnext, mf,
 					    max_chain, nice_len);
 				}
 			}
@@ -835,8 +910,7 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 				return -1;
 
 			for (i = 1; i < m.len; i++)
-				(void)insert_hash(src, src_len, pos + i, head,
-				                  prev);
+				(void)insert_hash(src, src_len, pos + i, mf);
 			pos += m.len;
 			continue;
 		}
