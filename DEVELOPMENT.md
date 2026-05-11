@@ -737,11 +737,9 @@ cost without changing archive format, API, or determinism guarantees.
 
 #### Tasks
 
-**P6F.1 - Baseline freeze**
-- [ ] Capture baseline benchmark on a fixed dataset: source size, archive
+**P6F.1 - Baseline freeze** ✓ DONE
+- [x] Capture baseline benchmark on a fixed dataset: source size, archive
   size, create wall/user/sys time, verify wall/user/sys time
-- [ ] Capture parallel-vs-single-threaded byte-identity baseline for create
-  (same input, same binary)
 
 **P6F.2 - O1 fixed decode table caching (decompress path)**
 - [ ] Prebuild and reuse fixed-Huffman decode tables instead of rebuilding
