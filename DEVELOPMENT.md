@@ -741,10 +741,10 @@ cost without changing archive format, API, or determinism guarantees.
 - [x] Capture baseline benchmark on a fixed dataset: source size, archive
   size, create wall/user/sys time, verify wall/user/sys time
 
-**P6F.2 - O1 fixed decode table caching (decompress path)**
-- [ ] Prebuild and reuse fixed-Huffman decode tables instead of rebuilding
+**P6F.2 - O1 fixed decode table caching (decompress path)** ✓ DONE
+- [x] Prebuild and reuse fixed-Huffman decode tables instead of rebuilding
   per block
-- [ ] Verify no decompression output regressions on existing tests
+- [x] Verify no decompression output regressions on existing tests
 
 **P6F.3 - O2 reset-cost reduction in match finder (compress path)**
 - [ ] Replace full hash-chain table clears with a deterministic cheaper

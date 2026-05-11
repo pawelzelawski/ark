@@ -282,7 +282,8 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 			free(ring->slots);
 			free(ring);
 			(void)fail_error(err, ARK_ERR_IO_ALLOC,
-			                 "ring payload allocation failed", "", 0);
+			                 "ring payload allocation failed", "",
+			                 0);
 			return NULL;
 		}
 		ring->slots[i].seq = UINT64_MAX;
@@ -494,8 +495,8 @@ static void ring_buf_release(ring_buf_t *ring, uint64_t seq)
 		return;
 	if (slot->ready && slot->seq == seq) {
 		/* SAFETY: release occurs only after the I/O thread consumes the
-		 * borrowed slot payload, allowing modulo slot reuse without racing a
-		 * writer. See ARCHITECTURE.md section 6.3. */
+		 * borrowed slot payload, allowing modulo slot reuse without
+		 * racing a writer. See ARCHITECTURE.md section 6.3. */
 		slot->len = 0U;
 		slot->abort = 0;
 		slot->worker_err = ARK_OK;
@@ -608,7 +609,8 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 	    (size_t)n_workers, sizeof(pool->worker_args[0]));
 	if (pool->worker_args == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
-		                 "thread pool worker arg allocation failed", "", 0);
+		                 "thread pool worker arg allocation failed", "",
+		                 0);
 		free(pool->workers);
 		free(pool);
 		return NULL;
@@ -616,7 +618,8 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 	for (i = 0; i < n_workers; i++) {
 		pool->worker_args[i].pool = pool;
 		pool->worker_args[i].src_cap = ARK_CHUNK_SIZE;
-		pool->worker_args[i].dst_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+		pool->worker_args[i].dst_cap =
+		    ark_deflate_bound(ARK_CHUNK_SIZE);
 		pool->worker_args[i].src = malloc(ARK_CHUNK_SIZE);
 		pool->worker_args[i].dst = malloc(pool->worker_args[i].dst_cap);
 		if (pool->worker_args[i].src == NULL ||
@@ -631,19 +634,21 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args);
 			free(pool->workers);
 			free(pool);
-			(void)fail_error(err, ARK_ERR_IO_ALLOC,
-			                 "thread pool worker buffer allocation failed",
-			                 "", 0);
+			(void)fail_error(
+			    err, ARK_ERR_IO_ALLOC,
+			    "thread pool worker buffer allocation failed", "",
+			    0);
 			return NULL;
 		}
 	}
-	/* OWNERSHIP: pool->queue_slots and their buffers are owned by pool until
-	 * pool_shutdown. */
+	/* OWNERSHIP: pool->queue_slots and their buffers are owned by pool
+	 * until pool_shutdown. */
 	pool->queue_slots = (pool_queue_slot_t *)calloc(
 	    (size_t)n_workers, sizeof(pool->queue_slots[0]));
 	if (pool->queue_slots == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
-		                 "thread pool queue slot allocation failed", "", 0);
+		                 "thread pool queue slot allocation failed", "",
+		                 0);
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
@@ -670,13 +675,15 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args);
 			free(pool->workers);
 			free(pool);
-			(void)fail_error(err, ARK_ERR_IO_ALLOC,
-			                 "thread pool queue buffer allocation failed",
-			                 "", 0);
+			(void)fail_error(
+			    err, ARK_ERR_IO_ALLOC,
+			    "thread pool queue buffer allocation failed", "",
+			    0);
 			return NULL;
 		}
 	}
-	/* OWNERSHIP: pool->queue descriptors are owned by pool until shutdown. */
+	/* OWNERSHIP: pool->queue descriptors are owned by pool until shutdown.
+	 */
 	pool->queue =
 	    (pool_work_t *)calloc((size_t)n_workers, sizeof(pool->queue[0]));
 	if (pool->queue == NULL) {
@@ -989,7 +996,8 @@ static void *worker_compress(void *arg)
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_ALLOC,
-			                 "worker output buffer unavailable", "", 0);
+			                 "worker output buffer unavailable", "",
+			                 0);
 			error_store_once(&pool->shared_err, &local_err);
 			(void)ring_buf_abort(pool->ring, work.seq,
 			                     ARK_ERR_IO_ALLOC, NULL);
@@ -1001,7 +1009,8 @@ static void *worker_compress(void *arg)
 		if (out_len < 0) {
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
-			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK, NULL);
+			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK,
+			                     NULL);
 			break;
 		}
 
@@ -1095,7 +1104,8 @@ static void *worker_decompress(void *arg)
 		if (out_len < 0) {
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
-			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK, NULL);
+			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK,
+			                     NULL);
 			break;
 		}
 
@@ -3048,7 +3058,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 							    "extract worker "
 							    "aborted",
 							    meta->path, 0);
-						ring_buf_release(pool->ring, drain_seq);
+						ring_buf_release(pool->ring,
+						                 drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
@@ -3071,13 +3082,15 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 						    "decompressed chunk length "
 						    "mismatch",
 						    meta->path, 0);
-						ring_buf_release(pool->ring, drain_seq);
+						ring_buf_release(pool->ring,
+						                 drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
 					if (write_full(out_fd, out_buf, out_len,
 					               meta->path, err) != 0) {
-						ring_buf_release(pool->ring, drain_seq);
+						ring_buf_release(pool->ring,
+						                 drain_seq);
 						out_buf = NULL;
 						goto cleanup;
 					}
@@ -5260,16 +5273,16 @@ void pool_inject_worker_error(ark_pool_t *pool, ark_err_t code, int errno_value)
 	                 errno_value);
 	error_store_once(&pool->shared_err, &local_err);
 	__atomic_store_n((unsigned int *)&pool->error_event,
-	                 __atomic_add_fetch((unsigned int *)&pool->event_seq, 1U,
-	                                    __ATOMIC_ACQ_REL),
+	                 __atomic_add_fetch((unsigned int *)&pool->event_seq,
+	                                    1U, __ATOMIC_ACQ_REL),
 	                 __ATOMIC_RELEASE);
 	/* SAFETY: publish abort sentinel after shared error is stored so
 	 * the I/O thread observes first-error metadata before abort handling.
 	 * See ARCHITECTURE.md section 6.3. */
 	(void)ring_buf_abort(pool->ring, 0U, code, NULL);
 	__atomic_store_n((unsigned int *)&pool->abort_event,
-	                 __atomic_add_fetch((unsigned int *)&pool->event_seq, 1U,
-	                                    __ATOMIC_ACQ_REL),
+	                 __atomic_add_fetch((unsigned int *)&pool->event_seq,
+	                                    1U, __ATOMIC_ACQ_REL),
 	                 __ATOMIC_RELEASE);
 }
 

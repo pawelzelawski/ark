@@ -860,7 +860,7 @@ int test_quiescence_sequence_order(void)
 	}
 	cleanup_step = ++step;
 	if (!(cancel_step < stop_step && stop_step < join_step &&
-	    join_step < close_step && close_step < cleanup_step)) {
+	      join_step < close_step && close_step < cleanup_step)) {
 		(void)remove_tree(tmp);
 		return 1;
 	}

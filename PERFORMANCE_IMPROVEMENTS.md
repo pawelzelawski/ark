@@ -68,5 +68,6 @@ Add one entry per task (`P6F.2`, `P6F.3`, ...):
 | Task | Date | ark size (bytes) | Ratio (%) | Create wall (s) | Verify wall (s) | Size delta vs P6F.1 (bytes) | Create wall delta vs P6F.1 (s) | Determinism |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | P6F.1 (baseline) | 2026-05-11 | 175306086 | 33.97 | 29.51 | 2.02 | 0 | 0.00 | yes |
+| P6F.2 (fixed decode table caching) | 2026-05-11 | 175306086 | 33.97 | 28.54 | 2.34 | 0 | -0.97 | yes |
 
 

@@ -1142,12 +1142,17 @@ static int decode_huffman_block(ark_bit_reader_t *br,
 	}
 }
 
-/* Decode one fixed-Huffman symbol set into dst; stops on end-of-block code. */
-static int decode_fixed_block(ark_bit_reader_t *br, uint8_t *dst,
-                              size_t dst_cap, size_t *dst_pos)
+/*
+ * Build RFC 1951 fixed-Huffman decode tables.
+ *
+ * The fixed tables are stream-invariant; build once and reuse across all
+ * fixed blocks in a stream. This keeps decompressor-only table symbols local
+ * to deflate.c, preserving the decompressor boundary used by recovery
+ * amalgamation. See ARCHITECTURE.md section 15.3.
+ */
+static int build_fixed_decode_tables(ark_huff_table_t *lit_tab,
+                                     ark_huff_table_t *dist_tab)
 {
-	ark_huff_table_t lit_tab;
-	ark_huff_table_t dist_tab;
 	uint8_t lit_len[288];
 	uint8_t dist_len[32];
 	size_t i;
@@ -1163,11 +1168,20 @@ static int decode_fixed_block(ark_bit_reader_t *br, uint8_t *dst,
 	for (i = 0; i < 32U; i++)
 		dist_len[i] = 5U;
 
-	if (huff_build(&lit_tab, lit_len, 288U, 9U) != 0)
+	if (huff_build(lit_tab, lit_len, 288U, 9U) != 0)
 		return -1;
-	if (huff_build(&dist_tab, dist_len, 32U, 5U) != 0)
+	if (huff_build(dist_tab, dist_len, 32U, 5U) != 0)
 		return -1;
-	return decode_huffman_block(br, &lit_tab, &dist_tab, dst, dst_cap,
+	return 0;
+}
+
+/* Decode one fixed-Huffman symbol set into dst; stops on end-of-block code. */
+static int decode_fixed_block(ark_bit_reader_t *br,
+                              const ark_huff_table_t *lit_tab,
+                              const ark_huff_table_t *dist_tab, uint8_t *dst,
+                              size_t dst_cap, size_t *dst_pos)
+{
+	return decode_huffman_block(br, lit_tab, dist_tab, dst, dst_cap,
 	                            dst_pos);
 }
 
@@ -1392,6 +1406,8 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
                                size_t dst_cap)
 {
 	ark_bit_reader_t br;
+	ark_huff_table_t fixed_lit_tab;
+	ark_huff_table_t fixed_dist_tab;
 	size_t out_pos;
 
 	if (src == NULL && src_len != 0U)
@@ -1405,6 +1421,8 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	br.bits = 0;
 	br.nbits = 0;
 	out_pos = 0U;
+	if (build_fixed_decode_tables(&fixed_lit_tab, &fixed_dist_tab) != 0)
+		return -1;
 
 	for (;;) {
 		uint16_t bfinal;
@@ -1420,8 +1438,9 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 			    0)
 				return -1;
 		} else if (btype == 1U) {
-			if (decode_fixed_block(&br, dst, dst_cap, &out_pos) !=
-			    0)
+			if (decode_fixed_block(&br, &fixed_lit_tab,
+			                       &fixed_dist_tab, dst, dst_cap,
+			                       &out_pos) != 0)
 				return -1;
 		} else if (btype == 2U) {
 			if (decode_dynamic_block(&br, dst, dst_cap, &out_pos) !=
