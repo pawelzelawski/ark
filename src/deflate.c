@@ -820,7 +820,7 @@ static int parse_block(const uint8_t *src, size_t src_len,
 	size_t pos;
 	size_t i;
 
-	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 1024U;
+	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 128U;
 	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
 
 	/*
