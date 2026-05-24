@@ -46,11 +46,14 @@ int test_read_header_unknown_hash_alg(void);
 int test_read_header_nonzero_flags(void);
 int test_read_header_nonzero_reserved(void);
 int test_read_header_before_init(void);
+int test_read_header_truncated(void);
 int test_read_check1_bad_footer_magic(void);
 int test_read_check2_index_hash_mismatch(void);
 int test_read_check3_path_absolute(void);
 int test_read_check3_path_dotdot(void);
 int test_read_check3_path_empty_component_fmt(void);
+int test_read_check3_path_invalid_utf8(void);
+int test_read_index_unknown_member_type(void);
 int test_read_check4_path_too_long(void);
 int test_read_check5_link_absolute(void);
 int test_read_check5_link_dotdot(void);
@@ -135,6 +138,37 @@ int test_fault_deflate_truncated_stream(void);
 int test_fault_deflate_output_buffer_too_small(void);
 int test_fault_injection_no_effect_on_archive_component(void);
 int test_fault_injection_no_effect_on_deflate_component(void);
+int test_fault_create_open_archive(void);
+int test_fault_create_write_header(void);
+int test_fault_create_lstat_member(void);
+int test_fault_create_open_member(void);
+int test_fault_create_read_member(void);
+int test_fault_create_write_chunk(void);
+int test_fault_create_write_index(void);
+int test_fault_create_write_footer(void);
+int test_fault_create_opendir(void);
+int test_fault_create_readdir(void);
+int test_fault_create_realpath(void);
+int test_fault_create_commit(void);
+int test_fault_create_fsync(void);
+int test_fault_create_modified(void);
+int test_fault_extract_open_archive(void);
+int test_fault_extract_read_header(void);
+int test_fault_extract_read_footer(void);
+int test_fault_extract_read_index(void);
+int test_fault_extract_seek(void);
+int test_fault_extract_read_chunk(void);
+int test_fault_extract_open_output(void);
+int test_fault_extract_write_output(void);
+int test_fault_extract_mkdir(void);
+int test_fault_extract_symlink_create(void);
+int test_fault_extract_link_create(void);
+int test_fault_extract_lchown(void);
+int test_fault_extract_chmod(void);
+int test_fault_extract_utimensat(void);
+int test_fault_extract_unlink_overwrite(void);
+int test_fault_extract_cleanup_unlink(void);
+int test_fault_extract_cleanup_rmdir(void);
 int test_integration_single_file(void);
 int test_integration_directory_tree(void);
 int test_integration_all_member_types(void);
@@ -281,6 +315,7 @@ static const test_case_t g_tests[] = {
     {"test_read_header_nonzero_flags", test_read_header_nonzero_flags},
     {"test_read_header_nonzero_reserved", test_read_header_nonzero_reserved},
     {"test_read_header_before_init", test_read_header_before_init},
+    {"test_read_header_truncated", test_read_header_truncated},
     {"test_read_check1_bad_footer_magic", test_read_check1_bad_footer_magic},
     {"test_read_check2_index_hash_mismatch",
      test_read_check2_index_hash_mismatch},
@@ -288,6 +323,9 @@ static const test_case_t g_tests[] = {
     {"test_read_check3_path_dotdot", test_read_check3_path_dotdot},
     {"test_read_check3_path_empty_component_fmt",
      test_read_check3_path_empty_component_fmt},
+    {"test_read_check3_path_invalid_utf8", test_read_check3_path_invalid_utf8},
+    {"test_read_index_unknown_member_type",
+     test_read_index_unknown_member_type},
     {"test_read_check4_path_too_long", test_read_check4_path_too_long},
     {"test_read_check5_link_absolute", test_read_check5_link_absolute},
     {"test_read_check5_link_dotdot", test_read_check5_link_dotdot},
@@ -351,6 +389,38 @@ static const test_case_t g_tests[] = {
      test_fault_injection_no_effect_on_archive_component},
     {"test_fault_injection_no_effect_on_deflate_component",
      test_fault_injection_no_effect_on_deflate_component},
+    {"test_fault_create_open_archive", test_fault_create_open_archive},
+    {"test_fault_create_write_header", test_fault_create_write_header},
+    {"test_fault_create_lstat_member", test_fault_create_lstat_member},
+    {"test_fault_create_open_member", test_fault_create_open_member},
+    {"test_fault_create_read_member", test_fault_create_read_member},
+    {"test_fault_create_write_chunk", test_fault_create_write_chunk},
+    {"test_fault_create_write_index", test_fault_create_write_index},
+    {"test_fault_create_write_footer", test_fault_create_write_footer},
+    {"test_fault_create_opendir", test_fault_create_opendir},
+    {"test_fault_create_readdir", test_fault_create_readdir},
+    {"test_fault_create_realpath", test_fault_create_realpath},
+    {"test_fault_create_commit", test_fault_create_commit},
+    {"test_fault_create_fsync", test_fault_create_fsync},
+    {"test_fault_create_modified", test_fault_create_modified},
+    {"test_fault_extract_open_archive", test_fault_extract_open_archive},
+    {"test_fault_extract_read_header", test_fault_extract_read_header},
+    {"test_fault_extract_read_footer", test_fault_extract_read_footer},
+    {"test_fault_extract_read_index", test_fault_extract_read_index},
+    {"test_fault_extract_seek", test_fault_extract_seek},
+    {"test_fault_extract_read_chunk", test_fault_extract_read_chunk},
+    {"test_fault_extract_open_output", test_fault_extract_open_output},
+    {"test_fault_extract_write_output", test_fault_extract_write_output},
+    {"test_fault_extract_mkdir", test_fault_extract_mkdir},
+    {"test_fault_extract_symlink_create", test_fault_extract_symlink_create},
+    {"test_fault_extract_link_create", test_fault_extract_link_create},
+    {"test_fault_extract_lchown", test_fault_extract_lchown},
+    {"test_fault_extract_chmod", test_fault_extract_chmod},
+    {"test_fault_extract_utimensat", test_fault_extract_utimensat},
+    {"test_fault_extract_unlink_overwrite",
+     test_fault_extract_unlink_overwrite},
+    {"test_fault_extract_cleanup_unlink", test_fault_extract_cleanup_unlink},
+    {"test_fault_extract_cleanup_rmdir", test_fault_extract_cleanup_rmdir},
     {"test_edge_empty_archive", test_edge_empty_archive},
     {"test_edge_single_member", test_edge_single_member},
     {"test_edge_max_path_length", test_edge_max_path_length},

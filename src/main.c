@@ -135,6 +135,29 @@ typedef struct {
 	int permission_error;
 } traverse_ctx_t;
 
+#ifdef ARK_TEST
+typedef struct {
+	int which;
+	int fail_on_call_n;
+	int errno_value;
+	ark_err_t code;
+	int calls;
+} ark_cli_fault_t;
+
+enum ark_cli_fault_which {
+	ARK_CLI_FAULT_NONE = 0,
+	ARK_CLI_FAULT_CREATE_OPEN_ARCHIVE,
+	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
+	ARK_CLI_FAULT_CREATE_COMMIT,
+	ARK_CLI_FAULT_CREATE_MARK_MODIFIED
+};
+
+static ark_cli_fault_t ark_cli_fault;
+static int ark_test_owner_restore_forced;
+#else
+#define ark_test_owner_restore_forced 0
+#endif
+
 typedef struct ring_buf ring_buf_t;
 
 typedef enum {
@@ -1226,6 +1249,13 @@ int pool_get_sentinel_count(const ark_pool_t *);
 unsigned int pool_get_error_event(const ark_pool_t *);
 unsigned int pool_get_abort_event(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
+void ark_test_cli_fault_reset(void);
+void ark_test_cli_fault_inject(int, int, ark_err_t, int);
+int ark_test_extract_archive(const char *, const char *, int, const char *, int,
+                             ark_error_t *);
+void ark_test_force_owner_restore(int);
+static int ark_test_cli_fault_should_fail(int, ark_error_t *, const char *);
+static int ark_test_cli_fault_should_mark_modified(void);
 #endif
 
 #ifdef __linux__
@@ -1554,18 +1584,24 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 		                  "and source paths",
 		                  "", 0);
 
-	if (create_validate_destination_outside_sources(
-	        args->archive_path, args->create_paths, args->create_path_count,
-	        err) != 0)
-		return -1;
-
 	wctx = (ark_write_ctx_t *)wstorage.bytes;
 	opened = 0;
 	rc = -1;
 	output_offset = 0U;
 
+	if (create_validate_destination_outside_sources(
+	        args->archive_path, args->create_paths, args->create_path_count,
+	        err) != 0)
+		goto cleanup;
+
 	if (ark_write_init(wctx, args->hash_alg, args->deflate_mode, err) != 0)
 		goto cleanup;
+
+#ifdef ARK_TEST
+	if (ark_test_cli_fault_should_fail(ARK_CLI_FAULT_CREATE_OPEN_ARCHIVE,
+	                                   err, args->archive_path) != 0)
+		goto cleanup;
+#endif
 
 	if (chevron_open(&handle, args->archive_path, CHEVRON_FULL,
 	                 CHEVRON_MODE_DEFAULT, &cerr) != 0) {
@@ -1589,6 +1625,14 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 		                 err) != 0)
 			goto cleanup;
 	}
+
+#ifdef ARK_TEST
+	if (ark_test_cli_fault_should_mark_modified()) {
+		if (modified_path_list_push(&modified, args->create_paths[0],
+		                            err) != 0)
+			goto cleanup;
+	}
+#endif
 
 	if (modified.count > 0U) {
 		print_modified_summary(&modified);
@@ -1623,6 +1667,12 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 	 * index, and footer writes; all error paths abort the handle before
 	 * returning. See ARCHITECTURE.md sections 9 and 16.3.
 	 */
+#ifdef ARK_TEST
+	if (ark_test_cli_fault_should_fail(ARK_CLI_FAULT_CREATE_COMMIT, err,
+	                                   args->archive_path) != 0)
+		goto cleanup;
+#endif
+
 	if (chevron_commit(&handle, &cerr) != 0) {
 		rc = chevron_error_fail(err, &cerr, "archive commit failed",
 		                        args->archive_path);
@@ -2222,7 +2272,7 @@ static int restore_regular_meta(int fd, const ark_member_meta_t *meta,
 	int rc;
 
 	decode_mtime(meta->mtime, times);
-	if (geteuid() == 0) {
+	if (geteuid() == 0 || ark_test_owner_restore_forced) {
 		do {
 			rc = ARK_FCHOWN(fd, (uid_t)meta->uid, (gid_t)meta->gid);
 		} while (rc != 0 && errno == EINTR);
@@ -2770,21 +2820,25 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	selected = NULL;
 	comp_buf = NULL;
 	out_buf = NULL;
+	archive_fd = -1;
 	out_fd = -1;
 	rc = -1;
 	if (pool == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "extract worker pool is required", "", 0);
 	max_in_flight = (size_t)pool->n_workers;
-	if (max_in_flight == 0U)
-		return fail_error(err, ARK_ERR_USAGE,
-		                  "extract worker pool has zero workers", "",
-		                  0);
+	if (max_in_flight == 0U) {
+		(void)fail_error(err, ARK_ERR_USAGE,
+		                 "extract worker pool has zero workers", "", 0);
+		goto cleanup;
+	}
 
 	archive_fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
-	if (archive_fd == -1)
-		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
-		                  args->archive_path, errno);
+	if (archive_fd == -1) {
+		(void)fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
+		                 args->archive_path, errno);
+		goto cleanup;
+	}
 	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
 	                       &index_len, err) != 0)
 		goto cleanup;
@@ -3211,7 +3265,7 @@ cleanup:
 	free(comp_buf);
 	free(selected);
 	free(index_buf);
-	if (ARK_CLOSE(archive_fd) != 0 && rc == 0)
+	if (archive_fd != -1 && ARK_CLOSE(archive_fd) != 0 && rc == 0)
 		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
 		                args->archive_path, errno);
 	(void)index_len;
@@ -3737,6 +3791,12 @@ static int chevron_write_or_fail(chevron_handle_t *handle, const void *buf,
                                  size_t len, const char *path, ark_error_t *err)
 {
 	chevron_error_t cerr = {0};
+
+#ifdef ARK_TEST
+	if (ark_test_cli_fault_should_fail(ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
+	                                   err, path) != 0)
+		return -1;
+#endif
 
 	if (chevron_write_chunk(handle, buf, len, &cerr) != 0)
 		return fail_error(err, ARK_ERR_IO_WRITE,
@@ -5242,6 +5302,128 @@ int ark_test_create_archive(const char *archive_path, const char **create_paths,
 	if (pool == NULL)
 		return -1;
 	return cmd_create(&args, pool, err);
+}
+
+#endif
+
+#ifdef ARK_TEST
+
+/*
+ * ark_test_cli_fault_reset - Clear test-only command fault injection state.
+ */
+void ark_test_cli_fault_reset(void)
+{
+	ark_cli_fault = (ark_cli_fault_t){0};
+}
+
+/*
+ * ark_test_force_owner_restore - Enable owner-restore error paths in tests.
+ *
+ * Production skips chown-style metadata operations for non-root users. Phase
+ * 7.2 fault coverage must still verify ARK_ERR_IO_CHOWN deterministically on
+ * normal developer accounts, so this ARK_TEST-only switch forces the attempted
+ * call while preserving the production EPERM-as-warning contract.
+ */
+void ark_test_force_owner_restore(int enabled)
+{
+	ark_test_owner_restore_forced = enabled;
+}
+
+/*
+ * ark_test_cli_fault_inject - Fail one command sequence point in ARK_TEST.
+ *
+ * The hook covers create steps owned by libchevron, which cannot use ark's
+ * ARK_* syscall wrappers. It is compiled out of production builds and exists
+ * solely to verify TESTING.md section 6 fault contracts.
+ */
+void ark_test_cli_fault_inject(int which, int fail_on_call_n, ark_err_t code,
+                               int errno_value)
+{
+	ark_test_cli_fault_reset();
+	ark_cli_fault.which = which;
+	ark_cli_fault.fail_on_call_n = fail_on_call_n;
+	ark_cli_fault.code = code;
+	ark_cli_fault.errno_value = errno_value;
+}
+
+/*
+ * ark_test_cli_fault_should_fail - Consume a matching test-only sequence fault.
+ */
+static int ark_test_cli_fault_should_fail(int which, ark_error_t *err,
+                                          const char *path)
+{
+	if (ark_cli_fault.which != which)
+		return 0;
+	ark_cli_fault.calls++;
+	if (ark_cli_fault.calls != ark_cli_fault.fail_on_call_n)
+		return 0;
+	return fail_error(err, ark_cli_fault.code,
+	                  "ARK_TEST command fault injected", path,
+	                  ark_cli_fault.errno_value);
+}
+
+/*
+ * ark_test_cli_fault_should_mark_modified - Consume source-modified hook.
+ */
+static int ark_test_cli_fault_should_mark_modified(void)
+{
+	if (ark_cli_fault.which != ARK_CLI_FAULT_CREATE_MARK_MODIFIED)
+		return 0;
+	ark_cli_fault.calls++;
+	return ark_cli_fault.calls == ark_cli_fault.fail_on_call_n;
+}
+
+/*
+ * ark_test_extract_archive - Run extract in-process with fault injection.
+ *
+ * SAFETY: production main() applies a sandbox that permanently restricts the
+ * current process. The ARK_TEST helper intentionally skips sandbox_apply so the
+ * test runner can execute multiple independent fault cases in one process;
+ * it still exercises the same cmd_extract implementation and cleanup ordering
+ * from ARCHITECTURE.md section 14.
+ */
+int ark_test_extract_archive(const char *archive_path, const char *output_path,
+                             int overwrite, const char *member_path,
+                             int n_workers, ark_error_t *err)
+{
+	ark_args_t args;
+	ark_pool_t *pool;
+	int dest_fd;
+	int rc;
+
+	if (archive_path == NULL || output_path == NULL || n_workers <= 0)
+		return fail_error(
+		    err, ARK_ERR_USAGE,
+		    "ARK_TEST extract helper received invalid arguments", "",
+		    0);
+
+	args = (ark_args_t){0};
+	args.cmd = ARK_CMD_EXTRACT;
+	args.archive_path = archive_path;
+	args.output_path = output_path;
+	args.overwrite = overwrite;
+	if (member_path != NULL) {
+		args.member_paths = &member_path;
+		args.member_count = 1U;
+	}
+
+	dest_fd = ARK_OPEN(output_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+	if (dest_fd == -1)
+		return fail_error(err, ARK_ERR_IO_OPEN,
+		                  "output directory open failed", output_path,
+		                  errno);
+
+	pool = pool_init(n_workers, ARK_POOL_DECOMPRESS, err);
+	if (pool == NULL) {
+		(void)ARK_CLOSE(dest_fd);
+		return -1;
+	}
+	rc = cmd_extract(&args, dest_fd, pool, err);
+	if (ARK_CLOSE(dest_fd) != 0 && rc == 0)
+		rc = fail_error(err, ARK_ERR_IO_OPEN,
+		                "output directory close failed", output_path,
+		                errno);
+	return rc;
 }
 
 /* ARK_TEST only: expose current cancellation flag for thread tests. */

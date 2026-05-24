@@ -584,15 +584,15 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 
 | Test file | Written | Valgrind clean | ASan clean | OpenBSD |
 |---|---|---|---|---|
-| `test_sha256.c` | - | - | - | - |
-| `test_blake3.c` | - | - | - | - |
-| `test_deflate.c` | - | - | - | - |
-| `test_archive.c` | - | - | - | - |
-| `test_thread.c` | - | - | - (TSan) | - |
-| `test_extract.c` | - | - | - | - |
-| `test_fault.c` | - | - | - | - |
-| `test_edge.c` | - | - | - | - |
-| `test_integration.c` | - | - | - | - |
+| `test_sha256.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_blake3.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_deflate.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_archive.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_thread.c` | ✓ | ✓ | ✓ (TSan) | ✓ |
+| `test_extract.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_fault.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_edge.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_integration.c` | ✓ | ✓ | ✓ | ✓ |
 
 ### Key Correctness Cases
 

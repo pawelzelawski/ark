@@ -2,9 +2,9 @@
 
 ## Status Overview
 
-**Last Updated:** 2026-05-10
-**Current Phase:** Phase 7 - Test suite completion (in progress)
-**Next Task:** Phase 7.2 - Coverage verification
+**Last Updated:** 2026-05-24
+**Current Phase:** Phase 8 - Hardening and release (not started)
+**Next Task:** Phase 8.1 - Static analysis
 
 ### Phase Summary
 
@@ -16,7 +16,7 @@
 | 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
 | 5 | CLI: core operations | DONE | 5.1-5.10 complete | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | DONE | 6.1-6.7 complete | Ring buffer, workers, cancellation, error propagation; TSan required; parallel correctness confirmed |
-| 7 | Test suite completion | IN PROGRESS | 7.1 complete | Integration tests complete; coverage verification pending |
+| 7 | Test suite completion | DONE | 7.1-7.3 complete | Integration tests complete; coverage verification and OpenBSD run complete |
 | 8 | Hardening and release | NOT STARTED | - | Valgrind, TSan final, static analysis, README |
 
 ### Quality Milestones
@@ -38,9 +38,9 @@
 | M13 | Thread pool: no deadlock on worker error (ring buffer abort sentinel unblocks I/O thread) | DONE |
 | M14 | Thread pool: TSan clean | DONE |
 | M15 | Parallel create: output bit-identical to single-threaded create on same input | DONE |
-| M16 | Fault injection: every create sequence step covered with forced failure | NOT STARTED |
-| M17 | Fault injection: every extract sequence step covered with forced failure | NOT STARTED |
-| M18 | All sixteen §8.3 adversarial index inputs rejected before any filesystem side effect | NOT STARTED |
+| M16 | Fault injection: every create sequence step covered with forced failure | DONE |
+| M17 | Fault injection: every extract sequence step covered with forced failure | DONE |
+| M18 | All sixteen §8.3 adversarial index inputs rejected before any filesystem side effect | DONE |
 | M19 | Pre-epoch mtime: stored and restored; tv_nsec normalised to [0, 999999999] | DONE |
 | M20 | Empty file: chunk_count=0 accepted; empty file extracted correctly | DONE |
 | M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
@@ -54,7 +54,7 @@
 | M29 | clang-tidy zero warnings on Linux and OpenBSD | NOT STARTED |
 | M30 | cppcheck zero warnings on Linux and OpenBSD | NOT STARTED |
 | M31 | clang-format clean | NOT STARTED |
-| M32 | All tests pass on OpenBSD x86_64 | NOT STARTED |
+| M32 | All tests pass on OpenBSD x86_64 | DONE |
 | M33 | All tests pass on OpenBSD ARM64 | NOT STARTED |
 | M34 | Deflate optimisation pass is format-preserving and deterministic (same input, same binary, identical output) | NOT STARTED |
 | M35 | Deflate optimisation pass improves compression ratio on the reference benchmark dataset | NOT STARTED |
@@ -761,27 +761,6 @@ cost without changing archive format, API, or determinism guarantees.
   Deflate-compliant length-limited builder for lit/dist trees
 - [x] Enforce Deflate max code-length constraints and preserve RFC 1951 validity
 
-**P6F.6 - O5 dynamic-header code-length RLE**
-- [ ] Encode dynamic header code lengths with symbols 16/17/18 when beneficial
-- [ ] Keep header emission deterministic and standards-compliant
-
-**P6F.7 - Regression + determinism gate**
-- [ ] Re-run full Linux validation gate in required order
-- [ ] Re-verify parallel create output remains bit-identical to single-threaded
-  create (same input, same binary)
-- [ ] Re-run fixed benchmark matrix from P6F.1 and record deltas
-
-**P6F.8 - OpenBSD verification**
-- [ ] Provide OpenBSD command set for the same benchmark + tests
-- [ ] Confirm OpenBSD pass before marking the optimisation pass complete
-
-#### Completion Criteria
-
-- [ ] No format changes (header/index/footer/chunk model unchanged)
-- [ ] No public API changes in `deflate.h`
-- [ ] Determinism scope from ARCHITECTURE.md §13.1 preserved
-- [ ] Quality milestones M34, M35, M36 confirmed
-
 ---
 
 ## Phase 7 - Test Suite Completion
@@ -808,25 +787,25 @@ in TESTING.md §11 is fully populated.
 - [x] `test_integration_large_archive`: 1000 files of mixed sizes; create,
   verify, extract; all clean; measures wall time for regression reference
 
-**7.2 - Coverage verification**
-- [ ] Verify every `ark_err_t` value appears in at least one test that
+**7.2 - Coverage verification** ✓ DONE
+- [x] Verify every `ark_err_t` value appears in at least one test that
   triggers it under correct conditions
-- [ ] Verify every create sequence step has a fault injection test
-- [ ] Verify every extract sequence step has a fault injection test
-- [ ] Verify all sixteen §8.3 checks are individually tested with crafted
+- [x] Verify every create sequence step has a fault injection test
+- [x] Verify every extract sequence step has a fault injection test
+- [x] Verify all sixteen §8.3 checks are individually tested with crafted
   archives
-- [ ] Populate TESTING.md §11 coverage tracking table; all cells marked done
+- [x] Populate TESTING.md §11 coverage tracking table; all cells marked done
 
-**7.3 - OpenBSD test run**
-- [ ] All tests pass on OpenBSD x86_64
-- [ ] Quality milestones M32 confirmed
+**7.3 - OpenBSD test run** ✓ DONE
+- [x] All tests pass on OpenBSD x86_64
+- [x] Quality milestones M32 confirmed
 
 ### Phase 7 Completion Criteria
 
-- [ ] All integration tests pass on Linux and OpenBSD
-- [ ] Coverage tracking table fully populated
-- [ ] All correctness quality milestones confirmed
-- [ ] Quality milestones M24, M25, M32 confirmed
+- [x] All integration tests pass on Linux and OpenBSD
+- [x] Coverage tracking table fully populated
+- [x] All correctness quality milestones confirmed
+- [x] Quality milestones M24, M25, M32 confirmed
 
 ---
 

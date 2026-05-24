@@ -1253,6 +1253,20 @@ int test_read_header_before_init(void)
 	return err.code == ARK_ERR_USAGE ? 0 : 1;
 }
 
+int test_read_header_truncated(void)
+{
+	read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+	uint8_t header[16];
+
+	ctx = read_ctx_from_storage(&storage);
+	build_header(header, ARK_HASH_BLAKE3);
+	if (ark_read_header(ctx, header, 15U, &err) != -1)
+		return 1;
+	return err.code == ARK_ERR_FMT_TRUNCATED ? 0 : 1;
+}
+
 int test_read_check1_bad_footer_magic(void)
 {
 	read_entry_t e;
@@ -1389,6 +1403,53 @@ int test_read_check3_path_empty_component_fmt(void)
 	build_footer(footer, 17U, index_len, 1U, digest);
 	return parse_index_expect(header, footer, index, index_len,
 	                          ARK_ERR_FMT_INDEX);
+}
+
+int test_read_check3_path_invalid_utf8(void)
+{
+	read_entry_t e;
+	const uint32_t sizes[1] = {1U};
+	const uint8_t path[2] = {0xffU, 'a'};
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e, 0x01U, "a");
+	e.path = path;
+	e.path_len = sizeof(path);
+	e.size_original = 1U;
+	e.size_compressed = 1U;
+	e.data_offset = 16U;
+	e.chunk_count = 1U;
+	e.chunk_sizes = sizes;
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 17U, index_len, 1U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_PATH_ENCODING);
+}
+
+int test_read_index_unknown_member_type(void)
+{
+	read_entry_t e;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[256];
+	uint8_t digest[32];
+	size_t index_len;
+
+	entry_base(&e, 0xffU, "a");
+	if (build_index(&e, 1U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 1U, digest);
+	return parse_index_expect(header, footer, index, index_len,
+	                          ARK_ERR_FMT_MEMBER_TYPE);
 }
 
 int test_read_check4_path_too_long(void)
