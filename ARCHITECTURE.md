@@ -1615,14 +1615,14 @@ are provided. The check must occur before libchevron is initialised
 (before the temp file is created), so no cleanup is needed on rejection.
 
 **Example rejections:**
-- `ark create out.ark .` — destination parent `.` equals source `.`
-- `ark create project/archive.ark project` — destination parent
+- `ark create out.ark .` - destination parent `.` equals source `.`
+- `ark create project/archive.ark project` - destination parent
   `project/` is inside source `project/`
-- `ark create /tmp/a.ark /tmp` — destination parent `/tmp/` equals
+- `ark create /tmp/a.ark /tmp` - destination parent `/tmp/` equals
   source `/tmp/`
 
 **Non-rejection:**
-- `ark create ../archive.ark .` — destination parent `..` is outside
+- `ark create ../archive.ark .` - destination parent `..` is outside
   source `.`; accepted
 
 ### 13.6 Path Stripping

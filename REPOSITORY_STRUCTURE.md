@@ -9,7 +9,7 @@ ark/
 ├── .clang-tidy                 # Static analysis configuration
 ├── README.md                   # User-facing introduction, installation, quickstart
 ├── PROJECT.md                  # Overview, goals, scope, design philosophy
-├── ARCHITECTURE.md             # Full architecture — format spec, component design,
+├── ARCHITECTURE.md             # Full architecture - format spec, component design,
 │                               #   API contracts, security model, error model,
 │                               #   threading model, known limitations
 ├── TECH_STACK.md               # Build system, compiler flags, system libraries,
@@ -32,7 +32,7 @@ installs exactly two artefacts: the `ark` binary into `$(BINDIR)` and
 
 ---
 
-## 2. src/ — Source Files
+## 2. src/ - Source Files
 
 ark is decomposed into five components, each a self-contained two-file unit
 (public header + implementation), plus one internal shared header and the
@@ -41,18 +41,18 @@ application entry point.
 ```
 src/
 │
-│   — Cryptographic hash components —
+│   - Cryptographic hash components -
 │
 ├── sha256.h            # SHA-256 public API.
 │                       #
 │                       # Types:
-│                       #   ark_sha256_ctx_t   — opaque streaming context
+│                       #   ark_sha256_ctx_t   - opaque streaming context
 │                       #
 │                       # Functions:
-│                       #   ark_sha256_init()   — initialise context
-│                       #   ark_sha256_update() — feed data
-│                       #   ark_sha256_final()  — produce 32-byte digest
-│                       #   ark_sha256()        — single-shot convenience
+│                       #   ark_sha256_init()   - initialise context
+│                       #   ark_sha256_update() - feed data
+│                       #   ark_sha256_final()  - produce 32-byte digest
+│                       #   ark_sha256()        - single-shot convenience
 │                       #
 │                       # Self-contained: depends only on <stddef.h> and
 │                       #   <stdint.h>. Copyable to other projects without
@@ -65,13 +65,13 @@ src/
 ├── blake3.h            # BLAKE3 public API.
 │                       #
 │                       # Types:
-│                       #   ark_blake3_ctx_t   — opaque streaming context
+│                       #   ark_blake3_ctx_t   - opaque streaming context
 │                       #
 │                       # Functions:
-│                       #   ark_blake3_init()   — initialise context
-│                       #   ark_blake3_update() — feed data
-│                       #   ark_blake3_final()  — produce 32-byte digest
-│                       #   ark_blake3()        — single-shot convenience
+│                       #   ark_blake3_init()   - initialise context
+│                       #   ark_blake3_update() - feed data
+│                       #   ark_blake3_final()  - produce 32-byte digest
+│                       #   ark_blake3()        - single-shot convenience
 │                       #
 │                       # Output length is fixed at 32 bytes. Variable-length
 │                       #   output is not exposed. Tree parallelism is not
@@ -82,14 +82,14 @@ src/
 │                       # Validated against the official BLAKE3 test vectors.
 │                       # No dependencies beyond blake3.h and libc.
 │
-│   — Compression component —
+│   - Compression component -
 │
 ├── deflate.h           # Deflate compress/decompress public API.
 │                       #
 │                       # Functions:
-│                       #   ark_deflate_compress()  — compress one chunk
-│                       #   ark_deflate_decompress()— decompress one chunk
-│                       #   ark_deflate_bound()     — maximum compressed
+│                       #   ark_deflate_compress()  - compress one chunk
+│                       #   ark_deflate_decompress()- decompress one chunk
+│                       #   ark_deflate_bound()     - maximum compressed
 │                       #     output size for a given input size; used by
 │                       #     main.c to size output buffers
 │                       #
@@ -105,39 +105,39 @@ src/
 │                       # Decompressor is a strict RFC 1951 implementation.
 │                       # No dependencies beyond deflate.h and libc.
 │
-│   — Archive format component —
+│   - Archive format component -
 │
 ├── archive.h           # Archive read and write public API.
 │                       #
 │                       # Types:
-│                       #   ark_write_ctx_t    — write context
-│                       #   ark_read_ctx_t     — read context
-│                       #   ark_member_meta_t  — member metadata
-│                       #   ark_error_t        — error detail struct
-│                       #   ark_err_t          — error code enum
-│                       #   ark_hash_alg_t     — BLAKE3 or SHA-256
-│                       #   ark_deflate_mode_t — compressor quality
+│                       #   ark_write_ctx_t    - write context
+│                       #   ark_read_ctx_t     - read context
+│                       #   ark_member_meta_t  - member metadata
+│                       #   ark_error_t        - error detail struct
+│                       #   ark_err_t          - error code enum
+│                       #   ark_hash_alg_t     - BLAKE3 or SHA-256
+│                       #   ark_deflate_mode_t - compressor quality
 │                       #
 │                       # Write path:
-│                       #   ark_write_init()         — initialise context
-│                       #   ark_write_header()        — serialise header
-│                       #   ark_write_member_begin()  — begin member
-│                       #   ark_write_chunk()         — record pre-compressed chunk
-│                       #   ark_write_member_end()    — finalise member
-│                       #   ark_write_index()         — serialise index
-│                       #   ark_write_footer()        — serialise footer
-│                       #   ark_write_free()          — release context
+│                       #   ark_write_init()         - initialise context
+│                       #   ark_write_header()        - serialise header
+│                       #   ark_write_member_begin()  - begin member
+│                       #   ark_write_chunk()         - record pre-compressed chunk
+│                       #   ark_write_member_end()    - finalise member
+│                       #   ark_write_index()         - serialise index
+│                       #   ark_write_footer()        - serialise footer
+│                       #   ark_write_free()          - release context
 │                       #
 │                       # Read path:
-│                       #   ark_read_header()                 — parse and validate header
-│                       #   ark_read_init()                   — parse and validate footer
-│                       #   ark_read_index()                  — verify and parse index
-│                       #   ark_read_member_meta()            — access member metadata
-│                       #   ark_read_chunk()                  — decompress one chunk
-│                       #   ark_read_verify_member_begin()    — begin per-member hash
-│                       #   ark_read_verify_member_update()   — feed compressed chunk
-│                       #   ark_read_verify_member_final()    — verify hash
-│                       #   ark_read_free()                   — release context
+│                       #   ark_read_header()                 - parse and validate header
+│                       #   ark_read_init()                   - parse and validate footer
+│                       #   ark_read_index()                  - verify and parse index
+│                       #   ark_read_member_meta()            - access member metadata
+│                       #   ark_read_chunk()                  - decompress one chunk
+│                       #   ark_read_verify_member_begin()    - begin per-member hash
+│                       #   ark_read_verify_member_update()   - feed compressed chunk
+│                       #   ark_read_verify_member_final()    - verify hash
+│                       #   ark_read_free()                   - release context
 │                       #
 │                       # No I/O, no threading, no allocation beyond context
 │                       #   lifetime. See ARCHITECTURE.md §16.
@@ -149,7 +149,7 @@ src/
 │                       # Per-member and index hash verification.
 │                       # Format validation per §8.3.
 │
-│   — Recovery reader template —
+│   - Recovery reader template -
 │
 ├── recovery_template.c # Source template for the generate-reader subcommand.
 │                       #
@@ -166,7 +166,7 @@ src/
 │                       #   (no host-endian struct casts). Compilable on any
 │                       #   host byte order. See ARCHITECTURE.md §15.
 │
-│   — Internal shared header —
+│   - Internal shared header -
 │
 ├── ark_internal.h      # Shared internal definitions.
 │                       # Not part of any component's public API.
@@ -197,50 +197,50 @@ src/
 │                       #   ARK_CLOSEDIR    → closedir
 │                       #   ARK_REALPATH    → realpath
 │
-│   — Application entry point —
+│   - Application entry point -
 │
 └── main.c              # CLI entry point and application logic.
                         #
                         # Subcommand dispatch:
-                        #   cmd_create()          — traverse, compress, write archive
-                        #   cmd_extract()         — validate index, extract members
-                        #   cmd_list()            — read index, print member table
-                        #   cmd_verify()          — read index, verify all member hashes
-                        #   cmd_generate_reader() — write recovery_template.c to output
+                        #   cmd_create()          - traverse, compress, write archive
+                        #   cmd_extract()         - validate index, extract members
+                        #   cmd_list()            - read index, print member table
+                        #   cmd_verify()          - read index, verify all member hashes
+                        #   cmd_generate_reader() - write recovery_template.c to output
                         #
                         # Argument parsing:
-                        #   parse_args()          — validate flags and operands
+                        #   parse_args()          - validate flags and operands
                         #
                         # Thread pool (create and extract):
-                        #   pool_init()           — allocate worker pool
-                        #   pool_submit()         — submit chunk to worker queue
-                        #   pool_shutdown()       — cancel flag, join, free
-                        #   worker_compress()     — worker thread: compress one chunk
-                        #   worker_decompress()   — worker thread: decompress one chunk
+                        #   pool_init()           - allocate worker pool
+                        #   pool_submit()         - submit chunk to worker queue
+                        #   pool_shutdown()       - cancel flag, join, free
+                        #   worker_compress()     - worker thread: compress one chunk
+                        #   worker_decompress()   - worker thread: decompress one chunk
                         #
                         # Filesystem traversal (create):
-                        #   traverse_dir()        — depth-first directory walk
-                        #   traverse_entry()      — process one directory entry
+                        #   traverse_dir()        - depth-first directory walk
+                        #   traverse_entry()      - process one directory entry
                         #
                         # Ring buffer:
-                        #   ring_buf_init()       — initialise fixed-size ring buffer
-                        #   ring_buf_write()      — worker: write compressed result
-                        #   ring_buf_abort()      — worker: write abort sentinel
-                        #   ring_buf_read()       — I/O thread: read next slot in order
-                        #   ring_buf_free()       — release ring buffer
+                        #   ring_buf_init()       - initialise fixed-size ring buffer
+                        #   ring_buf_write()      - worker: write compressed result
+                        #   ring_buf_abort()      - worker: write abort sentinel
+                        #   ring_buf_read()       - I/O thread: read next slot in order
+                        #   ring_buf_free()       - release ring buffer
                         #
                         # Extraction cleanup tracker:
-                        #   cleanup_track()       — register created filesystem object
-                        #   cleanup_created()     — remove all tracked objects
+                        #   cleanup_track()       - register created filesystem object
+                        #   cleanup_created()     - remove all tracked objects
                         #
                         # Sandboxing:
-                        #   sandbox_apply()       — apply pledge/unveil or Landlock
+                        #   sandbox_apply()       - apply pledge/unveil or Landlock
                         #                           policy for the current subcommand
                         #
                         # Output formatting:
-                        #   print_error()         — format and emit ark_error_t to stderr
-                        #   print_warning()       — yellow warning line to stderr
-                        #   print_member()        — one member row for list subcommand
+                        #   print_error()         - format and emit ark_error_t to stderr
+                        #   print_warning()       - yellow warning line to stderr
+                        #   print_member()        - one member row for list subcommand
                         #
                         # main.c is the only file that calls pledge/unveil (OpenBSD)
                         # and Landlock/seccomp-bpf (Linux). No sandboxing code
@@ -249,7 +249,7 @@ src/
 
 ---
 
-## 3. vendor/ — Vendored Dependencies
+## 3. vendor/ - Vendored Dependencies
 
 ```
 vendor/
@@ -283,7 +283,7 @@ ark's own source files. There is no separate libchevron.a build step.
 
 ---
 
-## 4. tests/ — Test Suite
+## 4. tests/ - Test Suite
 
 ```
 tests/
@@ -406,7 +406,7 @@ design, platform test matrix, and quality milestone gates.
 
 ---
 
-## 5. man/ — Manual Page
+## 5. man/ - Manual Page
 
 ```
 man/

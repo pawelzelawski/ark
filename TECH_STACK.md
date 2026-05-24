@@ -61,7 +61,7 @@ These are part of the C standard library or POSIX and require no installation.
 #include <string.h>     /* memset, memcpy, memcmp, strlen, strerror      */
 #include <stdlib.h>     /* malloc, free, exit                            */
 #include <stdio.h>      /* fprintf, snprintf, stderr                     */
-#include <errno.h>      /* errno — syscall error inspection              */
+#include <errno.h>      /* errno - syscall error inspection              */
 #include <limits.h>     /* PATH_MAX, NAME_MAX                            */
 #include <assert.h>     /* _Static_assert (via assert.h in C11)          */
 ```
@@ -91,7 +91,7 @@ No platform-specific threading API exists anywhere in the codebase.
 ### 3.4 POSIX Realpath and Path Operations
 
 ```c
-#include <stdlib.h>     /* realpath(3) — POSIX.1-2008                    */
+#include <stdlib.h>     /* realpath(3) - POSIX.1-2008                    */
 ```
 
 `realpath` is used exclusively in `main.c` for source path resolution before
@@ -128,7 +128,7 @@ beyond the standard kernel headers package is required.
 
 ```c
 #ifdef __OpenBSD__
-#include <unistd.h>     /* pledge(2), unveil(2) — part of base unistd.h  */
+#include <unistd.h>     /* pledge(2), unveil(2) - part of base unistd.h  */
 #endif
 ```
 
@@ -269,8 +269,8 @@ All platform-conditional Makefile logic branches on `$(OS)`.
 ### 5.2 Build Output
 
 ```
-build/ark           — binary (sole build artefact)
-build/tests/run_tests — test binary
+build/ark           - binary (sole build artefact)
+build/tests/run_tests - test binary
 ```
 
 The `ark` binary is the only artefact. There is no static library output.

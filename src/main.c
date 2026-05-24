@@ -242,6 +242,8 @@ int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
 static void ring_buf_release(ring_buf_t *, uint64_t);
 void ring_buf_free(ring_buf_t *);
 static void error_store_once(ark_shared_err_t *, const ark_error_t *);
+static size_t pool_input_cap(ark_pool_mode_t);
+static size_t pool_output_cap(ark_pool_mode_t);
 static ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
 static int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
                        ark_deflate_mode_t);
@@ -581,6 +583,36 @@ static void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
 }
 
 /*
+ * pool_input_cap - Return maximum queued worker input for a pool mode.
+ *
+ * ARCHITECTURE.md section 6.2 stores independent compressed chunk streams.
+ * Compress workers receive uncompressed chunks capped at ARK_CHUNK_SIZE;
+ * decompress workers receive compressed chunks, which may be larger for
+ * incompressible stored-block fallback.
+ */
+static size_t
+pool_input_cap(ark_pool_mode_t mode)
+{
+	if (mode == ARK_POOL_DECOMPRESS)
+		return ark_deflate_bound(ARK_CHUNK_SIZE);
+	return ARK_CHUNK_SIZE;
+}
+
+/*
+ * pool_output_cap - Return maximum worker output size for a pool mode.
+ *
+ * Compress workers may emit up to ark_deflate_bound(ARK_CHUNK_SIZE) bytes;
+ * decompress workers emit at most one uncompressed ARK chunk.
+ */
+static size_t
+pool_output_cap(ark_pool_mode_t mode)
+{
+	if (mode == ARK_POOL_DECOMPRESS)
+		return ARK_CHUNK_SIZE;
+	return ark_deflate_bound(ARK_CHUNK_SIZE);
+}
+
+/*
  * pool_init - Allocate and initialise a worker pool bound to one mode.
  *
  * mode selects a fixed worker routine for the lifetime of the pool:
@@ -640,10 +672,9 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 	}
 	for (i = 0; i < n_workers; i++) {
 		pool->worker_args[i].pool = pool;
-		pool->worker_args[i].src_cap = ARK_CHUNK_SIZE;
-		pool->worker_args[i].dst_cap =
-		    ark_deflate_bound(ARK_CHUNK_SIZE);
-		pool->worker_args[i].src = malloc(ARK_CHUNK_SIZE);
+		pool->worker_args[i].src_cap = pool_input_cap(mode);
+		pool->worker_args[i].dst_cap = pool_output_cap(mode);
+		pool->worker_args[i].src = malloc(pool->worker_args[i].src_cap);
 		pool->worker_args[i].dst = malloc(pool->worker_args[i].dst_cap);
 		if (pool->worker_args[i].src == NULL ||
 		    pool->worker_args[i].dst == NULL) {
@@ -682,8 +713,8 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		return NULL;
 	}
 	for (i = 0; i < n_workers; i++) {
-		pool->queue_slots[i].cap = ARK_CHUNK_SIZE;
-		pool->queue_slots[i].src = malloc(ARK_CHUNK_SIZE);
+		pool->queue_slots[i].cap = pool_input_cap(mode);
+		pool->queue_slots[i].src = malloc(pool->queue_slots[i].cap);
 		if (pool->queue_slots[i].src == NULL) {
 			free(pool->queue_slots[i].src);
 			while (i > 0) {
@@ -864,7 +895,7 @@ static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 		return -1;
 	if (src_len > 0U && src == NULL)
 		return -1;
-	if (src_len > ARK_CHUNK_SIZE)
+	if (src_len > pool_input_cap(pool->mode))
 		return -1;
 	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0)
 		return -1;

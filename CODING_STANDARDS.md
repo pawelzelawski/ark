@@ -36,7 +36,7 @@ read_chunk(ark_read_ctx_t *ctx, int fd, uint8_t *dst,
 	return 0;
 }
 
-/* Wrong — spaces used for indentation */
+/* Wrong - spaces used for indentation */
 static int
 read_chunk(ark_read_ctx_t *ctx, int fd, uint8_t *dst,
     size_t len, ark_error_t *err)
@@ -175,7 +175,7 @@ header is self-contained and copyable to other projects without modification.
 #define ARK_BLAKE3_H
 
 /*
- * blake3.h — BLAKE3 hash implementation
+ * blake3.h - BLAKE3 hash implementation
  *
  * Streaming:
  *   ark_blake3_ctx_t ctx;
@@ -204,14 +204,14 @@ header is self-contained and copyable to other projects without modification.
 #define ARK_INTERNAL_H
 
 /*
- * ark_internal.h — shared internal types and syscall wrapper macros
+ * ark_internal.h - shared internal types and syscall wrapper macros
  *
  * Not part of any component's public API. Included by all .c files
  * in src/. Never included by tests directly; tests include component
  * headers only.
  */
 
-/* Syscall wrapper macros for fault injection — see TESTING.md §3 */
+/* Syscall wrapper macros for fault injection - see TESTING.md §3 */
 #ifndef ARK_TEST
 #define ARK_READ        read
 #define ARK_WRITE       write
@@ -238,7 +238,7 @@ header is self-contained and copyable to other projects without modification.
 **Source files** (`.c`):
 ```c
 /*
- * archive.c — archive format read and write implementation
+ * archive.c - archive format read and write implementation
  *
  * Implements the write path (ark_write_*) and read path (ark_read_*)
  * defined in archive.h. No I/O, no allocation beyond context lifetime,
@@ -300,7 +300,7 @@ already populated by a lower layer.
 
 ```c
 /*
- * ark_fail — populate err and return -1.
+ * ark_fail - populate err and return -1.
  *
  * Convenience wrapper used at every failure site. Returns -1 always so
  * callers can write: return ark_fail(err, code, msg, sys_errno);
@@ -326,7 +326,7 @@ struct. The original error takes precedence over any subsequent failure
 (including cleanup failures).
 
 ```c
-/* Correct — propagate immediately, preserve original error */
+/* Correct - propagate immediately, preserve original error */
 rc = ark_read_header(ctx, header_buf, 16, &err);
 if (rc != 0)
 	goto done;
@@ -335,7 +335,7 @@ rc = ark_read_init(ctx, footer_buf, 64, &err);
 if (rc != 0)
 	goto done;
 
-/* Correct — capture error before cleanup, do not overwrite */
+/* Correct - capture error before cleanup, do not overwrite */
 rc = extract_member(meta, dst_dir, &err);
 if (rc != 0) {
 	saved_err = err;           /* capture */
@@ -344,7 +344,7 @@ if (rc != 0) {
 	goto done;
 }
 
-/* Wrong — overwriting original error with cleanup failure */
+/* Wrong - overwriting original error with cleanup failure */
 rc = extract_member(meta, dst_dir, &err);
 if (rc != 0) {
 	cleanup_created(&tracker, &err);   /* clobbers original error */
@@ -366,7 +366,7 @@ if (n < 0) {
 	    saved_errno);
 }
 
-/* Wrong — errno may have changed */
+/* Wrong - errno may have changed */
 n = ARK_READ(fd, buf, len);
 some_other_call();
 if (n < 0)
@@ -427,13 +427,13 @@ discipline:
   responsible for freeing it.
 
 ```c
-/* Correct — documented ownership, freed in context teardown */
+/* Correct - documented ownership, freed in context teardown */
 ctx->chunk_buf = malloc(ARK_CHUNK_SIZE);
 if (ctx->chunk_buf == NULL)
 	return ark_fail(err, ARK_ERR_IO_ALLOC, "chunk buffer", 0);
 /* OWNERSHIP: ctx->chunk_buf freed by ark_write_free. */
 
-/* Wrong — allocated in the hot path */
+/* Wrong - allocated in the hot path */
 for (i = 0; i < chunk_count; i++) {
 	tmp = malloc(ARK_CHUNK_SIZE);   /* never in the chunk loop */
 	/* ... */
@@ -482,7 +482,7 @@ cleanup tracker immediately after creation, before any subsequent operation
 that could fail.
 
 ```c
-/* Correct — register before next fallible operation */
+/* Correct - register before next fallible operation */
 rc = ARK_MKDIR(path, 0700);
 if (rc != 0) {
 	return ark_fail(err, ARK_ERR_IO_MKDIR, path, errno);
@@ -493,7 +493,7 @@ rc = set_dir_metadata(path, meta, err);           /* next fallible op */
 if (rc != 0)
 	goto cleanup;                                  /* tracker has the dir */
 
-/* Wrong — create then fail before registering */
+/* Wrong - create then fail before registering */
 rc = ARK_MKDIR(path, 0700);
 if (rc != 0)
 	goto cleanup;
@@ -519,7 +519,7 @@ never the raw syscall names.
 /* Correct */
 n = ARK_READ(fd, buf, len);
 
-/* Wrong — bypasses fault injection */
+/* Wrong - bypasses fault injection */
 n = read(fd, buf, len);
 ```
 
@@ -532,14 +532,14 @@ the macros silently breaks fault injection coverage.
 All retryable syscalls use the same retry loop pattern:
 
 ```c
-/* Correct — consistent EINTR retry */
+/* Correct - consistent EINTR retry */
 do {
 	rc = ARK_LCHOWN(path, uid, gid);
 } while (rc != 0 && errno == EINTR);
 if (rc != 0)
 	return ark_fail(err, ARK_ERR_IO_CHOWN, path, errno);
 
-/* Wrong — treating EINTR as hard failure */
+/* Wrong - treating EINTR as hard failure */
 if (ARK_LCHOWN(path, uid, gid) != 0)
 	return ark_fail(err, ARK_ERR_IO_CHOWN, path, errno);
 ```
@@ -552,11 +552,11 @@ Metadata operations on extracted members must not follow symlinks. Use the
 no-follow variants:
 
 ```c
-/* Correct — operates on the symlink inode, not the target */
+/* Correct - operates on the symlink inode, not the target */
 ARK_LCHOWN(path, uid, gid);
 ARK_UTIMENSAT(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW);
 
-/* Wrong — follows the symlink */
+/* Wrong - follows the symlink */
 chown(path, uid, gid);
 utimensat(AT_FDCWD, path, times, 0);
 ```
@@ -577,7 +577,7 @@ ARK_CHMOD(path, meta->mode & 0777);     /* after lchown */
 
 /* Wrong */
 ARK_CHMOD(path, meta->mode & 0777);     /* setuid/setgid bits set here */
-ARK_LCHOWN(path, meta->uid, meta->gid); /* cleared here — wrong */
+ARK_LCHOWN(path, meta->uid, meta->gid); /* cleared here - wrong */
 ```
 
 ---
@@ -591,7 +591,7 @@ call `ark_write_chunk`, do not modify the write or read context, and do not
 touch any shared struct except the ring buffer and the shared error state.
 
 ```c
-/* Correct — worker calls ark_deflate_compress directly */
+/* Correct - worker calls ark_deflate_compress directly */
 static void *
 worker_compress(void *arg)
 {
@@ -604,7 +604,7 @@ worker_compress(void *arg)
 	return NULL;
 }
 
-/* Wrong — worker calls write API directly */
+/* Wrong - worker calls write API directly */
 static void *
 worker_compress(void *arg)
 {
@@ -624,7 +624,7 @@ workers check it between chunks and exit cleanly when it is set. Workers
 never access shared context state after the cancellation flag is set.
 
 ```c
-/* Correct — check flag at each chunk boundary */
+/* Correct - check flag at each chunk boundary */
 while (chunks_remaining > 0) {
 	if (atomic_load(&pool->cancel))
 		break;
@@ -648,7 +648,7 @@ Required sequence for a worker that encounters a fatal error:
 3. Exit the worker function.
 
 ```c
-/* Correct — abort sentinel written before worker exit */
+/* Correct - abort sentinel written before worker exit */
 clen = ark_deflate_compress(w->in, w->in_len, w->out, w->out_cap,
     w->mode);
 if (clen < 0) {
@@ -658,7 +658,7 @@ if (clen < 0) {
 	return NULL;                                       /* step 3 */
 }
 
-/* Wrong — worker exits without writing sentinel; I/O thread deadlocks */
+/* Wrong - worker exits without writing sentinel; I/O thread deadlocks */
 if (clen < 0)
 	return NULL;
 ```
@@ -674,9 +674,9 @@ On any fatal error during a parallel operation, cleanup must not begin until
 all workers are joined. The sequence is fixed and must not be reordered:
 
 ```c
-/* Correct — quiescence before cleanup */
+/* Correct - quiescence before cleanup */
 atomic_store(&pool->cancel, 1);    /* step 1: signal cancellation    */
-/* step 2: stop submitting new work — done implicitly by I/O thread  */
+/* step 2: stop submitting new work - done implicitly by I/O thread  */
 for (i = 0; i < pool->nworkers; i++)
 	pthread_join(pool->workers[i], NULL);  /* step 3: join all      */
 if (out_fd != -1) {
@@ -702,7 +702,7 @@ The write context must be called in strict sequence. See ARCHITECTURE.md
 `ARK_ERR_USAGE` and is a caller programming error.
 
 ```c
-/* Correct — follows state machine sequence */
+/* Correct - follows state machine sequence */
 ark_write_init(&ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err);
 ark_write_header(&ctx, header_buf, sizeof(header_buf), &err);
 ark_write_member_begin(&ctx, &meta, &err);
@@ -712,7 +712,7 @@ ark_write_index(&ctx, idx_buf, idx_cap, &err);
 ark_write_footer(&ctx, idx_offset, idx_len, footer_buf, 64, &err);
 ark_write_free(&ctx);
 
-/* Wrong — chunk called after member_end */
+/* Wrong - chunk called after member_end */
 ark_write_member_end(&ctx, &err);
 ark_write_chunk(&ctx, data, len, out, cap, &err);   /* ARK_ERR_USAGE */
 ```
@@ -726,14 +726,14 @@ context resources, even after an error return from any other write function.
 only. It is never populated or read by callers of the write path.
 
 ```c
-/* Correct — chunk_sizes NULL on write path */
+/* Correct - chunk_sizes NULL on write path */
 memset(&meta, 0, sizeof(meta));
 meta.size_original = file_size;
 meta.type          = ARK_TYPE_REGULAR;
 /* meta.chunk_sizes intentionally left NULL */
 ark_write_member_begin(&ctx, &meta, &err);
 
-/* Wrong — populating chunk_sizes on write path */
+/* Wrong - populating chunk_sizes on write path */
 meta.chunk_sizes = my_array;   /* context owns this internally */
 ark_write_member_begin(&ctx, &meta, &err);
 ```
@@ -793,7 +793,7 @@ self-explanatory.
 
 ```c
 /*
- * ark_write_chunk — record one pre-compressed chunk into the write context.
+ * ark_write_chunk - record one pre-compressed chunk into the write context.
  *
  * src contains compressed bytes produced by ark_deflate_compress in a worker
  * thread. This function does not compress. It updates the per-member hash

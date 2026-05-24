@@ -51,7 +51,7 @@ and runs the binary.
 
 ```c
 /*
- * CHECK(name, expr) — assert expr is true; record pass or fail.
+ * CHECK(name, expr) - assert expr is true; record pass or fail.
  * name is a string literal identifying the test case.
  */
 #define CHECK(name, expr) do {                                          \

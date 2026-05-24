@@ -1,5 +1,5 @@
 /*
- * ark_stubs.c — ARK_TEST syscall wrappers with fault injection.
+ * ark_stubs.c - ARK_TEST syscall wrappers with fault injection.
  *
  * Each stub increments its call counter, optionally fails on configured Nth
  * invocation, and otherwise forwards to the real libc syscall.

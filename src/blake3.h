@@ -33,34 +33,54 @@ typedef struct ark_blake3_ctx {
 /*
  * ark_blake3_init - Initialize BLAKE3 context state.
  *
- * ctx must be non-NULL. Resets all internal state for a new hash stream.
- * This function does not fail.
+ * Parameters:
+ * - ctx: writable BLAKE3 context storage.
+ *
+ * Returns no value.
+ * Failure contract: does not fail.
+ * Preconditions: ctx must be non-NULL.
  */
 void ark_blake3_init(ark_blake3_ctx_t *ctx);
 
 /*
  * ark_blake3_update - Feed message bytes into an initialized context.
  *
- * ctx must be initialized with ark_blake3_init.
- * data points to len bytes of input to hash (may be NULL when len is 0).
- * This function does not fail.
+ * Parameters:
+ * - ctx: initialized BLAKE3 context.
+ * - data: input byte buffer; may be NULL only when len is 0.
+ * - len: number of input bytes to hash.
+ *
+ * Returns no value.
+ * Failure contract: does not fail.
+ * Preconditions: ctx must be non-NULL and initialized by ark_blake3_init().
  */
 void ark_blake3_update(ark_blake3_ctx_t *ctx, const uint8_t *data, size_t len);
 
 /*
  * ark_blake3_final - Finalize the digest and write 32 output bytes.
  *
- * ctx must be initialized and may have zero or more update calls.
- * digest must point to a writable 32-byte buffer.
- * This function does not fail.
+ * Parameters:
+ * - ctx: initialized BLAKE3 context after zero or more update calls.
+ * - digest: writable 32-byte output buffer.
+ *
+ * Returns no value.
+ * Failure contract: does not fail.
+ * Preconditions: ctx and digest must be non-NULL; ctx must be initialized by
+ * ark_blake3_init().
  */
 void ark_blake3_final(ark_blake3_ctx_t *ctx, uint8_t digest[32]);
 
 /*
  * ark_blake3 - Convenience wrapper over init/update/final.
  *
- * data points to len bytes of input; digest receives exactly 32 bytes.
- * This function does not fail.
+ * Parameters:
+ * - data: input byte buffer; may be NULL only when len is 0.
+ * - len: number of input bytes to hash.
+ * - digest: writable 32-byte output buffer.
+ *
+ * Returns no value.
+ * Failure contract: does not fail.
+ * Preconditions: digest must be non-NULL.
  */
 void ark_blake3(const uint8_t *data, size_t len, uint8_t digest[32]);
 

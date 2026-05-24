@@ -1,0 +1,277 @@
+.Dd May 24, 2026
+.Dt ARK 1
+.Os
+.Sh NAME
+.Nm ark
+.Nd create and extract crash-safe archives
+.Sh SYNOPSIS
+.Nm ark
+.Cm create
+.Bk -words
+.Op Fl -hash Ar blake3 Ns | Ns Ar sha256
+.Op Fl -fast
+.Op Fl -verbose
+.Ar archive.ark
+.Ar path
+.Ek
+.Nm ark
+.Cm extract
+.Bk -words
+.Op Fl -output Ar dir
+.Op Fl -member Ar path
+.Op Fl -overwrite
+.Op Fl -verbose
+.Ar archive.ark
+.Ek
+.Nm ark
+.Cm list
+.Bk -words
+.Op Fl -verbose
+.Op Fl -human
+.Ar archive.ark
+.Ek
+.Nm ark
+.Cm verify
+.Bk -words
+.Op Fl -member Ar path
+.Op Fl -verbose
+.Ar archive.ark
+.Ek
+.Nm ark
+.Cm generate-reader
+.Op Ar output.c
+.Sh DESCRIPTION
+The
+.Nm
+utility creates, extracts, lists, verifies, and generates recovery readers for
+.Pa .ark
+archives.
+A
+.Pa .ark
+archive is a binary archive format with integrated Deflate compression,
+per-member hashes, an index hash, and crash-safe writes.
+.Pp
+The archive format stores regular files, directories, symbolic links, and
+hardlinks.
+Regular file contents are split into fixed 1MB chunks, and each chunk is
+compressed independently.
+The archive index is verified before extraction creates filesystem objects.
+.Pp
+The commands are as follows:
+.Bl -tag -width generate-reader
+.It Cm create Oo Fl -hash Ar blake3 Ns | Ns Ar sha256 Oc Oo Fl -fast Oc Oo Fl -verbose Oc Ar archive.ark Ar path
+Create
+.Ar archive.ark
+from
+.Ar path .
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl -hash Ar blake3 Ns | Ns Ar sha256
+Select the hash algorithm.
+The default is BLAKE3.
+.It Fl -fast
+Use faster Deflate parsing with a lower compression ratio.
+.It Fl -verbose
+Print each member path as it is added.
+.El
+.It Cm extract Oo Fl -output Ar dir Oc Oo Fl -member Ar path Oc Oo Fl -overwrite Oc Oo Fl -verbose Oc Ar archive.ark
+Extract members from
+.Ar archive.ark .
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl -output Ar dir
+Extract into
+.Ar dir .
+The default is the current directory.
+.It Fl -member Ar path
+Extract only the named member.
+This option may be specified more than once.
+If a selected hardlink requires its target member, the target is included
+automatically.
+.It Fl -overwrite
+Overwrite existing extraction targets.
+Without this option,
+.Nm
+checks conflicts before touching the filesystem and aborts if any target exists.
+.It Fl -verbose
+Print each member path as it is extracted.
+.El
+.It Cm list Oo Fl -verbose Oc Oo Fl -human Oc Ar archive.ark
+List members in
+.Ar archive.ark .
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl -verbose
+Print full metadata for each member.
+.It Fl -human
+Print sizes in human-readable form with
+.Fl -verbose .
+Without
+.Fl -verbose ,
+this option produces a warning.
+.El
+.It Cm verify Oo Fl -member Ar path Oc Oo Fl -verbose Oc Ar archive.ark
+Verify member data and hashes in
+.Ar archive.ark .
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl -member Ar path
+Verify only the named member.
+This option may be specified more than once.
+If a selected hardlink requires its target member for data verification, the
+target is included automatically.
+.It Fl -verbose
+Print each member path as it is verified.
+.El
+.It Cm generate-reader Op Ar output.c
+Write a standalone C11 recovery reader.
+If
+.Ar output.c
+is omitted, the output path is
+.Pa recovery.c
+in the current directory.
+.El
+.Sh FORMAT
+An archive contains, in order, a 16-byte fixed header, compressed member data,
+the index, and a 64-byte footer.
+The footer stores the index offset.
+The index stores member metadata, data offsets, compressed sizes, chunk sizes,
+and hashes.
+All multi-byte integer fields are little-endian.
+.Sh PLATFORM REQUIREMENTS
+On Linux,
+.Nm
+requires kernel 5.13 or newer for Landlock filesystem sandboxing.
+There is no unsandboxed fallback.
+On
+.Ox ,
+.Nm
+requires
+.Ox
+6.4 or newer for
+.Xr unveil 2
+and also uses
+.Xr pledge 2 .
+.Pp
+The supported architectures are x86_64 and ARM64.
+.Sh FILES
+.Bl -tag -width ARCHITECTURE.md -compact
+.It Pa ARCHITECTURE.md
+Format and architecture specification.
+.It Pa README.md
+Overview and build instructions.
+.It Pa LICENSE
+License text.
+.El
+.Sh EXIT STATUS
+.Ex -std ark
+.Pp
+The
+.Nm
+utility uses the following non-zero exit statuses:
+.Bl -tag -width Ds
+.It 1
+Usage error.
+.It 2
+Input/output or filesystem error.
+.It 3
+Archive format error.
+.It 4
+Integrity error.
+.It 5
+Security error.
+.It 6
+Source consistency error.
+.El
+.Sh EXAMPLES
+Create an archive:
+.Bd -literal -offset indent
+$ ark create archive.ark path
+.Ed
+.Pp
+Create an archive using SHA-256:
+.Bd -literal -offset indent
+$ ark create --hash sha256 archive.ark path
+.Ed
+.Pp
+List archive members:
+.Bd -literal -offset indent
+$ ark list archive.ark
+.Ed
+.Pp
+Extract into a directory:
+.Bd -literal -offset indent
+$ ark extract --output restored archive.ark
+.Ed
+.Pp
+Extract a single member:
+.Bd -literal -offset indent
+$ ark extract --member path/in/archive archive.ark
+.Ed
+.Pp
+Verify an archive:
+.Bd -literal -offset indent
+$ ark verify archive.ark
+.Ed
+.Pp
+Generate and compile a recovery reader:
+.Bd -literal -offset indent
+$ ark generate-reader recovery.c
+$ cc -O2 recovery.c -o recover
+.Ed
+.Sh KNOWN LIMITATIONS
+The following are design limitations, not defects:
+.Bl -bullet
+.It
+.Fl -overwrite
+is not rollback-safe.
+If extraction fails after replacing an existing file, the original file
+contents are lost.
+.It
+The recovery reader covers the v1 format only.
+.It
+The entire index is loaded and verified in memory.
+.It
+The writer buffers index metadata in memory until all member data is written.
+.It
+Compression is always enabled.
+There is no store-only mode.
+.It
+ACLs, SELinux contexts, and extended attributes are not preserved.
+.It
+Member paths are limited to 1023 bytes.
+.It
+Concurrent writes to the same target path are not coordinated.
+.It
+Only local POSIX filesystem behaviour is in scope.
+.It
+Numeric uid and gid values are not portable across systems.
+.It
+Existing archives cannot be appended to or updated in place.
+.It
+A crash may leave an orphaned libchevron temporary file in the target parent
+directory.
+.It
+The v1 chunk size is fixed at 1MB.
+.It
+Deflate optimisations must preserve v1 format invariants.
+.It
+Source modification detection is limited to mtime and size changes while each
+file is being read.
+.It
+On Linux 5.13 through 5.18, archives containing hardlinks are rejected before
+filesystem side effects because hardlink extraction requires Landlock ABI v2.
+.It
+Cleanup failure after an extraction error may leave residual extracted content.
+.It
+.Cm generate-reader
+writes a separate companion C source file that must be kept with long-term
+archives.
+.It
+Hardlink extraction on Linux requires Linux 5.19 or newer.
+.El
+.Sh SEE ALSO
+.Xr pledge 2 ,
+.Xr unveil 2
+.Sh AUTHORS
+.An Pawel Zelawski Aq Mt pawel@pzelawski.com

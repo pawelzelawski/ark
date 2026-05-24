@@ -2,7 +2,7 @@
 #define ARK_INTERNAL_H
 
 /*
- * ark_internal.h — shared internal types and syscall wrapper macros.
+ * ark_internal.h - shared internal types and syscall wrapper macros.
  *
  * Not part of the public API. Source files use ARK_* wrappers so test
  * builds can inject syscall failures through ARK_TEST stubs.
