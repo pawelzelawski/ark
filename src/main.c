@@ -1163,6 +1163,10 @@ static int inode_table_insert(inode_table_t *, dev_t, ino_t, const char *,
                               ark_error_t *);
 static int sandbox_apply(ark_cmd_t, const char **, int, const char *,
                          const char *, ark_error_t *);
+#ifdef __OpenBSD__
+static int openbsd_pledge_threads_precreated(const char *, const char *,
+                                             ark_error_t *);
+#endif
 static int modified_path_list_push(modified_path_list_t *, const char *,
                                    ark_error_t *);
 static void modified_path_list_free(modified_path_list_t *);
@@ -4475,13 +4479,27 @@ static int landlock_add_path_rule(int ruleset_fd, const char *path,
                                   uint64_t rights, ark_error_t *err)
 {
 	struct landlock_path_beneath_attr rule = {0};
+	struct stat st;
 	int path_fd;
 
 	path_fd = ARK_OPEN(path, O_RDONLY | O_CLOEXEC, 0);
 	if (path_fd == -1)
 		return fail_error(err, ARK_ERR_IO_OPEN,
 		                  "sandbox path open failed", path, errno);
+	if (fstat(path_fd, &st) != 0) {
+		(void)ARK_CLOSE(path_fd);
+		return fail_error(err, ARK_ERR_IO_OPEN,
+		                  "sandbox path stat failed", path, errno);
+	}
 
+	/*
+	 * NOTE: Landlock rejects READ_DIR for a regular-file parent_fd.
+	 * Single-file create sources therefore receive only READ_FILE, while
+	 * directory source roots retain READ_DIR for traversal. See
+	 * ARCHITECTURE.md section 10.4.
+	 */
+	if (S_ISREG(st.st_mode))
+		rights &= ~LANDLOCK_ACCESS_FS_READ_DIR;
 	rule.allowed_access = rights;
 	rule.parent_fd = path_fd;
 	if (syscall(SYS_landlock_add_rule, ruleset_fd,
@@ -4495,6 +4513,27 @@ static int landlock_add_path_rule(int ruleset_fd, const char *path,
 		return fail_error(err, ARK_ERR_IO_OPEN,
 		                  "sandbox path close failed", path, errno);
 	return 0;
+}
+#endif
+
+#ifdef __OpenBSD__
+/*
+ * openbsd_pledge_threads_precreated - Apply OpenBSD pledge after pool setup.
+ *
+ * ARCHITECTURE.md sections 6.3 and 10.4 require the thread pool to be created
+ * before pledge.  The documented profile includes a defensive pthread token;
+ * OpenBSD pledge(2) variants that reject that token with EINVAL can safely use
+ * the fallback profile because no pthread_create call remains after pledge.
+ */
+static int openbsd_pledge_threads_precreated(const char *with_pthread,
+                                             const char *fallback,
+                                             ark_error_t *err)
+{
+	if (pledge(with_pthread, NULL) == 0)
+		return 0;
+	if (errno == EINVAL && pledge(fallback, NULL) == 0)
+		return 0;
+	return fail_error(err, ARK_ERR_USAGE, "pledge failed", "", errno);
 }
 #endif
 
@@ -4548,9 +4587,10 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 		if (unveil(NULL, NULL) != 0)
 			return fail_error(err, ARK_ERR_USAGE,
 			                  "unveil lock failed", "", errno);
-		if (pledge("stdio rpath wpath cpath fattr pthread", NULL) != 0)
-			return fail_error(err, ARK_ERR_USAGE, "pledge failed",
-			                  "", errno);
+		if (openbsd_pledge_threads_precreated(
+		        "stdio rpath wpath cpath fattr pthread",
+		        "stdio rpath wpath cpath fattr", err) != 0)
+			return -1;
 		return 0;
 	case ARK_CMD_EXTRACT:
 		if (archive_path == NULL || dst_path == NULL)
@@ -4573,9 +4613,10 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 		if (unveil(NULL, NULL) != 0)
 			return fail_error(err, ARK_ERR_USAGE,
 			                  "unveil lock failed", "", errno);
-		if (pledge("stdio rpath wpath cpath fattr pthread", NULL) != 0)
-			return fail_error(err, ARK_ERR_USAGE, "pledge failed",
-			                  "", errno);
+		if (openbsd_pledge_threads_precreated(
+		        "stdio rpath wpath cpath fattr pthread",
+		        "stdio rpath wpath cpath fattr", err) != 0)
+			return -1;
 		return 0;
 	case ARK_CMD_LIST:
 	case ARK_CMD_VERIFY:

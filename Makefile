@@ -90,10 +90,10 @@ release: $(RECOVERY_HEADER) $(APP_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS_RELEASE) $(INCLUDES) $(APP_SRCS) -o $(ARK_BIN) $(LDFLAGS_COMMON)
 
-test: $(TEST_BIN)
+test: $(ARK_BIN) $(TEST_BIN)
 	$(TEST_BIN)
 
-test-tsan:
+test-tsan: $(ARK_BIN)
 	@command -v clang >/dev/null 2>&1 || \
 		{ echo "test-tsan: TSan requires Clang"; exit 1; }
 	@if [ "$(OS)" != "Linux" ]; then \
@@ -104,7 +104,7 @@ test-tsan:
 		-o $(TEST_BIN_TSAN) $(LDFLAGS_COMMON)
 	$(TEST_BIN_TSAN)
 
-valgrind: $(TEST_BIN_VG)
+valgrind: $(ARK_BIN) $(TEST_BIN_VG)
 	@if [ "$(OS)" != "Linux" ]; then \
 		echo "valgrind: Linux only"; exit 1; \
 	fi

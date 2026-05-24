@@ -135,7 +135,23 @@ int test_fault_deflate_truncated_stream(void);
 int test_fault_deflate_output_buffer_too_small(void);
 int test_fault_injection_no_effect_on_archive_component(void);
 int test_fault_injection_no_effect_on_deflate_component(void);
-int test_integration_stub(void);
+int test_integration_single_file(void);
+int test_integration_directory_tree(void);
+int test_integration_all_member_types(void);
+int test_integration_empty_file(void);
+int test_integration_round_trip_blake3(void);
+int test_integration_round_trip_sha256(void);
+int test_integration_mtime_preserved(void);
+int test_integration_mtime_pre_epoch(void);
+int test_integration_verify_detects_corruption(void);
+int test_integration_verify_detects_index_corruption(void);
+int test_integration_overwrite(void);
+int test_integration_overwrite_symlink(void);
+int test_integration_selective_member(void);
+int test_integration_list(void);
+int test_integration_generate_reader(void);
+int test_integration_deterministic(void);
+int test_integration_large_archive(void);
 int test_ring_normal_produce_consume(void);
 int test_ring_out_of_order_completion(void);
 int test_ring_abort_sentinel_written(void);
@@ -378,7 +394,25 @@ static const test_case_t g_tests[] = {
     {"test_create_deterministic_multi_worker_matches_single",
      test_create_deterministic_multi_worker_matches_single},
     {"test_extract_stub", test_extract_stub},
-    {"test_integration_stub", test_integration_stub},
+    {"test_integration_single_file", test_integration_single_file},
+    {"test_integration_directory_tree", test_integration_directory_tree},
+    {"test_integration_all_member_types", test_integration_all_member_types},
+    {"test_integration_empty_file", test_integration_empty_file},
+    {"test_integration_round_trip_blake3", test_integration_round_trip_blake3},
+    {"test_integration_round_trip_sha256", test_integration_round_trip_sha256},
+    {"test_integration_mtime_preserved", test_integration_mtime_preserved},
+    {"test_integration_mtime_pre_epoch", test_integration_mtime_pre_epoch},
+    {"test_integration_verify_detects_corruption",
+     test_integration_verify_detects_corruption},
+    {"test_integration_verify_detects_index_corruption",
+     test_integration_verify_detects_index_corruption},
+    {"test_integration_overwrite", test_integration_overwrite},
+    {"test_integration_overwrite_symlink", test_integration_overwrite_symlink},
+    {"test_integration_selective_member", test_integration_selective_member},
+    {"test_integration_list", test_integration_list},
+    {"test_integration_generate_reader", test_integration_generate_reader},
+    {"test_integration_deterministic", test_integration_deterministic},
+    {"test_integration_large_archive", test_integration_large_archive},
 };
 
 int main(void)

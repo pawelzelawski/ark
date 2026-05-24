@@ -3,8 +3,8 @@
 ## Status Overview
 
 **Last Updated:** 2026-05-10
-**Current Phase:** Phase 7 - Test suite completion (not started)
-**Next Task:** Phase 7.1 - Integration tests
+**Current Phase:** Phase 7 - Test suite completion (in progress)
+**Next Task:** Phase 7.2 - Coverage verification
 
 ### Phase Summary
 
@@ -16,7 +16,7 @@
 | 4 | Archive format | DONE | 4.1-4.5 complete | archive.h types, write path, read path, and §8.3 validation coverage |
 | 5 | CLI: core operations | DONE | 5.1-5.10 complete | Single-threaded create/extract/list/verify/generate-reader; sandboxing |
 | 6 | Thread pool | DONE | 6.1-6.7 complete | Ring buffer, workers, cancellation, error propagation; TSan required; parallel correctness confirmed |
-| 7 | Test suite completion | NOT STARTED | - | Integration tests, coverage verification |
+| 7 | Test suite completion | IN PROGRESS | 7.1 complete | Integration tests complete; coverage verification pending |
 | 8 | Hardening and release | NOT STARTED | - | Valgrind, TSan final, static analysis, README |
 
 ### Quality Milestones
@@ -46,8 +46,8 @@
 | M21 | Non-file member types: hash of empty byte sequence stored and verified | DONE |
 | M22 | --overwrite: existing target unlinked before open; no stale tail bytes | DONE |
 | M23 | Cleanup: all filesystem objects removed after any fatal extraction error, including implicitly created dirs | DONE |
-| M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly (Phase 7 integration) | NOT STARTED |
-| M25 | Deterministic archives: identical source content archived twice produces bit-identical archives (Phase 7 integration) | NOT STARTED |
+| M24 | generate-reader: output is valid C11 that compiles with `cc -O2` and extracts correctly (Phase 7 integration) | DONE |
+| M25 | Deterministic archives: identical source content archived twice produces bit-identical archives (Phase 7 integration) | DONE |
 | M26 | Valgrind clean on Linux x86_64 and ARM64 | NOT STARTED |
 | M27 | ASan/UBSan clean on Linux | NOT STARTED |
 | M28 | TSan clean on Linux (final sweep) | NOT STARTED |
@@ -798,14 +798,14 @@ in TESTING.md §11 is fully populated.
 
 ### Tasks
 
-**7.1 - Integration tests**
-- [ ] Implement all integration tests per TESTING.md §8
-- [ ] `test_integration_generate_reader`: verify output compiles with
+**7.1 - Integration tests** ✓ DONE
+- [x] Implement all integration tests per TESTING.md §8
+- [x] `test_integration_generate_reader`: verify output compiles with
   `cc -O2 recovery.c -o recover && ./recover archive.ark`; extracted
   content matches source
-- [ ] `test_integration_deterministic`: archive same source twice; compare
+- [x] `test_integration_deterministic`: archive same source twice; compare
   archives byte-by-byte; must be identical
-- [ ] `test_integration_large_archive`: 1000 files of mixed sizes; create,
+- [x] `test_integration_large_archive`: 1000 files of mixed sizes; create,
   verify, extract; all clean; measures wall time for regression reference
 
 **7.2 - Coverage verification**
