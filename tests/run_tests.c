@@ -167,6 +167,7 @@ int test_fault_extract_lchown(void);
 int test_fault_extract_chmod(void);
 int test_fault_extract_utimensat(void);
 int test_fault_extract_unlink_overwrite(void);
+int test_fault_extract_cleanup_track_alloc(void);
 int test_fault_extract_cleanup_unlink(void);
 int test_fault_extract_cleanup_rmdir(void);
 int test_integration_single_file(void);
@@ -184,6 +185,7 @@ int test_integration_overwrite_symlink(void);
 int test_integration_selective_member(void);
 int test_integration_list(void);
 int test_integration_generate_reader(void);
+int test_integration_generate_reader_no_follow(void);
 int test_integration_deterministic(void);
 int test_integration_large_archive(void);
 int test_ring_normal_produce_consume(void);
@@ -194,10 +196,15 @@ int test_ring_abort_does_not_block(void);
 int test_worker_error_stores_first(void);
 int test_worker_error_subsequent_discarded(void);
 int test_worker_error_then_sentinel(void);
+int test_worker_error_published_complete(void);
 int test_io_thread_reads_worker_error(void);
 int test_worker_error_triggers_cancel(void);
 int test_cancel_workers_exit_cleanly(void);
 int test_cancel_join_completes(void);
+int test_pool_init_create_failure_wakes_workers(void);
+int test_pool_init_create_failure_cleans_up(void);
+int test_ring_init_sync_failure_cleans_up(void);
+int test_pool_init_sync_failure_cleans_up(void);
 int test_quiescence_sequence_order(void);
 int test_no_resource_leak_on_cancel(void);
 int test_no_cleanup_race(void);
@@ -419,6 +426,8 @@ static const test_case_t g_tests[] = {
     {"test_fault_extract_utimensat", test_fault_extract_utimensat},
     {"test_fault_extract_unlink_overwrite",
      test_fault_extract_unlink_overwrite},
+    {"test_fault_extract_cleanup_track_alloc",
+     test_fault_extract_cleanup_track_alloc},
     {"test_fault_extract_cleanup_unlink", test_fault_extract_cleanup_unlink},
     {"test_fault_extract_cleanup_rmdir", test_fault_extract_cleanup_rmdir},
     {"test_edge_empty_archive", test_edge_empty_archive},
@@ -452,10 +461,20 @@ static const test_case_t g_tests[] = {
     {"test_worker_error_subsequent_discarded",
      test_worker_error_subsequent_discarded},
     {"test_worker_error_then_sentinel", test_worker_error_then_sentinel},
+    {"test_worker_error_published_complete",
+     test_worker_error_published_complete},
     {"test_io_thread_reads_worker_error", test_io_thread_reads_worker_error},
     {"test_worker_error_triggers_cancel", test_worker_error_triggers_cancel},
     {"test_cancel_workers_exit_cleanly", test_cancel_workers_exit_cleanly},
     {"test_cancel_join_completes", test_cancel_join_completes},
+    {"test_pool_init_create_failure_wakes_workers",
+     test_pool_init_create_failure_wakes_workers},
+    {"test_pool_init_create_failure_cleans_up",
+     test_pool_init_create_failure_cleans_up},
+    {"test_ring_init_sync_failure_cleans_up",
+     test_ring_init_sync_failure_cleans_up},
+    {"test_pool_init_sync_failure_cleans_up",
+     test_pool_init_sync_failure_cleans_up},
     {"test_quiescence_sequence_order", test_quiescence_sequence_order},
     {"test_no_resource_leak_on_cancel", test_no_resource_leak_on_cancel},
     {"test_no_cleanup_race", test_no_cleanup_race},
@@ -481,6 +500,8 @@ static const test_case_t g_tests[] = {
     {"test_integration_selective_member", test_integration_selective_member},
     {"test_integration_list", test_integration_list},
     {"test_integration_generate_reader", test_integration_generate_reader},
+    {"test_integration_generate_reader_no_follow",
+     test_integration_generate_reader_no_follow},
     {"test_integration_deterministic", test_integration_deterministic},
     {"test_integration_large_archive", test_integration_large_archive},
 };

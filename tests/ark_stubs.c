@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include "ark_internal.h"
 
@@ -354,4 +355,88 @@ ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz)
 		return (-1);
 	}
 	return (readlink(path, buf, bufsiz));
+}
+
+/*
+ * ark_stub_sleep_ms - Sleep for ms milliseconds, resuming after EINTR.
+ */
+static void ark_stub_sleep_ms(int ms)
+{
+	struct timespec ts;
+
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+		;
+}
+
+/*
+ * ark_stub_pthread_create - Fault-injectable wrapper for worker creation.
+ *
+ * When cond_wait_delay_ms is set, an injected failure is returned only after
+ * an already started worker has reached ARK_PTHREAD_COND_WAIT, so the pool
+ * startup failure path runs while that worker is inside its wait window.
+ */
+int ark_stub_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                            void *(*start)(void *), void *arg)
+{
+	ark_fault.pthread_create_calls++;
+	if (!fault_should_fail(ARK_FAULT_PTHREAD_CREATE,
+	                       ark_fault.pthread_create_calls))
+		return (pthread_create(thread, attr, start, arg));
+	if (__atomic_load_n(&ark_fault.cond_wait_delay_ms, __ATOMIC_ACQUIRE) >
+	    0) {
+		int waited_ms;
+
+		/* Bounded so a broken handshake cannot hang the suite here. */
+		for (waited_ms = 0;
+		     waited_ms < 5000 &&
+		     __atomic_load_n(&ark_fault.cond_wait_entered,
+		                     __ATOMIC_ACQUIRE) == 0;
+		     waited_ms++)
+			ark_stub_sleep_ms(1);
+	}
+	return (ark_fault.errno_value);
+}
+
+/*
+ * ark_stub_pthread_cond_wait - Condition wait with an optional delay hook.
+ *
+ * Called from worker threads: touches ark_fault only through atomics.
+ */
+int ark_stub_pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+	int delay_ms;
+	int expected;
+
+	delay_ms =
+	    __atomic_load_n(&ark_fault.cond_wait_delay_ms, __ATOMIC_ACQUIRE);
+	expected = 0;
+	if (delay_ms > 0 && __atomic_compare_exchange_n(
+	                        &ark_fault.cond_wait_entered, &expected, 1, 0,
+	                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		ark_stub_sleep_ms(delay_ms);
+	return (pthread_cond_wait(cond, mutex));
+}
+
+/* ark_stub_pthread_mutex_init - Fault-injectable mutex initialisation. */
+int ark_stub_pthread_mutex_init(pthread_mutex_t *mutex,
+                                const pthread_mutexattr_t *attr)
+{
+	ark_fault.pthread_mutex_init_calls++;
+	if (fault_should_fail(ARK_FAULT_PTHREAD_MUTEX_INIT,
+	                      ark_fault.pthread_mutex_init_calls))
+		return (ark_fault.errno_value);
+	return (pthread_mutex_init(mutex, attr));
+}
+
+/* ark_stub_pthread_cond_init - Fault-injectable condition initialisation. */
+int ark_stub_pthread_cond_init(pthread_cond_t *cond,
+                               const pthread_condattr_t *attr)
+{
+	ark_fault.pthread_cond_init_calls++;
+	if (fault_should_fail(ARK_FAULT_PTHREAD_COND_INIT,
+	                      ark_fault.pthread_cond_init_calls))
+		return (ark_fault.errno_value);
+	return (pthread_cond_init(cond, attr));
 }

@@ -1364,7 +1364,13 @@ static int extract_regular(const uint8_t *file, size_t file_size,
 
 	if (mkdirs_for_path(m->path) != 0)
 		return -1;
-	fd = open(m->path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	/*
+	 * SAFETY: O_NOFOLLOW so a symlink already at the member path is not
+	 * followed; open fails instead of writing outside the destination.
+	 * See ARCHITECTURE.md section 14.2.
+	 */
+	fd = open(m->path,
+	          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (fd == -1)
 		return -1;
 
@@ -1481,7 +1487,10 @@ static int extract_members(const uint8_t *file, size_t file_size,
 
 				if (mkdirs_for_path(m->path) != 0)
 					return -1;
-				fd = open(m->path, O_WRONLY | O_CREAT | O_TRUNC,
+				/* SAFETY: O_NOFOLLOW as in extract_regular. */
+				fd = open(m->path,
+				          O_WRONLY | O_CREAT | O_TRUNC |
+				              O_NOFOLLOW | O_CLOEXEC,
 				          0600);
 				if (fd == -1)
 					return -1;

@@ -1017,6 +1017,70 @@ cleanup:
 	(void)remove_tree(root);
 	return rc;
 }
+/*
+ * test_integration_generate_reader_no_follow - The recovery reader must not
+ * write through a symlink that already exists at a regular-file member path
+ * (non-empty and empty file paths). Recovery fails instead and the symlink
+ * target is left unchanged. See ARCHITECTURE.md sections 14.2 and 15.2.
+ */
+int test_integration_generate_reader_no_follow(void)
+{
+	static const char *const members[] = {"data.txt", "empty.txt"};
+	char root[PATH_MAX], src[PATH_MAX], archive[PATH_MAX];
+	char recovery_c[PATH_MAX], recover_bin[PATH_MAX];
+	char victim[PATH_MAX], victim_ref[PATH_MAX];
+	char out[PATH_MAX], file[PATH_MAX], link_path[PATH_MAX];
+	char *gen_argv[] = {(char *)g_ark_bin, "generate-reader", recovery_c,
+	                    NULL};
+	char *cc_argv[] = {"cc", "-O2", recovery_c, "-o", recover_bin, NULL};
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	size_t i;
+	int rc;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(archive, sizeof(archive), root, "reader.ark") != 0 ||
+	    path_join(recovery_c, sizeof(recovery_c), root, "recovery.c") !=
+	        0 ||
+	    path_join(recover_bin, sizeof(recover_bin), root, "recover") != 0 ||
+	    path_join(victim, sizeof(victim), root, "victim.txt") != 0 ||
+	    path_join(victim_ref, sizeof(victim_ref), root, "victim.ref") != 0)
+		goto cleanup;
+	if (mkdir(src, 0700) != 0 || write_text_file(victim, "victim\n") != 0 ||
+	    write_text_file(victim_ref, "victim\n") != 0)
+		goto cleanup;
+	if (path_join(file, sizeof(file), src, "data.txt") != 0 ||
+	    write_text_file(file, "recovered data\n") != 0 ||
+	    path_join(file, sizeof(file), src, "empty.txt") != 0 ||
+	    write_text_file(file, "") != 0)
+		goto cleanup;
+	if (create_archive(archive, src, NULL) != 0)
+		goto cleanup;
+	if (run_ark(gen_argv, 0, NULL, NULL) != 0)
+		goto cleanup;
+	if (run_program(cc_argv, NULL, NULL, NULL) != 0)
+		goto cleanup;
+	for (i = 0U; i < sizeof(members) / sizeof(members[0]); i++) {
+		char name[32];
+
+		(void)snprintf(name, sizeof(name), "out%zu", i);
+		if (path_join(out, sizeof(out), root, name) != 0 ||
+		    mkdir(out, 0700) != 0 ||
+		    path_join(link_path, sizeof(link_path), out, members[i]) !=
+		        0 ||
+		    symlink(victim, link_path) != 0)
+			goto cleanup;
+		if (run_program(recover_argv, out, NULL, "/dev/null") == 0)
+			goto cleanup;
+		if (!files_equal(victim, victim_ref))
+			goto cleanup;
+	}
+	rc = 0;
+cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
 int test_integration_deterministic(void)
 {
 	char root[PATH_MAX], src[PATH_MAX], a[PATH_MAX], b[PATH_MAX];

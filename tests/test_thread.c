@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 #include "archive.h"
+#include "ark_internal.h"
 #include "deflate.h"
 
 typedef struct ring_buf ring_buf_t;
@@ -41,6 +43,8 @@ void pool_test_cancel(ark_pool_t *);
 void pool_test_shutdown(ark_pool_t *);
 int pool_get_cancel_flag(const ark_pool_t *);
 ark_error_t pool_get_shared_err(const ark_pool_t *);
+void pool_test_store_error(ark_pool_t *, const ark_error_t *);
+void pool_test_reset_shared_err(ark_pool_t *);
 int pool_get_sentinel_count(const ark_pool_t *);
 unsigned int pool_get_error_event(const ark_pool_t *);
 unsigned int pool_get_abort_event(const ark_pool_t *);
@@ -630,6 +634,107 @@ int test_worker_error_then_sentinel(void)
 	return 0;
 }
 
+#define SHARED_ERR_WRITERS 4
+#define SHARED_ERR_ROUNDS 200
+
+typedef struct {
+	ark_pool_t *pool;
+	int *start;
+	ark_error_t err;
+} shared_err_writer_t;
+
+/*
+ * shared_err_payload - Fill one self-consistent error payload for writer k.
+ */
+static void shared_err_payload(ark_error_t *e, int k)
+{
+	*e = (ark_error_t){0};
+	e->code = ARK_ERR_FMT_DATA;
+	e->sys_errno = 100 + k;
+	memset(e->msg, 'a' + k, sizeof(e->msg) - 1U);
+	memset(e->path, 'A' + k, sizeof(e->path) - 1U);
+}
+
+/*
+ * shared_err_writer - Wait for the start flag, then store one error.
+ */
+static void *shared_err_writer(void *arg)
+{
+	shared_err_writer_t *w = arg;
+
+	/* Yield while waiting: Valgrind runs one guest thread at a time, and
+	 * a pure spin would hold the CPU for a whole scheduling slice. */
+	while (__atomic_load_n(w->start, __ATOMIC_ACQUIRE) == 0)
+		(void)sched_yield();
+	pool_test_store_error(w->pool, &w->err);
+	return NULL;
+}
+
+/*
+ * test_worker_error_published_complete - Concurrent first-error stores while
+ * the I/O side polls: any error the reader sees must be one writer's whole
+ * payload, never a partly copied one. See ARCHITECTURE.md section 6.3.
+ */
+int test_worker_error_published_complete(void)
+{
+	shared_err_writer_t writers[SHARED_ERR_WRITERS];
+	pthread_t tids[SHARED_ERR_WRITERS];
+	const ark_error_t zero = {0};
+	ark_error_t err = {0};
+	ark_error_t seen;
+	ark_error_t want;
+	ark_pool_t *pool;
+	int start;
+	int round;
+	int started;
+	int rc;
+
+	pool = pool_test_init(1, 0, &err);
+	if (pool == NULL)
+		return 1;
+	rc = 0;
+	for (round = 0; round < SHARED_ERR_ROUNDS && rc == 0; round++) {
+		pool_test_reset_shared_err(pool);
+		start = 0;
+		for (started = 0; started < SHARED_ERR_WRITERS; started++) {
+			writers[started].pool = pool;
+			writers[started].start = &start;
+			shared_err_payload(&writers[started].err, started);
+			if (pthread_create(&tids[started], NULL,
+			                   shared_err_writer,
+			                   &writers[started]) != 0) {
+				rc = 1;
+				break;
+			}
+		}
+		__atomic_store_n(&start, 1, __ATOMIC_RELEASE);
+		if (rc == 0) {
+			int k;
+
+			/* Poll until anything is visible; a snapshot taken
+			 * during the copy shows mixed or partly zero bytes. */
+			for (;;) {
+				seen = pool_get_shared_err(pool);
+				if (memcmp(&seen, &zero, sizeof(zero)) != 0)
+					break;
+				(void)sched_yield();
+			}
+			k = seen.sys_errno - 100;
+			if (k < 0 || k >= SHARED_ERR_WRITERS) {
+				rc = 1;
+			} else {
+				shared_err_payload(&want, k);
+				if (memcmp(&seen, &want, sizeof(want)) != 0)
+					rc = 1;
+			}
+		}
+		while (started > 0)
+			(void)pthread_join(tids[--started], NULL);
+	}
+	pool_test_shutdown(pool);
+	return rc;
+}
+
 int test_io_thread_reads_worker_error(void)
 {
 	ark_error_t err = {0};
@@ -771,6 +876,132 @@ int test_cancel_join_completes(void)
 	return 0;
 }
 
+/*
+ * test_pool_init_create_failure_wakes_workers - Worker creation fails while
+ * an earlier worker is between its queue-empty check and its condition wait.
+ *
+ * The stub hooks hold the started worker in that window until the failing
+ * ARK_PTHREAD_CREATE returns, so a cancellation broadcast sent without the
+ * pool mutex is lost and pool_init blocks forever in pthread_join.
+ * See ARCHITECTURE.md section 6.3.
+ */
+int test_pool_init_create_failure_wakes_workers(void)
+{
+	ark_error_t err = {0};
+	ark_pool_t *pool;
+	int entered;
+
+	fault_inject(ARK_FAULT_PTHREAD_CREATE, 2, EAGAIN);
+	__atomic_store_n(&ark_fault.cond_wait_delay_ms, 50, __ATOMIC_RELEASE);
+	pool = pool_test_init(2, 0, &err);
+	entered =
+	    __atomic_load_n(&ark_fault.cond_wait_entered, __ATOMIC_ACQUIRE);
+	fault_reset();
+	if (pool != NULL) {
+		pool_test_shutdown(pool);
+		return 1;
+	}
+	if (err.code != ARK_ERR_IO_ALLOC || err.sys_errno != EAGAIN)
+		return 1;
+	/* The handshake must have run, or the window was not exercised. */
+	return entered == 1 ? 0 : 1;
+}
+
+/*
+ * test_pool_init_create_failure_cleans_up - Worker creation fails at the
+ * first and at a later worker; pool_init must report ARK_ERR_IO_ALLOC and
+ * release everything (checked by ASan/Valgrind leak detection).
+ */
+int test_pool_init_create_failure_cleans_up(void)
+{
+	static const int fail_on[] = {1, 3};
+	size_t i;
+
+	for (i = 0U; i < sizeof(fail_on) / sizeof(fail_on[0]); i++) {
+		ark_error_t err;
+		ark_pool_t *pool;
+
+		err = (ark_error_t){0};
+		fault_inject(ARK_FAULT_PTHREAD_CREATE, fail_on[i], EAGAIN);
+		pool = pool_test_init(4, 0, &err);
+		fault_reset();
+		if (pool != NULL) {
+			pool_test_shutdown(pool);
+			return 1;
+		}
+		if (err.code != ARK_ERR_IO_ALLOC || err.sys_errno != EAGAIN)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * test_ring_init_sync_failure_cleans_up - Ring mutex or condition
+ * initialisation fails after every slot payload is allocated; ring_buf_init
+ * must report ARK_ERR_IO_ALLOC and free the payloads (checked by ASan and
+ * Valgrind leak detection).
+ */
+int test_ring_init_sync_failure_cleans_up(void)
+{
+	static const int which[] = {ARK_FAULT_PTHREAD_MUTEX_INIT,
+	                            ARK_FAULT_PTHREAD_COND_INIT};
+	size_t i;
+
+	for (i = 0U; i < sizeof(which) / sizeof(which[0]); i++) {
+		ark_error_t err;
+		ring_buf_t *ring;
+
+		err = (ark_error_t){0};
+		fault_inject(which[i], 1, EAGAIN);
+		ring = ring_buf_init(4U, &err);
+		fault_reset();
+		if (ring != NULL) {
+			ring_buf_free(ring);
+			return 1;
+		}
+		if (err.code != ARK_ERR_IO_ALLOC || err.sys_errno != EAGAIN)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * test_pool_init_sync_failure_cleans_up - Every mutex and condition
+ * initialisation in pool_init (pool and ring) fails in turn; pool_init must
+ * report ARK_ERR_IO_ALLOC and release everything.
+ */
+int test_pool_init_sync_failure_cleans_up(void)
+{
+	static const struct {
+		int which;
+		int fail_on;
+	} cases[] = {
+	    {ARK_FAULT_PTHREAD_MUTEX_INIT, 1}, /* pool->mutex */
+	    {ARK_FAULT_PTHREAD_COND_INIT, 1},  /* pool->cv_not_empty */
+	    {ARK_FAULT_PTHREAD_COND_INIT, 2},  /* pool->cv_not_full */
+	    {ARK_FAULT_PTHREAD_MUTEX_INIT, 2}, /* ring->mutex */
+	    {ARK_FAULT_PTHREAD_COND_INIT, 3},  /* ring->cond */
+	};
+	size_t i;
+
+	for (i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		ark_error_t err;
+		ark_pool_t *pool;
+
+		err = (ark_error_t){0};
+		fault_inject(cases[i].which, cases[i].fail_on, EAGAIN);
+		pool = pool_test_init(2, 0, &err);
+		fault_reset();
+		if (pool != NULL) {
+			pool_test_shutdown(pool);
+			return 1;
+		}
+		if (err.code != ARK_ERR_IO_ALLOC || err.sys_errno != EAGAIN)
+			return 1;
+	}
+	return 0;
+}
+
 int test_quiescence_sequence_order(void)
 {
 	ark_error_t err = {0};
@@ -780,12 +1011,6 @@ int test_quiescence_sequence_order(void)
 	const char *tmp;
 	uint8_t *data;
 	size_t len;
-	unsigned int step;
-	unsigned int cancel_step;
-	unsigned int stop_step;
-	unsigned int join_step;
-	unsigned int close_step;
-	unsigned int cleanup_step;
 	int fd;
 	int is_abort;
 	ark_err_t worker_err;
@@ -828,11 +1053,11 @@ int test_quiescence_sequence_order(void)
 
 	/*
 	 * SAFETY: test the complete quiescence order from ARCHITECTURE.md
-	 * section 14.3: cancel, stop submit, join, close fd, cleanup.
+	 * section 14.3: cancel, stop submit, join, close fd, cleanup. The
+	 * order is fixed by the call sequence below; each step is checked as
+	 * it happens.
 	 */
-	step = 0U;
 	pool_test_cancel(pool);
-	cancel_step = ++step;
 	if (pool_get_cancel_flag(pool) == 0) {
 		pool_test_shutdown(pool);
 		(void)close(fd);
@@ -846,21 +1071,12 @@ int test_quiescence_sequence_order(void)
 		(void)remove_tree(tmp);
 		return 1;
 	}
-	stop_step = ++step;
 	pool_test_shutdown(pool);
-	join_step = ++step;
 	if (close(fd) != 0) {
 		(void)remove_tree(tmp);
 		return 1;
 	}
-	close_step = ++step;
 	if (unlink(cleanup_file) != 0) {
-		(void)remove_tree(tmp);
-		return 1;
-	}
-	cleanup_step = ++step;
-	if (!(cancel_step < stop_step && stop_step < join_step &&
-	      join_step < close_step && close_step < cleanup_step)) {
 		(void)remove_tree(tmp);
 		return 1;
 	}

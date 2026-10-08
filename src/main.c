@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,7 +150,8 @@ enum ark_cli_fault_which {
 	ARK_CLI_FAULT_CREATE_OPEN_ARCHIVE,
 	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
 	ARK_CLI_FAULT_CREATE_COMMIT,
-	ARK_CLI_FAULT_CREATE_MARK_MODIFIED
+	ARK_CLI_FAULT_CREATE_MARK_MODIFIED,
+	ARK_CLI_FAULT_CLEANUP_GROW
 };
 
 static ark_cli_fault_t ark_cli_fault;
@@ -165,8 +167,18 @@ typedef enum {
 	ARK_POOL_DECOMPRESS,
 } ark_pool_mode_t;
 
+/*
+ * Shared first-worker error. state moves EMPTY -> CLAIMED -> READY exactly
+ * once; error may be read only after an acquire load observes READY.
+ */
+enum {
+	ARK_SHARED_ERR_EMPTY = 0,
+	ARK_SHARED_ERR_CLAIMED,
+	ARK_SHARED_ERR_READY,
+};
+
 typedef struct {
-	_Atomic int recorded;
+	_Atomic int state;
 	ark_error_t error;
 } ark_shared_err_t;
 
@@ -242,6 +254,7 @@ int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
 static void ring_buf_release(ring_buf_t *, uint64_t);
 void ring_buf_free(ring_buf_t *);
 static void error_store_once(ark_shared_err_t *, const ark_error_t *);
+static int shared_err_get(const ark_shared_err_t *, ark_error_t *);
 static size_t pool_input_cap(ark_pool_mode_t);
 static size_t pool_output_cap(ark_pool_mode_t);
 static ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
@@ -254,6 +267,21 @@ static void *worker_decompress(void *);
 
 static int fail_error(ark_error_t *, ark_err_t, const char *, const char *,
                       int);
+
+/*
+ * ring_buf_free_storage - Free a partly built ring's heap storage.
+ *
+ * Frees the first n_data slot payloads, the slot array and the ring. Used by
+ * ring_buf_init failure paths, where the ring mutex and condition are not
+ * (both) initialised, so ring_buf_free cannot be used.
+ */
+static void ring_buf_free_storage(ring_buf_t *ring, size_t n_data)
+{
+	while (n_data > 0U)
+		free(ring->slots[--n_data].data);
+	free(ring->slots);
+	free(ring);
+}
 
 /*
  * ring_buf_init - Allocate a fixed-size ring buffer for worker results.
@@ -302,10 +330,7 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 		 * ring_buf_free. */
 		ring->slots[i].data = malloc(ring->slots[i].cap);
 		if (ring->slots[i].data == NULL) {
-			while (i > 0U)
-				free(ring->slots[--i].data);
-			free(ring->slots);
-			free(ring);
+			ring_buf_free_storage(ring, i);
 			(void)fail_error(err, ARK_ERR_IO_ALLOC,
 			                 "ring payload allocation failed", "",
 			                 0);
@@ -314,19 +339,17 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 		ring->slots[i].seq = UINT64_MAX;
 	}
 
-	rc = pthread_mutex_init(&ring->mutex, NULL);
+	rc = ARK_PTHREAD_MUTEX_INIT(&ring->mutex, NULL);
 	if (rc != 0) {
-		free(ring->slots);
-		free(ring);
+		ring_buf_free_storage(ring, n_slots);
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "ring mutex initialisation failed", "", rc);
 		return NULL;
 	}
-	rc = pthread_cond_init(&ring->cond, NULL);
+	rc = ARK_PTHREAD_COND_INIT(&ring->cond, NULL);
 	if (rc != 0) {
 		(void)pthread_mutex_destroy(&ring->mutex);
-		free(ring->slots);
-		free(ring);
+		ring_buf_free_storage(ring, n_slots);
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "ring condition initialisation failed", "",
 		                 rc);
@@ -373,7 +396,7 @@ int ring_buf_write(ring_buf_t *ring, uint64_t seq, const uint8_t *data,
 		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
 		                  "", rc);
 	while (slot->ready && slot->seq != seq) {
-		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		rc = ARK_PTHREAD_COND_WAIT(&ring->cond, &ring->mutex);
 		if (rc != 0) {
 			(void)pthread_mutex_unlock(&ring->mutex);
 			return fail_error(err, ARK_ERR_USAGE,
@@ -434,7 +457,7 @@ int ring_buf_abort(ring_buf_t *ring, uint64_t seq, ark_err_t worker_err,
 		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
 		                  "", rc);
 	while (slot->ready && slot->seq != seq) {
-		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		rc = ARK_PTHREAD_COND_WAIT(&ring->cond, &ring->mutex);
 		if (rc != 0) {
 			(void)pthread_mutex_unlock(&ring->mutex);
 			return fail_error(err, ARK_ERR_USAGE,
@@ -491,7 +514,7 @@ int ring_buf_read(ring_buf_t *ring, uint64_t seq, uint8_t **data, size_t *len,
 		return fail_error(err, ARK_ERR_USAGE, "ring mutex lock failed",
 		                  "", rc);
 	while (!slot->ready || slot->seq != seq) {
-		rc = pthread_cond_wait(&ring->cond, &ring->mutex);
+		rc = ARK_PTHREAD_COND_WAIT(&ring->cond, &ring->mutex);
 		if (rc != 0) {
 			(void)pthread_mutex_unlock(&ring->mutex);
 			return fail_error(err, ARK_ERR_USAGE,
@@ -566,20 +589,56 @@ static void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
 	if (shared == NULL || err == NULL)
 		return;
 
-	expected = 0;
+	expected = ARK_SHARED_ERR_EMPTY;
 	/* NOTE: use compiler atomics directly so this path does not depend on
 	 * <stdatomic.h> header availability across toolchains; cast to int *
 	 * matches __atomic_compare_exchange_n argument requirements. */
-	if (!__atomic_compare_exchange_n((int *)&shared->recorded, &expected, 1,
-	                                 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+	if (!__atomic_compare_exchange_n((int *)&shared->state, &expected,
+	                                 ARK_SHARED_ERR_CLAIMED, 0,
+	                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		return;
 
 	/*
-	 * SAFETY: only the compare-and-swap winner writes shared->error.
+	 * SAFETY: only the compare-and-swap winner writes shared->error, and
+	 * it marks the copy READY with a release store only after the copy
+	 * is complete. Readers that see CLAIMED must not read error yet.
 	 * This preserves first-error-wins semantics for worker-to-I/O error
 	 * propagation from ARCHITECTURE.md section 6.3.
 	 */
 	shared->error = *err;
+	__atomic_store_n((int *)&shared->state, ARK_SHARED_ERR_READY,
+	                 __ATOMIC_RELEASE);
+}
+
+/*
+ * shared_err_get - Copy the published first worker error, if any.
+ *
+ * If a worker has claimed the slot but not finished copying, waits for
+ * the copy: the claimer holds no lock and only copies one struct, so the
+ * wait is short and the first error still wins over later abort codes.
+ *
+ * Returns 1 and fills out when an error was published, 0 otherwise (out is
+ * left unchanged).
+ *
+ * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.3.
+ */
+static int shared_err_get(const ark_shared_err_t *shared, ark_error_t *out)
+{
+	int state;
+
+	if (shared == NULL || out == NULL)
+		return 0;
+	for (;;) {
+		state = __atomic_load_n((const int *)&shared->state,
+		                        __ATOMIC_ACQUIRE);
+		if (state != ARK_SHARED_ERR_CLAIMED)
+			break;
+		(void)sched_yield();
+	}
+	if (state != ARK_SHARED_ERR_READY)
+		return 0;
+	*out = shared->error;
+	return 1;
 }
 
 /*
@@ -590,8 +649,7 @@ static void error_store_once(ark_shared_err_t *shared, const ark_error_t *err)
  * decompress workers receive compressed chunks, which may be larger for
  * incompressible stored-block fallback.
  */
-static size_t
-pool_input_cap(ark_pool_mode_t mode)
+static size_t pool_input_cap(ark_pool_mode_t mode)
 {
 	if (mode == ARK_POOL_DECOMPRESS)
 		return ark_deflate_bound(ARK_CHUNK_SIZE);
@@ -604,8 +662,7 @@ pool_input_cap(ark_pool_mode_t mode)
  * Compress workers may emit up to ark_deflate_bound(ARK_CHUNK_SIZE) bytes;
  * decompress workers emit at most one uncompressed ARK chunk.
  */
-static size_t
-pool_output_cap(ark_pool_mode_t mode)
+static size_t pool_output_cap(ark_pool_mode_t mode)
 {
 	if (mode == ARK_POOL_DECOMPRESS)
 		return ARK_CHUNK_SIZE;
@@ -666,7 +723,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "thread pool worker arg allocation failed", "",
 		                 0);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
@@ -686,7 +743,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 				free(pool->worker_args[i].dst);
 			}
 			free(pool->worker_args);
-			free(pool->workers);
+			free((void *)pool->workers);
 			free(pool);
 			(void)fail_error(
 			    err, ARK_ERR_IO_ALLOC,
@@ -708,7 +765,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args[i].dst);
 		}
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
@@ -727,7 +784,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 				free(pool->worker_args[i].dst);
 			}
 			free(pool->worker_args);
-			free(pool->workers);
+			free((void *)pool->workers);
 			free(pool);
 			(void)fail_error(
 			    err, ARK_ERR_IO_ALLOC,
@@ -752,12 +809,12 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args[i].dst);
 		}
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
 
-	rc = pthread_mutex_init(&pool->mutex, NULL);
+	rc = ARK_PTHREAD_MUTEX_INIT(&pool->mutex, NULL);
 	if (rc != 0) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "thread pool mutex initialisation failed", "",
@@ -772,11 +829,11 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args[i].dst);
 		}
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
-	rc = pthread_cond_init(&pool->cv_not_empty, NULL);
+	rc = ARK_PTHREAD_COND_INIT(&pool->cv_not_empty, NULL);
 	if (rc != 0) {
 		(void)fail_error(
 		    err, ARK_ERR_IO_ALLOC,
@@ -793,11 +850,11 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args[i].dst);
 		}
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
-	rc = pthread_cond_init(&pool->cv_not_full, NULL);
+	rc = ARK_PTHREAD_COND_INIT(&pool->cv_not_full, NULL);
 	if (rc != 0) {
 		(void)fail_error(
 		    err, ARK_ERR_IO_ALLOC,
@@ -815,7 +872,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->worker_args[i].dst);
 		}
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
@@ -837,23 +894,37 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		}
 		free(pool->queue_slots);
 		free(pool->worker_args);
-		free(pool->workers);
+		free((void *)pool->workers);
 		free(pool);
 		return NULL;
 	}
-	pool->shared_err.recorded = 0;
+	pool->shared_err.state = ARK_SHARED_ERR_EMPTY;
 
 	entry = mode == ARK_POOL_COMPRESS ? worker_compress : worker_decompress;
 	for (i = 0; i < n_workers; i++) {
-		rc = pthread_create(&pool->workers[i], NULL, entry,
-		                    &pool->worker_args[i]);
+		rc = ARK_PTHREAD_CREATE(&pool->workers[i], NULL, entry,
+		                        &pool->worker_args[i]);
 		if (rc != 0) {
 			(void)fail_error(err, ARK_ERR_IO_ALLOC,
 			                 "thread pool worker creation failed",
 			                 "", rc);
+			/*
+			 * SAFETY: publish cancellation and broadcast under
+			 * pool->mutex, as pool_shutdown does. A started worker
+			 * checks cancelled under the mutex before waiting; an
+			 * unlocked broadcast can land between that check and
+			 * its wait, and the join below then never returns.
+			 * See ARCHITECTURE.md section 6.3.
+			 */
 			__atomic_store_n((int *)&pool->cancelled, 1,
 			                 __ATOMIC_RELEASE);
-			(void)pthread_cond_broadcast(&pool->cv_not_empty);
+			if (pthread_mutex_lock(&pool->mutex) == 0) {
+				(void)pthread_cond_broadcast(
+				    &pool->cv_not_empty);
+				(void)pthread_cond_broadcast(
+				    &pool->cv_not_full);
+				(void)pthread_mutex_unlock(&pool->mutex);
+			}
 			while (--i >= 0)
 				(void)pthread_join(pool->workers[i], NULL);
 			ring_buf_free(pool->ring);
@@ -868,7 +939,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			}
 			free(pool->queue_slots);
 			free(pool->worker_args);
-			free(pool->workers);
+			free((void *)pool->workers);
 			free(pool);
 			return NULL;
 		}
@@ -906,7 +977,7 @@ static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 	while (pool->q_count == pool->q_cap &&
 	       __atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) ==
 	           0) {
-		rc = pthread_cond_wait(&pool->cv_not_full, &pool->mutex);
+		rc = ARK_PTHREAD_COND_WAIT(&pool->cv_not_full, &pool->mutex);
 		if (rc != 0) {
 			(void)pthread_mutex_unlock(&pool->mutex);
 			return -1;
@@ -971,7 +1042,7 @@ static void pool_shutdown(ark_pool_t *pool)
 	}
 	free(pool->queue_slots);
 	free(pool->worker_args);
-	free(pool->workers);
+	free((void *)pool->workers);
 	free(pool);
 }
 
@@ -1007,8 +1078,8 @@ static void *worker_compress(void *arg)
 		while (pool->q_count == 0U &&
 		       __atomic_load_n((int *)&pool->cancelled,
 		                       __ATOMIC_ACQUIRE) == 0) {
-			rc = pthread_cond_wait(&pool->cv_not_empty,
-			                       &pool->mutex);
+			rc = ARK_PTHREAD_COND_WAIT(&pool->cv_not_empty,
+			                           &pool->mutex);
 			if (rc != 0)
 				break;
 		}
@@ -1119,8 +1190,8 @@ static void *worker_decompress(void *arg)
 		while (pool->q_count == 0U &&
 		       __atomic_load_n((int *)&pool->cancelled,
 		                       __ATOMIC_ACQUIRE) == 0) {
-			rc = pthread_cond_wait(&pool->cv_not_empty,
-			                       &pool->mutex);
+			rc = ARK_PTHREAD_COND_WAIT(&pool->cv_not_empty,
+			                           &pool->mutex);
 			if (rc != 0)
 				break;
 		}
@@ -1247,7 +1318,8 @@ static int build_extract_selection(const ark_args_t *, const ark_read_ctx_t *,
 static int preflight_conflicts(const ark_args_t *, const ark_read_ctx_t *,
                                size_t, const unsigned char *, int,
                                ark_error_t *);
-static int cleanup_track(cleanup_tracker_t *, const char *, int, ark_error_t *);
+static int cleanup_reserve(cleanup_tracker_t *, ark_error_t *);
+static void cleanup_track(cleanup_tracker_t *, const char *, int);
 static void cleanup_run(cleanup_tracker_t *, int);
 static void cleanup_free(cleanup_tracker_t *);
 static int dir_deferred_push(dir_deferred_meta_t *, const ark_member_meta_t *,
@@ -2115,34 +2187,52 @@ static int preflight_conflicts(const ark_args_t *args,
 }
 
 /*
- * cleanup_track - Record one created path for reverse-order fatal cleanup.
+ * cleanup_reserve - Ensure the tracker can record one more created path.
+ *
+ * Call before creating any filesystem object, so that cleanup_track after
+ * the creation cannot fail and leave the object untracked.
+ *
+ * Returns 0 on success, -1 on allocation failure with err set.
+ *
+ * See ARCHITECTURE.md section 14.3 and CODING_STANDARDS.md section 3.4.
  */
-static int cleanup_track(cleanup_tracker_t *tracker, const char *path,
-                         int is_dir, ark_error_t *err)
+static int cleanup_reserve(cleanup_tracker_t *tracker, ark_error_t *err)
 {
 	cleanup_entry_t *new_entries;
+	size_t new_cap;
 
-	if (tracker->count == tracker->capacity) {
-		size_t new_cap;
+	if (tracker->count < tracker->capacity)
+		return 0;
+#ifdef ARK_TEST
+	if (ark_test_cli_fault_should_fail(ARK_CLI_FAULT_CLEANUP_GROW, err,
+	                                   "") != 0)
+		return -1;
+#endif
+	new_cap = tracker->capacity == 0U ? 64U : tracker->capacity * 2U;
+	/* OWNERSHIP: tracker owns entries and frees them in cleanup_free. */
+	new_entries = (cleanup_entry_t *)realloc(
+	    tracker->entries, new_cap * sizeof(tracker->entries[0]));
+	if (new_entries == NULL)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "cleanup tracker allocation failed", "", 0);
+	tracker->entries = new_entries;
+	tracker->capacity = new_cap;
+	return 0;
+}
 
-		new_cap =
-		    tracker->capacity == 0U ? 64U : tracker->capacity * 2U;
-		/* OWNERSHIP: tracker owns entries and frees them in
-		 * cleanup_free. */
-		new_entries = (cleanup_entry_t *)realloc(
-		    tracker->entries, new_cap * sizeof(tracker->entries[0]));
-		if (new_entries == NULL)
-			return fail_error(err, ARK_ERR_IO_ALLOC,
-			                  "cleanup tracker allocation failed",
-			                  "", 0);
-		tracker->entries = new_entries;
-		tracker->capacity = new_cap;
-	}
+/*
+ * cleanup_track - Record one created path for reverse-order fatal cleanup.
+ *
+ * Cannot fail: the caller must have called cleanup_reserve before creating
+ * the object, and must not track anything else in between.
+ */
+static void cleanup_track(cleanup_tracker_t *tracker, const char *path,
+                          int is_dir)
+{
 	copy_msg(tracker->entries[tracker->count].path,
 	         sizeof(tracker->entries[tracker->count].path), path);
 	tracker->entries[tracker->count].is_dir = is_dir;
 	tracker->count++;
-	return 0;
 }
 
 /*
@@ -2253,6 +2343,8 @@ static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
 			    err, ARK_ERR_FMT_INDEX,
 			    "missing ancestor directory in archive order",
 			    meta->path, 0);
+		if (cleanup_reserve(tracker, err) != 0)
+			return -1;
 		if (ARK_MKDIRAT(dest_fd, path, 0700) != 0)
 			return fail_error(err, ARK_ERR_IO_MKDIR,
 			                  "implicit directory creation failed",
@@ -2262,8 +2354,7 @@ static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
 		 * before any subsequent fallible operation. See ARCHITECTURE.md
 		 * section 14.3.
 		 */
-		if (cleanup_track(tracker, path, 1, err) != 0)
-			return -1;
+		cleanup_track(tracker, path, 1);
 		*slash = '/';
 	}
 	return 0;
@@ -2920,6 +3011,15 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 			goto cleanup;
 		}
 
+		/*
+		 * SAFETY: each member creates at most one object below. Reserve
+		 * its tracker entry before any overwrite unlink or creation, so
+		 * registering it right after creation cannot fail. See
+		 * ARCHITECTURE.md section 14.3.
+		 */
+		if (cleanup_reserve(&tracker, err) != 0)
+			goto cleanup;
+
 		switch (meta->type) {
 		case 0x02:
 			if (exists) {
@@ -2940,9 +3040,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 					    meta->path, errno);
 					goto cleanup;
 				}
-				if (cleanup_track(&tracker, meta->path, 1,
-				                  err) != 0)
-					goto cleanup;
+				cleanup_track(&tracker, meta->path, 1);
 			}
 			if (dir_deferred_push(&deferred_dirs, meta, err) != 0)
 				goto cleanup;
@@ -2978,8 +3076,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
-				goto cleanup;
+			cleanup_track(&tracker, meta->path, 0);
 			restore_symlink_meta(dest_fd, meta);
 			break;
 		case 0x04:
@@ -3013,8 +3110,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
-				goto cleanup;
+			cleanup_track(&tracker, meta->path, 0);
 			break;
 		case 0x01: {
 			uint32_t chunk;
@@ -3062,8 +3158,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			if (cleanup_track(&tracker, meta->path, 0, err) != 0)
-				goto cleanup;
+			cleanup_track(&tracker, meta->path, 0);
 
 			if (ark_read_verify_member_begin(rctx, meta, err) != 0)
 				goto cleanup;
@@ -3098,12 +3193,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 					goto cleanup;
 				if (pool_submit(pool, submit_seq, comp_buf, csz,
 				                ARK_DEFLATE_DEFAULT) != 0) {
-					if (__atomic_load_n(
-					        (int *)&pool->shared_err
-					            .recorded,
-					        __ATOMIC_ACQUIRE) != 0)
-						*err = pool->shared_err.error;
-					else
+					if (!shared_err_get(&pool->shared_err,
+					                    err))
 						(void)fail_error(
 						    err, ARK_ERR_FMT_DATA,
 						    "extract worker submit "
@@ -3128,22 +3219,13 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 					        &worker_err, err) != 0)
 						goto cleanup;
 					if (is_abort) {
-						if (__atomic_load_n(
-						        (int *)&pool->shared_err
-						            .recorded,
-						        __ATOMIC_ACQUIRE) != 0)
-							*err = pool->shared_err
-							           .error;
-						else if (worker_err != ARK_OK)
-							(void)fail_error(
-							    err, worker_err,
-							    "extract worker "
-							    "aborted",
-							    meta->path, 0);
-						else
+						if (!shared_err_get(
+						        &pool->shared_err, err))
 							(void)fail_error(
 							    err,
-							    ARK_ERR_FMT_DATA,
+							    worker_err != ARK_OK
+							        ? worker_err
+							        : ARK_ERR_FMT_DATA,
 							    "extract worker "
 							    "aborted",
 							    meta->path, 0);
@@ -3201,19 +3283,13 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                  &worker_err, err) != 0)
 					goto cleanup;
 				if (is_abort) {
-					if (__atomic_load_n(
-					        (int *)&pool->shared_err
-					            .recorded,
-					        __ATOMIC_ACQUIRE) != 0)
-						*err = pool->shared_err.error;
-					else if (worker_err != ARK_OK)
+					if (!shared_err_get(&pool->shared_err,
+					                    err))
 						(void)fail_error(
-						    err, worker_err,
-						    "extract worker aborted",
-						    meta->path, 0);
-					else
-						(void)fail_error(
-						    err, ARK_ERR_FMT_DATA,
+						    err,
+						    worker_err != ARK_OK
+						        ? worker_err
+						        : ARK_ERR_FMT_DATA,
 						    "extract worker aborted",
 						    meta->path, 0);
 					ring_buf_release(pool->ring, drain_seq);
@@ -3584,7 +3660,7 @@ static const char *inode_table_lookup(const inode_table_t *table, dev_t dev,
 		return NULL;
 	pos = (size_t)(inode_hash(dev, ino) % table->capacity);
 	for (i = 0U; i < table->capacity; i++) {
-		inode_slot_t *slot;
+		const inode_slot_t *slot;
 
 		slot = &table->slots[(pos + i) % table->capacity];
 		if (slot->ino == 0)
@@ -3935,11 +4011,7 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 
 		if (pool_submit(ctx->pool, submit_seq, ctx->input_buf, want,
 		                ctx->deflate_mode) != 0) {
-			if (__atomic_load_n(
-			        (int *)&ctx->pool->shared_err.recorded,
-			        __ATOMIC_ACQUIRE) != 0)
-				*err = ctx->pool->shared_err.error;
-			else
+			if (!shared_err_get(&ctx->pool->shared_err, err))
 				rc = fail_error(err, ARK_ERR_IO_WRITE,
 				                "create worker submit failed",
 				                abs_path, 0);
@@ -3955,18 +4027,13 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			                  &slot_worker_err, err) != 0)
 				goto cleanup;
 			if (slot_abort) {
-				if (__atomic_load_n(
-				        (int *)&ctx->pool->shared_err.recorded,
-				        __ATOMIC_ACQUIRE) != 0)
-					*err = ctx->pool->shared_err.error;
-				else if (slot_worker_err != ARK_OK)
+				if (!shared_err_get(&ctx->pool->shared_err,
+				                    err))
 					(void)fail_error(
-					    err, slot_worker_err,
-					    "create worker aborted", abs_path,
-					    0);
-				else
-					(void)fail_error(
-					    err, ARK_ERR_IO_WRITE,
+					    err,
+					    slot_worker_err != ARK_OK
+					        ? slot_worker_err
+					        : ARK_ERR_IO_WRITE,
 					    "create worker aborted", abs_path,
 					    0);
 				ring_buf_release(ctx->pool->ring, drain_seq);
@@ -4012,16 +4079,11 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 		                  err) != 0)
 			goto cleanup;
 		if (slot_abort) {
-			if (__atomic_load_n(
-			        (int *)&ctx->pool->shared_err.recorded,
-			        __ATOMIC_ACQUIRE) != 0)
-				*err = ctx->pool->shared_err.error;
-			else if (slot_worker_err != ARK_OK)
-				(void)fail_error(err, slot_worker_err,
-				                 "create worker aborted",
-				                 abs_path, 0);
-			else
-				(void)fail_error(err, ARK_ERR_IO_WRITE,
+			if (!shared_err_get(&ctx->pool->shared_err, err))
+				(void)fail_error(err,
+				                 slot_worker_err != ARK_OK
+				                     ? slot_worker_err
+				                     : ARK_ERR_IO_WRITE,
 				                 "create worker aborted",
 				                 abs_path, 0);
 			ring_buf_release(ctx->pool->ring, drain_seq);
@@ -4927,11 +4989,12 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
  */
 static void args_init(ark_args_t *args)
 {
-	*args = (ark_args_t){0};
-	args->hash_alg = ARK_HASH_BLAKE3;
-	args->deflate_mode = ARK_DEFLATE_DEFAULT;
-	args->output_path = ".";
-	args->generate_reader_output = "recovery.c";
+	*args = (ark_args_t){
+	    .hash_alg = ARK_HASH_BLAKE3,
+	    .deflate_mode = ARK_DEFLATE_DEFAULT,
+	    .output_path = ".",
+	    .generate_reader_output = "recovery.c",
+	};
 }
 
 /*
@@ -5473,10 +5536,26 @@ ark_error_t pool_get_shared_err(const ark_pool_t *pool)
 	out = (ark_error_t){0};
 	if (pool == NULL)
 		return out;
-	if (__atomic_load_n((const int *)&pool->shared_err.recorded,
-	                    __ATOMIC_ACQUIRE) == 0)
-		return out;
-	return pool->shared_err.error;
+	(void)shared_err_get(&pool->shared_err, &out);
+	return out;
+}
+
+/* ARK_TEST only: store one error through the worker first-error path. */
+void pool_test_store_error(ark_pool_t *pool, const ark_error_t *err)
+{
+	if (pool == NULL)
+		return;
+	error_store_once(&pool->shared_err, err);
+}
+
+/* ARK_TEST only: clear shared error state; no worker may be storing. */
+void pool_test_reset_shared_err(ark_pool_t *pool)
+{
+	if (pool == NULL)
+		return;
+	pool->shared_err.error = (ark_error_t){0};
+	__atomic_store_n((int *)&pool->shared_err.state, ARK_SHARED_ERR_EMPTY,
+	                 __ATOMIC_RELEASE);
 }
 
 /* ARK_TEST only: count ring slots currently holding abort sentinels. */

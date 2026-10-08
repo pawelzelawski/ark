@@ -10,6 +10,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -50,6 +51,9 @@ enum ark_fault_which {
 	ARK_FAULT_CLOSEDIR,
 	ARK_FAULT_REALPATH,
 	ARK_FAULT_READLINK,
+	ARK_FAULT_PTHREAD_CREATE,
+	ARK_FAULT_PTHREAD_MUTEX_INIT,
+	ARK_FAULT_PTHREAD_COND_INIT,
 };
 
 typedef struct ark_fault {
@@ -86,6 +90,18 @@ typedef struct ark_fault {
 	int closedir_calls;
 	int realpath_calls;
 	int readlink_calls;
+	int pthread_create_calls;
+	int pthread_mutex_init_calls;
+	int pthread_cond_init_calls;
+	/*
+	 * Worker-start handshake for pool startup tests. Worker threads read
+	 * and write these fields, so access them only with __atomic builtins.
+	 * cond_wait_delay_ms > 0 makes the first ARK_PTHREAD_COND_WAIT set
+	 * cond_wait_entered and sleep before waiting, and makes an injected
+	 * ARK_PTHREAD_CREATE failure wait for cond_wait_entered first.
+	 */
+	int cond_wait_delay_ms;
+	int cond_wait_entered;
 } ark_fault_t;
 
 extern ark_fault_t ark_fault;
@@ -126,6 +142,13 @@ struct dirent *ark_stub_readdir(DIR *dirp);
 int ark_stub_closedir(DIR *dirp);
 char *ark_stub_realpath(const char *path, char *resolved_path);
 ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
+int ark_stub_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                            void *(*start)(void *), void *arg);
+int ark_stub_pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
+int ark_stub_pthread_mutex_init(pthread_mutex_t *mutex,
+                                const pthread_mutexattr_t *attr);
+int ark_stub_pthread_cond_init(pthread_cond_t *cond,
+                               const pthread_condattr_t *attr);
 
 #define ARK_READ ark_stub_read
 #define ARK_WRITE ark_stub_write
@@ -157,6 +180,10 @@ ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
 #define ARK_CLOSEDIR ark_stub_closedir
 #define ARK_REALPATH ark_stub_realpath
 #define ARK_READLINK ark_stub_readlink
+#define ARK_PTHREAD_CREATE ark_stub_pthread_create
+#define ARK_PTHREAD_COND_WAIT ark_stub_pthread_cond_wait
+#define ARK_PTHREAD_MUTEX_INIT ark_stub_pthread_mutex_init
+#define ARK_PTHREAD_COND_INIT ark_stub_pthread_cond_init
 
 #else
 
@@ -190,6 +217,10 @@ ssize_t ark_stub_readlink(const char *path, char *buf, size_t bufsiz);
 #define ARK_CLOSEDIR closedir
 #define ARK_REALPATH realpath
 #define ARK_READLINK readlink
+#define ARK_PTHREAD_CREATE pthread_create
+#define ARK_PTHREAD_COND_WAIT pthread_cond_wait
+#define ARK_PTHREAD_MUTEX_INIT pthread_mutex_init
+#define ARK_PTHREAD_COND_INIT pthread_cond_init
 
 #endif
 

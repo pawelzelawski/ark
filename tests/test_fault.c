@@ -26,7 +26,8 @@ enum {
 	ARK_CLI_FAULT_CREATE_OPEN_ARCHIVE,
 	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
 	ARK_CLI_FAULT_CREATE_COMMIT,
-	ARK_CLI_FAULT_CREATE_MARK_MODIFIED
+	ARK_CLI_FAULT_CREATE_MARK_MODIFIED,
+	ARK_CLI_FAULT_CLEANUP_GROW
 };
 
 int ark_test_create_archive(const char *, const char **, size_t, int,
@@ -503,6 +504,72 @@ int test_fault_extract_unlink_overwrite(void)
 {
 	return expect_extract_fault(ARK_FAULT_UNLINKAT, 1, 0, 1,
 	                            ARK_ERR_IO_OPEN);
+}
+
+/* dir_is_empty - Return 1 when path is a directory with no entries. */
+static int dir_is_empty(const char *path)
+{
+	const struct dirent *dent;
+	DIR *dir;
+	int empty;
+
+	dir = opendir(path);
+	if (dir == NULL)
+		return 0;
+	empty = 1;
+	while ((dent = readdir(dir)) != NULL) {
+		if (strcmp(dent->d_name, ".") != 0 &&
+		    strcmp(dent->d_name, "..") != 0)
+			empty = 0;
+	}
+	(void)closedir(dir);
+	return empty;
+}
+
+/*
+ * expect_cleanup_grow_fault - Fail the first cleanup tracker allocation
+ * during extraction; no created object may be left behind untracked.
+ *
+ * member == NULL extracts everything (the first object created is the "dir"
+ * directory member); otherwise only member is extracted and its missing
+ * parent "dir" is created implicitly. See ARCHITECTURE.md section 14.3.
+ */
+static int expect_cleanup_grow_fault(const char *member)
+{
+	char root[PATH_MAX];
+	char src[PATH_MAX];
+	char archive[PATH_MAX];
+	char out[PATH_MAX];
+	char nested[PATH_MAX];
+	ark_error_t err;
+	int rc;
+
+	err = (ark_error_t){0};
+	if (make_tree_fixture(root, src, archive, out) != 0)
+		return 1;
+	if (path_join(nested, sizeof(nested), src, "dir/nested.txt") != 0 ||
+	    write_file(nested, "nested fixture data\n") != 0 ||
+	    create_archive(archive, src) != 0) {
+		rm_rf(root);
+		return 1;
+	}
+	ark_test_cli_fault_inject(ARK_CLI_FAULT_CLEANUP_GROW, 1,
+	                          ARK_ERR_IO_ALLOC, 0);
+	rc = ark_test_extract_archive(archive, out, 0, member, 1, &err);
+	ark_test_cli_fault_reset();
+	if (rc == 0 || err.code != ARK_ERR_IO_ALLOC || !dir_is_empty(out)) {
+		rm_rf(root);
+		return 1;
+	}
+	rm_rf(root);
+	return 0;
+}
+
+int test_fault_extract_cleanup_track_alloc(void)
+{
+	if (expect_cleanup_grow_fault(NULL) != 0)
+		return 1;
+	return expect_cleanup_grow_fault("dir/nested.txt");
 }
 
 int test_fault_extract_cleanup_unlink(void)

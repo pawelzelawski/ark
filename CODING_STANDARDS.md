@@ -479,15 +479,19 @@ fd = -1;   /* guard against double-close in cleanup */
 
 Every filesystem object created during extraction is registered with the
 cleanup tracker immediately after creation, before any subsequent operation
-that could fail.
+that could fail. Registration itself must not be able to fail: reserve the
+tracker entry with `cleanup_reserve` before creating the object, so that
+`cleanup_track` after creation only appends.
 
 ```c
-/* Correct - register before next fallible operation */
+/* Correct - reserve first, register before next fallible operation */
+if (cleanup_reserve(&tracker, err) != 0)          /* may fail: nothing */
+	goto cleanup;                                  /* created yet       */
 rc = ARK_MKDIR(path, 0700);
 if (rc != 0) {
 	return ark_fail(err, ARK_ERR_IO_MKDIR, path, errno);
 }
-cleanup_track(&tracker, ARK_CLEANUP_DIR, path);   /* register immediately */
+cleanup_track(&tracker, path, 1);                 /* cannot fail */
 
 rc = set_dir_metadata(path, meta, err);           /* next fallible op */
 if (rc != 0)
@@ -502,7 +506,14 @@ rc = set_dir_metadata(path, meta, err);           /* fails here */
 if (rc != 0)
 	goto cleanup;                                  /* dir is not tracked */
 
-cleanup_track(&tracker, ARK_CLEANUP_DIR, path);   /* never reached */
+cleanup_track(&tracker, path, 1);                 /* never reached */
+
+/* Wrong - registration that can fail after creation */
+rc = ARK_MKDIR(path, 0700);
+if (rc != 0)
+	goto cleanup;
+if (tracker_append_grow(&tracker, path, err) != 0) /* allocation fails */
+	goto cleanup;                                  /* dir is not tracked */
 ```
 
 ---
