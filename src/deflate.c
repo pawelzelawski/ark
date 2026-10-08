@@ -1129,7 +1129,8 @@ static int emit_match(ark_bit_writer_t *bw, size_t len, size_t dist)
 }
 
 /*
- * Compress with one fixed-Huffman block and deterministic lazy matching.
+ * Compress with one fixed-Huffman block. Used for fast mode, which matches
+ * greedily; the one-step lazy branch below runs only for default mode.
  * See ARCHITECTURE.md section 7.2.
  */
 static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
@@ -1877,8 +1878,10 @@ size_t ark_deflate_bound(size_t src_len)
 /*
  * ark_deflate_compress - Compress one chunk into a raw RFC 1951 stream.
  *
- * Uses deterministic hash-chain + lazy matching and fixed-Huffman coding.
- * For incompressible input, falls back to stored blocks when that yields
+ * Default mode uses deterministic hash-chain search with one-step lazy
+ * matching and dynamic-Huffman blocks whose lengths are chosen by estimated
+ * cost; fast mode uses greedy matching and one fixed-Huffman block. For
+ * incompressible input, falls back to stored blocks when that yields
  * smaller output. See ARCHITECTURE.md section 7.2.
  *
  * Returns compressed byte count on success, -1 on error.

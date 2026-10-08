@@ -683,12 +683,15 @@ stored block instead. This is essential for already-compressed content
 (JPEG, video, existing archives). The chunk size entry in the index
 records the stored block size; the reader handles both cases transparently.
 
-**Near-optimal parsing for archival mode.** Rather than committing to the
-first match found, the parser evaluates multiple match candidates and
-selects the optimal sequence. Adds approximately 300-500 lines but
-provides meaningful ratio improvement on compressible content. Archival
-mode is the default; a faster mode using greedy parsing may be provided
-as a CLI option.
+**Lazy matching for archival mode.** The parser searches hash chains for
+the longest match at each position (up to 128 candidates, stopping early
+at a 258-byte match) and defers a match by one position, emitting a
+literal instead, when the next position offers a match at least two bytes
+longer (one-step lazy evaluation, similar to zlib's default levels). It
+does not compute an optimal parse; an optimal or
+single-pass cost-driven parser remains an allowed improvement under §17.
+Archival mode is the default; `--fast` uses greedy parsing with a shorter
+search.
 
 **Aggressive block boundary decisions.** Deflate divides compressed data
 into blocks, each with its own Huffman table. Choosing block boundaries
@@ -720,7 +723,8 @@ component is extractable for reuse in other projects without modification.
 
 ```c
 typedef enum {
-    ARK_DEFLATE_DEFAULT,   /* near-optimal parsing, archival quality (default) */
+    ARK_DEFLATE_DEFAULT,   /* lazy matching + cost-chosen dynamic blocks,
+                              archival quality (default) */
     ARK_DEFLATE_FAST       /* greedy parsing, faster compression (--fast flag) */
 } ark_deflate_mode_t;
 
@@ -741,8 +745,8 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len,
                                 uint8_t       *dst, size_t dst_cap);
 ```
 
-**Mode semantics.** `ARK_DEFLATE_DEFAULT` uses near-optimal parsing and
-aggressive block boundary decisions. This is the default mode used by the
+**Mode semantics.** `ARK_DEFLATE_DEFAULT` uses lazy matching and
+cost-based block boundary decisions. This is the default mode used by the
 `ark` CLI. `ARK_DEFLATE_FAST` uses greedy parsing for users who explicitly
 prioritise compression speed over ratio, enabled via the `--fast` CLI flag.
 
@@ -1516,7 +1520,7 @@ regression testing and backup deduplication.
 ark binary running on the same platform. It does not require two
 independent implementations of this specification to produce identical
 Deflate streams: the compressor quality levers in §7.2 specify qualitative
-targets (near-optimal parsing, aggressive block boundary decisions), not
+targets (lazy matching, cost-based block boundary decisions), not
 an exact algorithm. Two compliant compressors may produce different but
 equally valid Deflate output for the same input. The guarantee is scoped
 to a single binary and is sufficient for regression testing and
