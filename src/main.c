@@ -1982,24 +1982,14 @@ static size_t read_member_count(const ark_read_ctx_t *rctx)
 
 /*
  * find_member_pos - Locate one member path and return its positional index.
+ *
+ * Uses the sorted path index of the read context (O(log N)); see
+ * ARCHITECTURE.md section 16.4.
  */
 static int find_member_pos(const ark_read_ctx_t *rctx, const char *path,
                            uint32_t *pos)
 {
-	uint32_t i;
-
-	for (i = 0U;; i++) {
-		const ark_member_meta_t *meta;
-
-		meta = ark_read_member_meta(rctx, i);
-		if (meta == NULL)
-			break;
-		if (strcmp(meta->path, path) == 0) {
-			*pos = i;
-			return 0;
-		}
-	}
-	return -1;
+	return ark_read_find_member(rctx, path, pos);
 }
 
 /*
@@ -2036,36 +2026,29 @@ static int build_extract_selection(const ark_args_t *args,
 		selected[pos] = 1U;
 	}
 
-	for (;;) {
-		int changed;
+	/*
+	 * ARCHITECTURE.md section 8.3 check 14: hardlink targets are regular
+	 * files, so a target never selects a further target and one pass
+	 * over the selected hardlinks is enough.
+	 */
+	for (i = 0U; i < member_count; i++) {
+		const ark_member_meta_t *meta;
+		uint32_t target_pos;
 
-		changed = 0;
-		for (i = 0U; i < member_count; i++) {
-			const ark_member_meta_t *meta;
-			uint32_t target_pos;
-
-			if (selected[i] == 0U)
-				continue;
-			meta = ark_read_member_meta(rctx, i);
-			if (meta->type != 0x04)
-				continue;
-			if (find_member_pos(rctx, meta->link, &target_pos) != 0)
-				return fail_error(
-				    err, ARK_ERR_FMT_INDEX,
-				    "hardlink target missing in archive",
-				    meta->link, 0);
-			if ((size_t)target_pos >= member_count)
-				return fail_error(
-				    err, ARK_ERR_FMT_INDEX,
-				    "hardlink target index out of bounds",
-				    meta->link, 0);
-			if (selected[target_pos] == 0U) {
-				selected[target_pos] = 1U;
-				changed = 1;
-			}
-		}
-		if (!changed)
-			break;
+		if (selected[i] == 0U)
+			continue;
+		meta = ark_read_member_meta(rctx, i);
+		if (meta->type != 0x04)
+			continue;
+		if (find_member_pos(rctx, meta->link, &target_pos) != 0)
+			return fail_error(err, ARK_ERR_FMT_INDEX,
+			                  "hardlink target missing in archive",
+			                  meta->link, 0);
+		if ((size_t)target_pos >= member_count)
+			return fail_error(err, ARK_ERR_FMT_INDEX,
+			                  "hardlink target index out of bounds",
+			                  meta->link, 0);
+		selected[target_pos] = 1U;
 	}
 	return 0;
 }
@@ -2109,10 +2092,15 @@ static int preflight_conflicts(const ark_args_t *args,
 		if (selected[i] == 0U)
 			continue;
 		meta = ark_read_member_meta(rctx, i);
+		/*
+		 * Member paths are unique (ARCHITECTURE.md section 8.3 check
+		 * 8) and an ancestor is only reported when it is not a
+		 * selected member, so a member path is never already in the
+		 * list; only ancestor entries need the duplicate check.
+		 */
 		if (ARK_FSTATAT(dest_fd, meta->path, &st,
 		                AT_SYMLINK_NOFOLLOW) == 0) {
-			if (!conflict_path_seen(&conflicts, meta->path) &&
-			    modified_path_list_push(&conflicts, meta->path,
+			if (modified_path_list_push(&conflicts, meta->path,
 			                            err) != 0) {
 				modified_path_list_free(&conflicts);
 				return -1;

@@ -2332,7 +2332,8 @@ before `ark_read_index` is called. The required call sequence is:
 ark_read_header   (validates header, populates comp_alg, hash_alg, version)
 ark_read_init     (validates footer, populates index_offset, index_size, member_count)
 ark_read_index    (loads, verifies, and parses the index block)
-ark_read_member_meta / ark_read_chunk / ark_read_verify_*  (per-member access)
+ark_read_member_meta / ark_read_find_member / ark_read_chunk /
+    ark_read_verify_*  (per-member access)
 ark_read_free
 ```
 
@@ -2385,6 +2386,17 @@ int ark_read_index(ark_read_ctx_t *ctx,
    valid until ark_read_free. No allocation. */
 const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
                                                uint32_t              pos);
+
+/* Find the member position for an archive path. path is compared byte for
+   byte with member paths (no normalisation). ark_read_index builds a path
+   index sorted by (path bytes, position), so the lookup is a binary search
+   (O(log member_count)) and returns the smallest position with that path.
+   Returns 0 and stores the position in *pos on success, -1 when no member
+   has the path, for NULL arguments, or before ark_read_index. The path
+   index is context-owned and released by ark_read_free. No allocation. */
+int ark_read_find_member(const ark_read_ctx_t *ctx,
+                         const char           *path,
+                         uint32_t             *pos);
 
 /* Decompress one pre-compressed chunk of member data. src contains the
    compressed chunk bytes as read from the archive; src_len must equal

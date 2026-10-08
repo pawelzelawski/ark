@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "archive.h"
@@ -2262,4 +2263,155 @@ int test_read_empty_file_chunk_count_zero(void)
 		return 1;
 	ark_read_free(ctx);
 	return 0;
+}
+
+int test_read_find_member(void)
+{
+	static const char *const paths[] = {"b", "a", "a/x", "a/x/y", "c"};
+	static const char *const missing[] = {"a/x/", "a/xy", "a/",
+	                                      "d",    "",     "a/x/y/z"};
+	read_entry_t e[5];
+	read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[1024];
+	uint8_t digest[32];
+	size_t index_len;
+	uint32_t pos;
+	size_t i;
+	int rc;
+
+	for (i = 0U; i < 5U; i++) {
+		entry_base(&e[i], 0x02U, paths[i]);
+		hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[i].hash);
+	}
+	if (build_index(e, 5U, index, sizeof(index), &index_len) != 0)
+		return 1;
+	hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+	build_header(header, ARK_HASH_BLAKE3);
+	build_footer(footer, 16U, index_len, 5U, digest);
+
+	/* Not usable before the index is read. */
+	ctx = read_ctx_from_storage(&storage);
+	if (ark_read_header(ctx, header, 16U, &err) != 0 ||
+	    ark_read_init(ctx, footer, 64U, &err) != 0)
+		return 1;
+	if (ark_read_find_member(ctx, "a", &pos) != -1)
+		return 1;
+	if (ark_read_index(ctx, index, index_len, &err) != 0)
+		return 1;
+
+	rc = 0;
+	for (i = 0U; i < 5U; i++) {
+		if (ark_read_find_member(ctx, paths[i], &pos) != 0 ||
+		    pos != (uint32_t)i)
+			rc = 1;
+	}
+	for (i = 0U; i < sizeof(missing) / sizeof(missing[0]); i++) {
+		if (ark_read_find_member(ctx, missing[i], &pos) != -1)
+			rc = 1;
+	}
+	if (ark_read_find_member(NULL, "a", &pos) != -1 ||
+	    ark_read_find_member(ctx, NULL, &pos) != -1 ||
+	    ark_read_find_member(ctx, "a", NULL) != -1)
+		rc = 1;
+	ark_read_free(ctx);
+	return rc;
+}
+
+#define MANY_MEMBERS 20000U
+
+/*
+ * many_members_index - Serialize MANY_MEMBERS directory members in reverse
+ * name order (plus an optional duplicate of the first one) and parse it.
+ * Returns the ark_read_index result; *ctx_out holds the context on success.
+ */
+static int many_members_index(int add_duplicate, read_ctx_storage_t *storage,
+                              ark_read_ctx_t **ctx_out, ark_error_t *err)
+{
+	static char names[MANY_MEMBERS][8];
+	read_entry_t *e;
+	uint8_t *index;
+	size_t index_len;
+	size_t cap;
+	size_t n;
+	size_t i;
+	int rc;
+
+	n = MANY_MEMBERS + (add_duplicate ? 1U : 0U);
+	cap = n * (79U + 8U + 4U);
+	e = calloc(n, sizeof(e[0]));
+	index = malloc(cap);
+	if (e == NULL || index == NULL) {
+		free(e);
+		free(index);
+		return -2;
+	}
+	for (i = 0U; i < MANY_MEMBERS; i++) {
+		(void)snprintf(names[i], sizeof(names[i]), "d%05zu",
+		               MANY_MEMBERS - 1U - i);
+		entry_base(&e[i], 0x02U, names[i]);
+		hash_bytes(ARK_HASH_BLAKE3, NULL, 0U, e[i].hash);
+	}
+	if (add_duplicate)
+		e[MANY_MEMBERS] = e[0];
+	rc = -2;
+	if (build_index(e, n, index, cap, &index_len) == 0) {
+		ark_read_ctx_t *ctx;
+		uint8_t header[16];
+		uint8_t footer[64];
+		uint8_t digest[32];
+
+		hash_bytes(ARK_HASH_BLAKE3, index, index_len, digest);
+		build_header(header, ARK_HASH_BLAKE3);
+		build_footer(footer, 16U, index_len, (uint32_t)n, digest);
+		ctx = read_ctx_from_storage(storage);
+		if (ark_read_header(ctx, header, 16U, err) == 0 &&
+		    ark_read_init(ctx, footer, 64U, err) == 0) {
+			rc = ark_read_index(ctx, index, index_len, err);
+			*ctx_out = ctx;
+		}
+	}
+	free(index);
+	free(e);
+	return rc;
+}
+
+int test_read_index_many_members(void)
+{
+	read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+	uint32_t pos;
+	int rc;
+
+	ctx = NULL;
+	if (many_members_index(0, &storage, &ctx, &err) != 0)
+		return 1;
+	/* Names were written in reverse order: d19999 is member 0. */
+	rc = 0;
+	if (ark_read_find_member(ctx, "d19999", &pos) != 0 || pos != 0U ||
+	    ark_read_find_member(ctx, "d00000", &pos) != 0 ||
+	    pos != MANY_MEMBERS - 1U ||
+	    ark_read_find_member(ctx, "d12345", &pos) != 0 ||
+	    pos != MANY_MEMBERS - 1U - 12345U ||
+	    ark_read_find_member(ctx, "d20000", &pos) != -1)
+		rc = 1;
+	ark_read_free(ctx);
+	return rc;
+}
+
+int test_read_index_many_members_duplicate(void)
+{
+	read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+
+	ctx = NULL;
+	if (many_members_index(1, &storage, &ctx, &err) != -1)
+		return 1;
+	ark_read_free(ctx);
+	return err.code == ARK_ERR_FMT_INDEX ? 0 : 1;
 }

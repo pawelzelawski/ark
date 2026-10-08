@@ -61,6 +61,9 @@ int test_read_check5_link_too_long(void);
 int test_read_check6_hardlink_missing_target(void);
 int test_read_check6_hardlink_forward_reference(void);
 int test_read_check7_duplicate_path(void);
+int test_read_find_member(void);
+int test_read_index_many_members(void);
+int test_read_index_many_members_duplicate(void);
 int test_read_check8_missing_ancestor(void);
 int test_read_check9_present_ancestor_non_directory(void);
 int test_read_check10_size_mismatch(void);
@@ -378,6 +381,10 @@ static const test_case_t g_tests[] = {
     {"test_read_check6_hardlink_forward_reference",
      test_read_check6_hardlink_forward_reference},
     {"test_read_check7_duplicate_path", test_read_check7_duplicate_path},
+    {"test_read_find_member", test_read_find_member},
+    {"test_read_index_many_members", test_read_index_many_members},
+    {"test_read_index_many_members_duplicate",
+     test_read_index_many_members_duplicate},
     {"test_read_check8_missing_ancestor", test_read_check8_missing_ancestor},
     {"test_read_check9_present_ancestor_non_directory",
      test_read_check9_present_ancestor_non_directory},

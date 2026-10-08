@@ -75,6 +75,7 @@ struct ark_read_ctx {
 	uint32_t member_count;
 	uint8_t index_hash[32];
 	ark_member_meta_t *members;
+	struct ark_path_ref *by_path;
 	ark_hash_state_t verify_hash;
 	const ark_member_meta_t *verify_meta;
 	uint32_t verify_next_chunk;
@@ -386,43 +387,103 @@ static int validate_hardlink_target_raw(const uint8_t *raw, size_t len,
 	return validate_member_path_raw(raw, len, err);
 }
 
-static int find_member_by_path(const ark_member_meta_t *members, uint32_t n,
-                               const char *path)
-{
-	uint32_t i;
+/*
+ * Member lookup by path. ark_read_index sorts one {path, idx} reference per
+ * member by (path bytes, idx), so every path lookup is a binary search for
+ * the first reference with that path: the smallest member index with the
+ * path, which is what a linear first-match scan in index order returns.
+ * See ARCHITECTURE.md section 8.3.
+ */
+typedef struct ark_path_ref {
+	const char *path;
+	uint32_t idx;
+} ark_path_ref_t;
 
-	for (i = 0U; i < n; i++) {
-		if (strcmp(members[i].path, path) == 0)
-			return (int)i;
+/* qsort comparator: path bytes (as strcmp), then member index. */
+static int path_ref_cmp(const void *a, const void *b)
+{
+	const ark_path_ref_t *x;
+	const ark_path_ref_t *y;
+	int c;
+
+	x = (const ark_path_ref_t *)a;
+	y = (const ark_path_ref_t *)b;
+	c = strcmp(x->path, y->path);
+	if (c != 0)
+		return c;
+	return x->idx < y->idx ? -1 : x->idx > y->idx ? 1 : 0;
+}
+
+/* Compare a NUL-terminated path with key[0..key_len) in strcmp order. */
+static int path_key_cmp(const char *path, const char *key, size_t key_len)
+{
+	int c;
+
+	c = strncmp(path, key, key_len);
+	if (c != 0)
+		return c;
+	return path[key_len] == '\0' ? 0 : 1;
+}
+
+/*
+ * Find the smallest member index whose path equals key[0..key_len); the key
+ * need not be NUL-terminated, so ancestor prefixes are looked up in place.
+ * Returns the index, or -1 when no member has that path.
+ */
+static int64_t path_ref_find(const ark_path_ref_t *refs, uint32_t n,
+                             const char *key, size_t key_len)
+{
+	uint32_t lo;
+	uint32_t hi;
+
+	lo = 0U;
+	hi = n;
+	while (lo < hi) {
+		uint32_t mid;
+
+		mid = lo + (hi - lo) / 2U;
+		if (path_key_cmp(refs[mid].path, key, key_len) < 0)
+			lo = mid + 1U;
+		else
+			hi = mid;
 	}
+	if (lo < n && path_key_cmp(refs[lo].path, key, key_len) == 0)
+		return (int64_t)refs[lo].idx;
 	return -1;
 }
 
+/*
+ * Linear-scan semantics of the original checks: first member with the
+ * path among members[0..limit). Returns its index or -1.
+ */
+static int64_t path_ref_find_before(const ark_path_ref_t *refs, uint32_t n,
+                                    const char *path, uint32_t limit)
+{
+	int64_t idx;
+
+	idx = path_ref_find(refs, n, path, strlen(path));
+	return idx >= 0 && (uint64_t)idx < limit ? idx : -1;
+}
+
 static int validate_ancestors_full(const ark_member_meta_t *members,
+                                   const ark_path_ref_t *refs,
                                    uint32_t member_count, uint32_t idx,
                                    ark_error_t *err)
 {
 	const char *path;
 	const char *slash;
-	char parent[1024];
 
 	path = members[idx].path;
 	slash = path;
 	while ((slash = strchr(slash, '/')) != NULL) {
-		size_t plen;
-		int pidx;
+		int64_t pidx;
 
-		plen = (size_t)(slash - path);
-		if (plen >= sizeof(parent))
-			return ark_fail(err, ARK_ERR_FMT_INDEX,
-			                "ancestor path too long", 0);
-		buf_copy(parent, path, plen);
-		parent[plen] = '\0';
-		pidx = find_member_by_path(members, member_count, parent);
+		pidx = path_ref_find(refs, member_count, path,
+		                     (size_t)(slash - path));
 		if (pidx < 0)
 			return ark_fail(err, ARK_ERR_FMT_INDEX,
 			                "missing ancestor member", 0);
-		if ((uint32_t)pidx >= idx)
+		if ((uint64_t)pidx >= idx)
 			return ark_fail(err, ARK_ERR_FMT_INDEX,
 			                "ancestor appears after child", 0);
 		if (members[pidx].type != 0x02U)
@@ -435,28 +496,22 @@ static int validate_ancestors_full(const ark_member_meta_t *members,
 }
 
 static int validate_present_ancestor_dirs(const ark_member_meta_t *members,
+                                          const ark_path_ref_t *refs,
                                           uint32_t member_count, uint32_t idx,
                                           ark_error_t *err)
 {
 	const char *path;
 	const char *slash;
-	char parent[1024];
 
 	path = members[idx].path;
 	slash = path;
 	while ((slash = strchr(slash, '/')) != NULL) {
-		size_t plen;
-		int pidx;
+		int64_t pidx;
 
-		plen = (size_t)(slash - path);
-		if (plen >= sizeof(parent))
-			return ark_fail(err, ARK_ERR_FMT_INDEX,
-			                "ancestor path too long", 0);
-		buf_copy(parent, path, plen);
-		parent[plen] = '\0';
-		pidx = find_member_by_path(members, member_count, parent);
+		pidx = path_ref_find(refs, member_count, path,
+		                     (size_t)(slash - path));
 		if (pidx >= 0) {
-			if ((uint32_t)pidx >= idx)
+			if ((uint64_t)pidx >= idx)
 				return ark_fail(err, ARK_ERR_FMT_INDEX,
 				                "ancestor appears after child",
 				                0);
@@ -468,6 +523,32 @@ static int validate_present_ancestor_dirs(const ark_member_meta_t *members,
 		slash++;
 	}
 
+	return 0;
+}
+
+/* One member body [start, end) in the archive file. */
+struct body_range {
+	uint64_t start;
+	uint64_t end;
+};
+
+/*
+ * qsort comparator for body ranges: start ascending, then end descending.
+ * Valid archives never share a start; if a crafted index does, the longer
+ * body sorts first so check 13 rejects any overlap regardless of index
+ * order (a zero-length body at the same start counts as overlapping).
+ */
+static int body_range_cmp(const void *a, const void *b)
+{
+	const struct body_range *x;
+	const struct body_range *y;
+
+	x = (const struct body_range *)a;
+	y = (const struct body_range *)b;
+	if (x->start != y->start)
+		return x->start < y->start ? -1 : 1;
+	if (x->end != y->end)
+		return x->end > y->end ? -1 : 1;
 	return 0;
 }
 
@@ -1077,11 +1158,9 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 {
 	ark_hash_state_t idx_hash;
 	ark_member_meta_t *members;
+	ark_path_ref_t *refs;
 	uint8_t empty_hash[32];
-	struct body_range {
-		uint64_t start;
-		uint64_t end;
-	} *ranges;
+	struct body_range *ranges;
 	uint32_t i;
 	size_t off;
 
@@ -1117,6 +1196,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 		                0);
 
 	members = NULL;
+	refs = NULL;
 	ranges = NULL;
 	if (ctx->member_count > 0U) {
 		members = calloc(ctx->member_count, sizeof(members[0]));
@@ -1267,32 +1347,53 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 	if (off != index_len)
 		goto fmt_index;
 
+	/*
+	 * Sorted path references for checks 7-10 and 14 and for
+	 * ark_read_find_member. member_count is already bounded by the
+	 * section 5.1 pre-allocation check above.
+	 */
+	if (ctx->member_count > 0U) {
+		refs = calloc(ctx->member_count, sizeof(refs[0]));
+		if (refs == NULL)
+			goto oom;
+		/* OWNERSHIP: refs transfers to ctx->by_path on success and is
+		 * released by ark_read_free. */
+		for (i = 0U; i < ctx->member_count; i++) {
+			refs[i].path = members[i].path;
+			refs[i].idx = i;
+		}
+		qsort(refs, ctx->member_count, sizeof(refs[0]), path_ref_cmp);
+	}
+
 	/* ARCHITECTURE.md section 8.3 check 7. */
 	for (i = 0U; i < ctx->member_count; i++) {
 		if (members[i].type == 0x04U) {
-			if (find_member_by_path(members, i, members[i].link) <
-			    0)
+			if (path_ref_find_before(refs, ctx->member_count,
+			                         members[i].link, i) < 0)
 				goto fmt_index;
 		}
 	}
 
-	/* ARCHITECTURE.md section 8.3 check 8. */
-	for (i = 0U; i < ctx->member_count; i++) {
-		if (find_member_by_path(members, i, members[i].path) >= 0)
+	/*
+	 * ARCHITECTURE.md section 8.3 check 8: a path seen before index i
+	 * means two equal paths, which are adjacent after sorting.
+	 */
+	for (i = 1U; i < ctx->member_count; i++) {
+		if (strcmp(refs[i - 1U].path, refs[i].path) == 0)
 			goto fmt_index;
 	}
 
 	/* ARCHITECTURE.md section 8.3 check 9. */
 	for (i = 0U; i < ctx->member_count; i++) {
-		if (validate_ancestors_full(members, ctx->member_count, i,
+		if (validate_ancestors_full(members, refs, ctx->member_count, i,
 		                            err) != 0)
 			goto fail;
 	}
 
 	/* ARCHITECTURE.md section 8.3 check 10. */
 	for (i = 0U; i < ctx->member_count; i++) {
-		if (validate_present_ancestor_dirs(members, ctx->member_count,
-		                                   i, err) != 0)
+		if (validate_present_ancestor_dirs(
+		        members, refs, ctx->member_count, i, err) != 0)
 			goto fail;
 	}
 
@@ -1327,19 +1428,9 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			range_count++;
 		}
 
-		for (i = 0U; i < range_count; i++) {
-			uint32_t j;
-
-			for (j = i + 1U; j < range_count; j++) {
-				if (ranges[j].start < ranges[i].start) {
-					struct body_range tmp;
-
-					tmp = ranges[i];
-					ranges[i] = ranges[j];
-					ranges[j] = tmp;
-				}
-			}
-		}
+		if (range_count > 1U)
+			qsort(ranges, range_count, sizeof(ranges[0]),
+			      body_range_cmp);
 
 		/* ARCHITECTURE.md section 8.3 check 13. */
 		for (i = 1U; i < range_count; i++) {
@@ -1350,11 +1441,12 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 
 	/* ARCHITECTURE.md section 8.3 check 14. */
 	for (i = 0U; i < ctx->member_count; i++) {
-		int t;
+		int64_t t;
 
 		if (members[i].type != 0x04U)
 			continue;
-		t = find_member_by_path(members, i, members[i].link);
+		t = path_ref_find_before(refs, ctx->member_count,
+		                         members[i].link, i);
 		if (t < 0)
 			goto fmt_index;
 		if (members[t].type != 0x01U)
@@ -1403,6 +1495,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 	}
 
 	ctx->members = members;
+	ctx->by_path = refs;
 	ctx->state = ARK_READ_STATE_INDEX_DONE;
 	free(ranges);
 	return 0;
@@ -1421,6 +1514,7 @@ fail:
 			member_clear(&members[i]);
 		free(members);
 	}
+	free(refs);
 	free(ranges);
 	return -1;
 }
@@ -1435,6 +1529,23 @@ const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
 	if (pos >= ctx->member_count)
 		return NULL;
 	return &ctx->members[pos];
+}
+
+int ark_read_find_member(const ark_read_ctx_t *ctx, const char *path,
+                         uint32_t *pos)
+{
+	int64_t idx;
+
+	if (ctx == NULL || path == NULL || pos == NULL)
+		return -1;
+	if (ctx->state != ARK_READ_STATE_INDEX_DONE)
+		return -1;
+	idx =
+	    path_ref_find(ctx->by_path, ctx->member_count, path, strlen(path));
+	if (idx < 0)
+		return -1;
+	*pos = (uint32_t)idx;
+	return 0;
 }
 
 ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
@@ -1577,5 +1688,6 @@ void ark_read_free(ark_read_ctx_t *ctx)
 			member_clear(&ctx->members[i]);
 	}
 	free(ctx->members);
+	free(ctx->by_path);
 	buf_zero(ctx, sizeof(*ctx));
 }

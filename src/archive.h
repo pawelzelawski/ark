@@ -296,6 +296,24 @@ const ark_member_meta_t *ark_read_member_meta(const ark_read_ctx_t *ctx,
                                               uint32_t pos);
 
 /*
+ * ark_read_find_member - Find the member position for an archive path.
+ *
+ * path is compared byte for byte with member paths (no normalisation). The
+ * lookup is a binary search over a path index built by ark_read_index, so
+ * it costs O(log member_count).
+ *
+ * Returns 0 and stores the member position in *pos when a member has that
+ * path, -1 when none does.
+ * Failure contract: no err parameter; -1 also covers NULL arguments and a
+ * context whose index has not been read.
+ * Preconditions: ark_read_index() succeeded.
+ *
+ * See ARCHITECTURE.md section 16.4.
+ */
+int ark_read_find_member(const ark_read_ctx_t *ctx, const char *path,
+                         uint32_t *pos);
+
+/*
  * ark_read_chunk - Decompress one member chunk.
  *
  * Returns decompressed byte count on success, -1 on failure.

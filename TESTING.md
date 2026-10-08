@@ -322,6 +322,9 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_read_chunk_length_mismatch` | Decompressed size does not match expected chunk size; `ARK_ERR_FMT_DATA` |
 | `test_read_chunk_compressed_size_mismatch` | Supplied compressed byte count does not match index chunk size; `ARK_ERR_FMT_DATA` |
 | `test_read_empty_file_chunk_count_zero` | Regular file with chunk_count=0; `ark_read_member_meta` reports correctly |
+| `test_read_find_member` | Path lookup returns each member's position (out-of-order members); near-miss paths and prefixes not found; -1 before `ark_read_index` and for NULL arguments |
+| `test_read_index_many_members` | 20,000 members in reverse name order parse; lookups return the right positions |
+| `test_read_index_many_members_duplicate` | 20,000 members plus one duplicate path; `ARK_ERR_FMT_INDEX` |
 
 ---
 

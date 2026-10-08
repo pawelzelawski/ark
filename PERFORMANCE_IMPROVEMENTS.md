@@ -107,3 +107,17 @@ the same streams):
   444 -> 42 us (table setup dominated small files).
 - `ark verify` of the `/usr/include` archive (release build): 4.09 -> 1.00 s.
 - `ark_deflate_decompress` stack frame: 492,360 -> 61,608 bytes.
+
+Index validation and member lookup (`archive.c` sorted path index, used by
+`main.c` through `ark_read_find_member`), release build, baseline `9173a31`
+vs new. The `tN` archives hold N empty files in nested directories.
+
+| Operation | Baseline (s) | New (s) |
+|---|---:|---:|
+| `ark list`, 5,000 members | 0.161 | 0.014 |
+| `ark list`, 10,000 members | 0.618 | 0.031 |
+| `ark list`, 20,000 members | 2.643 | 0.053 |
+| `ark list`, 40,000 members | 18.761 | 0.114 |
+| `ark extract --member` one file, 40,000 members | 19.092 | 0.112 |
+| `ark extract` over an existing tree (40,002 conflicts reported), 40,000 members | 20.888 | 0.399 |
+| `ark verify`, `/usr/include` archive (7,962 members; decoder change included) | 4.144 | 0.393 |
