@@ -125,6 +125,23 @@ fault_inject(int which, int on_call_n, int errno_value)
 }
 ```
 
+Thread-pool start-up uses the same mechanism for pthread calls:
+`ARK_PTHREAD_CREATE`, `ARK_PTHREAD_MUTEX_INIT` and `ARK_PTHREAD_COND_INIT`
+are fault-injectable (`ARK_FAULT_PTHREAD_CREATE`,
+`ARK_FAULT_PTHREAD_MUTEX_INIT`, `ARK_FAULT_PTHREAD_COND_INIT`), and
+`ARK_PTHREAD_COND_WAIT` has a test-only handshake
+(`ark_fault.cond_wait_delay_ms`, `ark_fault.cond_wait_entered`) that holds a
+started worker in its wait window while a later `pthread_create` fails.
+Worker threads touch these two fields only through atomics. Test loops that
+wait for other threads call `sched_yield()` instead of spinning: Valgrind
+runs one guest thread at a time.
+
+Command sequence points that are not syscalls use `ark_test_cli_fault_inject`
+in `src/main.c` (for example `ARK_CLI_FAULT_CLEANUP_GROW`, which fails the
+extraction cleanup-tracker allocation). Deflate encoder internals are reached
+through stateless `ark_deflate_test_*` accessors compiled only with
+`-DARK_TEST`.
+
 ---
 
 ## 3. Component Unit Test Catalogue
@@ -192,6 +209,14 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_deflate_truncated_stream` | Compressed bytes truncated; returns -1 |
 | `test_deflate_output_buffer_too_small` | Correct compressed stream but insufficient output capacity; returns -1 |
 | `test_deflate_output_buffer_exact` | Output buffer exactly the right size; no overflow |
+| `test_deflate_length_symbol_mapping` | Length symbol and extra bits at code boundaries; 258 maps to code 285 with no extra bits; 2 and 259 rejected |
+| `test_deflate_zero_run_uses_code_285` | 1MB of zeros compresses below 2KB (default) and 8KB (fast); round-trip identity |
+| `test_deflate_round_trip_all_match_lengths` | Runs of every match length 3..260; round-trip identity in default and fast mode |
+| `test_deflate_limit_lengths_fibonacci` | Fibonacci frequencies (17..30 symbols) limited to 15 bits; all used symbols coded; Kraft sum exactly 1 |
+| `test_deflate_limit_lengths_small_alphabets` | Distance (30, 15 bits) and code-length (19, 7 bits) alphabets complete; single used symbol gets one 1-bit code; no used symbol gives symbol 0 a 1-bit code |
+| `test_deflate_cl_code_always_complete` | Code-length plan with only one used symbol is completed with a second 1-bit code |
+| `test_deflate_header_cost_matches_emitted` | Costed dynamic header size equals the emitted bits for dense and sparse code lengths |
+| `test_deflate_small_input_not_stored` | 128-byte text input compresses to a smaller dynamic block, not a stored block |
 
 ### 3.4 Archive Write Path (`test_archive.c`)
 
@@ -320,6 +345,7 @@ complete.
 | `test_worker_error_then_sentinel` | Error struct populated before abort sentinel is written |
 | `test_io_thread_reads_worker_error` | I/O thread detects abort sentinel; reads error struct; correct error code |
 | `test_worker_error_triggers_cancel` | I/O thread sets cancellation flag after reading worker error |
+| `test_worker_error_published_complete` | Concurrent first-error stores while the I/O side polls; any visible error is one writer's complete payload |
 
 ### 4.3 Cancellation and Quiescence
 
@@ -330,6 +356,15 @@ complete.
 | `test_quiescence_sequence_order` | Cancel flag set, workers joined, fd closed, cleanup runs; in that order |
 | `test_no_resource_leak_on_cancel` | After cancel and join: no leaked fds, no leaked memory |
 | `test_no_cleanup_race` | No filesystem operation in cleanup races an active worker |
+
+### 4.4 Pool and Ring Start-up Failures
+
+| Test case | What is verified |
+|---|---|
+| `test_pool_init_create_failure_wakes_workers` | `pthread_create` fails while a started worker is in its wait window; `pool_init` returns `ARK_ERR_IO_ALLOC` without hanging in `pthread_join` |
+| `test_pool_init_create_failure_cleans_up` | `pthread_create` fails at the first and a later worker; `ARK_ERR_IO_ALLOC`; no leak |
+| `test_ring_init_sync_failure_cleans_up` | Ring mutex or condition initialisation fails; `ARK_ERR_IO_ALLOC`; slot payloads freed |
+| `test_pool_init_sync_failure_cleans_up` | Each pool and ring mutex/condition initialisation fails in turn; `ARK_ERR_IO_ALLOC`; no leak |
 
 ---
 
@@ -432,6 +467,7 @@ extract sequences. Each test verifies:
 | `test_fault_extract_chmod` | `ARK_CHMOD` fails | `ARK_ERR_IO_CHMOD` |
 | `test_fault_extract_utimensat` | `ARK_UTIMENSAT` fails | `ARK_ERR_IO_UTIMES` |
 | `test_fault_extract_unlink_overwrite` | `ARK_UNLINK` fails in --overwrite path | `ARK_ERR_IO_OPEN` |
+| `test_fault_extract_cleanup_track_alloc` | Cleanup tracker allocation fails (full extraction and implicit parent in selective extraction); nothing created is left behind | `ARK_ERR_IO_ALLOC` |
 | `test_fault_extract_cleanup_unlink` | `ARK_UNLINK` fails during cleanup; continues | best-effort only |
 | `test_fault_extract_cleanup_rmdir` | `ARK_RMDIR` fails during cleanup; continues | best-effort only |
 
@@ -516,6 +552,7 @@ test. These tests are the final gate before a phase is declared complete.
 | `test_integration_selective_member` | Archive with three members; --member extracts only one |
 | `test_integration_list` | list subcommand; output includes all member paths, sizes, types |
 | `test_integration_generate_reader` | generate-reader output is valid C11; compiles with `cc -O2`; runs against test archive |
+| `test_integration_generate_reader_no_follow` | Recovery reader refuses to write through a pre-existing symlink at a regular-file member path (empty and non-empty); symlink target unchanged |
 | `test_integration_deterministic` | Same source content archived twice; archives are bit-identical |
 | `test_integration_large_archive` | Archive containing 1000 files of mixed sizes; create, verify, extract; all clean |
 

@@ -76,3 +76,25 @@ Add one entry per task (`P6F.2`, `P6F.3`, ...):
 | P6F.5 tuning trial (max_chain=128 + word-at-a-time find_match; create+determinism) | 2026-05-11 | 161379463 | 31.27 | 15.61 | n/a | -13926623 | -13.90 | yes |
 
 
+
+---
+
+## Algorithm Audit Fixes (2026-10)
+
+Platform: Linux, Intel i7-7500U (2 cores / 4 threads). Codec numbers are one
+thread, 1 MiB chunks, `-O2`, measured back to back against the pre-audit
+baseline (`9173a31`) on the same machine. These numbers are not comparable
+with the P6F table above (different machine and dataset).
+
+Datasets:
+- Mixed corpus: 255,024,842 bytes (documentation, binaries, shared libraries,
+  headers) concatenated into one file.
+- Binary corpus: 121,540,894 bytes of executables.
+- `/usr/include` per file: 7,570 files, 106,126,746 bytes, each compressed as
+  its own stream(s).
+- Archive: `ark create` of a symlink-resolved `/usr/include` copy.
+
+| Change | Date | Mixed ratio (%) | Mixed compress (MB/s) | Mixed decompress (MB/s) | Binary ratio (%) | `/usr/include` per-file ratio (%) | `/usr/include` archive (bytes) | Determinism |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Baseline (`9173a31`) | 2026-10-08 | 29.212 | 3.4 | 128 | 36.297 | 18.370 | 20,801,154 | yes |
+| Encoder fixes: length 258 as code 285, Huffman length-limiter Kraft repair, run-length coded dynamic header | 2026-10-08 | 29.111 | 3.5 | 131 | 36.210 | 17.760 | 20,148,320 | yes |

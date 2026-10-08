@@ -434,7 +434,19 @@ static int length_symbol(size_t len, unsigned int *sym, unsigned int *extra_n,
 
 	if (len < ARK_DEFLATE_MIN_MATCH || len > ARK_DEFLATE_MAX_MATCH)
 		return -1;
-	for (i = 0; i < 29U; i++) {
+	/*
+	 * RFC 1951 section 3.2.5: code 284 covers 227..257 and length 258 has
+	 * its own code 285 with no extra bits. Code 284 with extra value 31
+	 * also decodes as 258, so check 285 first rather than relying on the
+	 * table scan order. Decoders keep accepting the 284 form.
+	 */
+	if (len == ARK_DEFLATE_MAX_MATCH) {
+		*sym = 285U;
+		*extra_n = 0U;
+		*extra_v = 0U;
+		return 0;
+	}
+	for (i = 0; i < 28U; i++) {
 		size_t base;
 		size_t max;
 
@@ -787,26 +799,42 @@ static int build_length_limited_lengths(const uint32_t *freq, size_t n_symbols,
 		}
 		if (depth == 0U)
 			depth = 1U;
-		if (depth > max_bits)
-			overflow = (overflow + 1U);
-		if (depth < 16U)
-			bl_count[depth]++;
+		if (depth > max_bits) {
+			overflow++;
+			depth = max_bits;
+		}
+		bl_count[depth]++;
 	}
 
-	while (overflow > 0U) {
-		int bits;
+	/*
+	 * Leaves deeper than max_bits were clamped to max_bits, which
+	 * oversubscribes the code (Kraft sum above 1). Repair it as miniz
+	 * does: each step drops one leaf from max_bits and splits one leaf at
+	 * the deepest shorter level into two leaves one level down. The leaf
+	 * count stays the same and the Kraft total, scaled by 2^max_bits,
+	 * drops by one, so the loop ends with a complete code.
+	 */
+	if (overflow > 0U) {
+		uint32_t total;
+		unsigned int b;
 
-		bits = (int)max_bits - 1;
-		while (bits > 0 && bl_count[bits] == 0U)
-			bits--;
-		if (bits == 0)
-			return -1;
-		if (overflow < 2U || bl_count[max_bits] == 0U)
-			return -1;
-		bl_count[bits]--;
-		bl_count[bits + 1] += 2U;
-		bl_count[max_bits]--;
-		overflow -= 2U;
+		total = 0U;
+		for (b = max_bits; b > 0U; b--)
+			total += (uint32_t)bl_count[b] << (max_bits - b);
+		while (total != (1UL << max_bits)) {
+			if (bl_count[max_bits] == 0U)
+				return -1;
+			bl_count[max_bits]--;
+			for (b = max_bits - 1U; b > 0U; b--) {
+				if (bl_count[b] != 0U)
+					break;
+			}
+			if (b == 0U)
+				return -1;
+			bl_count[b]--;
+			bl_count[b + 1U] += 2U;
+			total--;
+		}
 	}
 
 	sort_symbols_by_freq(freq, used_sym, used, order);
@@ -1118,9 +1146,142 @@ static size_t huff_data_bits(const ark_freq_t *freq, const uint8_t *lit_len,
 	return bits;
 }
 
-static size_t dynamic_header_bits(size_t hlit_count, size_t hdist_count)
+/*
+ * Code-length (CL) plan for one dynamic block header: the run-length coded
+ * sequence of literal/length and distance code lengths, and the Huffman code
+ * for the 19-symbol CL alphabet. See RFC 1951 section 3.2.7.
+ */
+typedef struct {
+	uint8_t sym[286 + 30];
+	uint8_t extra[286 + 30];
+	size_t count;
+	uint32_t freq[19];
+	uint8_t len[19];
+	size_t hclen;
+} ark_cl_plan_t;
+
+/* Extra-bit widths of CL repeat symbols 16, 17 and 18. */
+static const uint8_t g_cl_extra[19] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7,
+};
+
+/* Append one CL symbol and its repeat-count extra value to the plan. */
+static void cl_plan_push(ark_cl_plan_t *cp, unsigned int sym, size_t extra)
 {
-	return 3U + 5U + 5U + 4U + 19U * 3U + (hlit_count + hdist_count) * 4U;
+	cp->sym[cp->count] = (uint8_t)sym;
+	cp->extra[cp->count] = (uint8_t)extra;
+	cp->count++;
+	cp->freq[sym]++;
+}
+
+/*
+ * Run-length code the concatenated lit/len and distance code lengths with
+ * CL symbols 16 (repeat previous 3..6), 17 (zeros 3..10) and 18 (zeros
+ * 11..138), then build the CL Huffman code (at most 7 bits) and trim HCLEN.
+ *
+ * The CL code must be complete: a single used CL symbol would get one 1-bit
+ * code, which strict decoders such as zlib reject, so an unused symbol is
+ * given the other 1-bit code. See RFC 1951 section 3.2.7.
+ */
+static int cl_plan_build(const uint8_t *lit_len, size_t hlit,
+                         const uint8_t *dist_len, size_t hdist,
+                         ark_cl_plan_t *cp)
+{
+	uint8_t all[286 + 30];
+	size_t used;
+	size_t n;
+	size_t i;
+
+	if (hlit > 286U || hdist > 30U)
+		return -1;
+	n = hlit + hdist;
+	for (i = 0; i < hlit; i++)
+		all[i] = lit_len[i];
+	for (i = 0; i < hdist; i++)
+		all[hlit + i] = dist_len[i];
+	for (i = 0; i < 19U; i++)
+		cp->freq[i] = 0U;
+	cp->count = 0U;
+
+	i = 0U;
+	while (i < n) {
+		uint8_t v;
+		size_t run;
+		size_t r;
+
+		v = all[i];
+		run = 1U;
+		while (i + run < n && all[i + run] == v)
+			run++;
+		i += run;
+		if (v == 0U) {
+			r = run;
+			while (r >= 11U) {
+				size_t k;
+
+				k = r > 138U ? 138U : r;
+				cl_plan_push(cp, 18U, k - 11U);
+				r -= k;
+			}
+			if (r >= 3U) {
+				cl_plan_push(cp, 17U, r - 3U);
+				r = 0U;
+			}
+			while (r-- > 0U)
+				cl_plan_push(cp, 0U, 0U);
+			continue;
+		}
+		cl_plan_push(cp, v, 0U);
+		r = run - 1U;
+		while (r >= 3U) {
+			size_t k;
+
+			k = r > 6U ? 6U : r;
+			cl_plan_push(cp, 16U, k - 3U);
+			r -= k;
+		}
+		while (r-- > 0U)
+			cl_plan_push(cp, v, 0U);
+	}
+
+	if (build_length_limited_lengths(cp->freq, 19U, cp->len, 7U) != 0)
+		return -1;
+	used = 0U;
+	for (i = 0; i < 19U; i++) {
+		if (cp->len[i] != 0U)
+			used++;
+	}
+	if (used == 1U) {
+		/* Complete the code with the first unused symbol in HCLEN
+		 * order. */
+		for (i = 0; i < 19U; i++) {
+			if (cp->len[g_cl_order[i]] == 0U) {
+				cp->len[g_cl_order[i]] = 1U;
+				break;
+			}
+		}
+	}
+
+	cp->hclen = 19U;
+	while (cp->hclen > 4U && cp->len[g_cl_order[cp->hclen - 1U]] == 0U)
+		cp->hclen--;
+	return 0;
+}
+
+/*
+ * Exact bit size of a dynamic block header for plan cp: block header (3),
+ * HLIT/HDIST/HCLEN (14), CL code lengths and the coded CL sequence. Must
+ * match what emit_dynamic_header writes, plus the 3-bit block header.
+ */
+static size_t cl_plan_bits(const ark_cl_plan_t *cp)
+{
+	size_t bits;
+	size_t i;
+
+	bits = 3U + 5U + 5U + 4U + cp->hclen * 3U;
+	for (i = 0; i < 19U; i++)
+		bits += (size_t)cp->freq[i] * (cp->len[i] + g_cl_extra[i]);
+	return bits;
 }
 
 /*
@@ -1131,6 +1292,7 @@ static size_t dynamic_header_bits(size_t hlit_count, size_t hdist_count)
 static int build_dynamic_plan(const uint8_t *src, size_t src_len,
                               ark_dynamic_plan_t *plan, size_t *bits_out)
 {
+	ark_cl_plan_t cp;
 	size_t i;
 
 	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &plan->freq, NULL,
@@ -1154,7 +1316,10 @@ static int build_dynamic_plan(const uint8_t *src, size_t src_len,
 			plan->hdist_count = i + 1U;
 	}
 
-	*bits_out = dynamic_header_bits(plan->hlit_count, plan->hdist_count) +
+	if (cl_plan_build(plan->lit_len, plan->hlit_count, plan->dist_len,
+	                  plan->hdist_count, &cp) != 0)
+		return -1;
+	*bits_out = cl_plan_bits(&cp) +
 	            huff_data_bits(&plan->freq, plan->lit_len, plan->dist_len);
 	return 0;
 }
@@ -1203,45 +1368,50 @@ static int choose_default_block_plan(const uint8_t *src, size_t remaining,
 	return 0;
 }
 
+/*
+ * Emit a dynamic block header (after BFINAL/BTYPE): HLIT, HDIST, HCLEN, the
+ * CL code lengths and the run-length coded code lengths. Also builds the
+ * lit/len and distance codebooks used for the block data.
+ * See RFC 1951 section 3.2.7.
+ */
 static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
                                const uint8_t *dist_len, size_t hlit_count,
                                size_t hdist_count, ark_codebook_t *lit_book,
                                ark_codebook_t *dist_book)
 {
 	ark_codebook_t cl_book;
-	uint8_t cl_len[19];
+	ark_cl_plan_t cp;
 	size_t i;
-
-	for (i = 0; i < 19U; i++)
-		cl_len[i] = i <= 15U ? 4U : 0U;
 
 	if (build_codes(lit_len, 286U, 15U, lit_book) != 0)
 		return -1;
 	if (build_codes(dist_len, 30U, 15U, dist_book) != 0)
 		return -1;
-	if (build_codes(cl_len, 19U, 7U, &cl_book) != 0)
+	if (cl_plan_build(lit_len, hlit_count, dist_len, hdist_count, &cp) != 0)
+		return -1;
+	if (build_codes(cp.len, 19U, 7U, &cl_book) != 0)
 		return -1;
 
 	if (bw_put_bits(bw, (uint16_t)(hlit_count - 257U), 5U) != 0)
 		return -1;
 	if (bw_put_bits(bw, (uint16_t)(hdist_count - 1U), 5U) != 0)
 		return -1;
-	if (bw_put_bits(bw, 15U, 4U) != 0)
+	if (bw_put_bits(bw, (uint16_t)(cp.hclen - 4U), 4U) != 0)
 		return -1;
+	for (i = 0; i < cp.hclen; i++) {
+		if (bw_put_bits(bw, cp.len[g_cl_order[i]], 3U) != 0)
+			return -1;
+	}
+	for (i = 0; i < cp.count; i++) {
+		unsigned int sym;
 
-	for (i = 0; i < 19U; i++) {
-		if (bw_put_bits(bw, cl_len[g_cl_order[i]], 3U) != 0)
+		sym = cp.sym[i];
+		if (emit_code_symbol(bw, &cl_book, sym) != 0)
+			return -1;
+		if (g_cl_extra[sym] != 0U &&
+		    bw_put_bits(bw, cp.extra[i], g_cl_extra[sym]) != 0)
 			return -1;
 	}
-	for (i = 0; i < hlit_count; i++) {
-		if (emit_code_symbol(bw, &cl_book, lit_len[i]) != 0)
-			return -1;
-	}
-	for (i = 0; i < hdist_count; i++) {
-		if (emit_code_symbol(bw, &cl_book, dist_len[i]) != 0)
-			return -1;
-	}
-
 	return 0;
 }
 
@@ -1691,3 +1861,71 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 	return (ssize_t)out_pos;
 }
+
+#ifdef ARK_TEST
+/*
+ * ARK_TEST-only accessors for encoder internals. They keep no state and are
+ * compiled out of production builds; tests declare them locally.
+ */
+
+/* ARK_TEST only: map a match length to its length symbol and extra bits. */
+int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,
+                                   unsigned int *extra_n, uint16_t *extra_v)
+{
+	return length_symbol(len, sym, extra_n, extra_v);
+}
+
+/* ARK_TEST only: build length-limited Huffman code lengths. */
+int ark_deflate_test_limit_lengths(const uint32_t *freq, size_t n_symbols,
+                                   uint8_t *lengths, unsigned int max_bits)
+{
+	return build_length_limited_lengths(freq, n_symbols, lengths, max_bits);
+}
+
+/* ARK_TEST only: build the code-length plan; returns CL lengths + HCLEN. */
+int ark_deflate_test_cl_plan(const uint8_t *lit_len, size_t hlit,
+                             const uint8_t *dist_len, size_t hdist,
+                             uint8_t cl_len[19], size_t *hclen)
+{
+	ark_cl_plan_t cp;
+	size_t i;
+
+	if (cl_plan_build(lit_len, hlit, dist_len, hdist, &cp) != 0)
+		return -1;
+	for (i = 0; i < 19U; i++)
+		cl_len[i] = cp.len[i];
+	*hclen = cp.hclen;
+	return 0;
+}
+
+/*
+ * ARK_TEST only: report the costed and the actually emitted size, in bits,
+ * of a dynamic block header (including the 3-bit block header).
+ */
+int ark_deflate_test_header_bits(const uint8_t *lit_len, size_t hlit,
+                                 const uint8_t *dist_len, size_t hdist,
+                                 size_t *cost_bits, size_t *emitted_bits)
+{
+	ark_codebook_t lit_book;
+	ark_codebook_t dist_book;
+	ark_bit_writer_t bw;
+	ark_cl_plan_t cp;
+	uint8_t buf[1024];
+
+	if (cl_plan_build(lit_len, hlit, dist_len, hdist, &cp) != 0)
+		return -1;
+	*cost_bits = cl_plan_bits(&cp);
+	bw.dst = buf;
+	bw.cap = sizeof(buf);
+	bw.pos = 0U;
+	bw.bits = 0U;
+	bw.nbits = 0U;
+	if (bw_put_bits(&bw, 2U << 1U, 3U) != 0)
+		return -1;
+	if (emit_dynamic_header(&bw, lit_len, dist_len, hlit, hdist, &lit_book,
+	                        &dist_book) != 0)
+		return -1;
+	*emitted_bits = bw.pos * 8U + bw.nbits;
+	return 0;
+}
+#endif

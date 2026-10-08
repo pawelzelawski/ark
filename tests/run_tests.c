@@ -105,6 +105,14 @@ int test_deflate_invalid_stream(void);
 int test_deflate_truncated_stream(void);
 int test_deflate_output_buffer_too_small(void);
 int test_deflate_output_buffer_exact(void);
+int test_deflate_length_symbol_mapping(void);
+int test_deflate_zero_run_uses_code_285(void);
+int test_deflate_round_trip_all_match_lengths(void);
+int test_deflate_limit_lengths_fibonacci(void);
+int test_deflate_limit_lengths_small_alphabets(void);
+int test_deflate_cl_code_always_complete(void);
+int test_deflate_header_cost_matches_emitted(void);
+int test_deflate_small_input_not_stored(void);
 int test_edge_empty_archive(void);
 int test_edge_single_member(void);
 int test_edge_max_path_length(void);
@@ -267,6 +275,21 @@ static const test_case_t g_tests[] = {
     {"test_deflate_output_buffer_too_small",
      test_deflate_output_buffer_too_small},
     {"test_deflate_output_buffer_exact", test_deflate_output_buffer_exact},
+    {"test_deflate_length_symbol_mapping", test_deflate_length_symbol_mapping},
+    {"test_deflate_zero_run_uses_code_285",
+     test_deflate_zero_run_uses_code_285},
+    {"test_deflate_round_trip_all_match_lengths",
+     test_deflate_round_trip_all_match_lengths},
+    {"test_deflate_limit_lengths_fibonacci",
+     test_deflate_limit_lengths_fibonacci},
+    {"test_deflate_limit_lengths_small_alphabets",
+     test_deflate_limit_lengths_small_alphabets},
+    {"test_deflate_cl_code_always_complete",
+     test_deflate_cl_code_always_complete},
+    {"test_deflate_header_cost_matches_emitted",
+     test_deflate_header_cost_matches_emitted},
+    {"test_deflate_small_input_not_stored",
+     test_deflate_small_input_not_stored},
     {"test_write_valid_sequence_zero_members",
      test_write_valid_sequence_zero_members},
     {"test_write_valid_sequence_one_member",
