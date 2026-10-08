@@ -217,6 +217,11 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_deflate_cl_code_always_complete` | Code-length plan with only one used symbol is completed with a second 1-bit code |
 | `test_deflate_header_cost_matches_emitted` | Costed dynamic header size equals the emitted bits for dense and sparse code lengths |
 | `test_deflate_small_input_not_stored` | 128-byte text input compresses to a smaller dynamic block, not a stored block |
+| `test_deflate_fixed_then_stored` | Fixed block followed by a stored block decodes correctly (bit reader gives back read-ahead bytes) |
+| `test_deflate_accepts_legacy_length_258` | Length 258 written as code 284 + extra 31 (older ark encoders) still decodes |
+| `test_deflate_rejects_incomplete_trees` | Incomplete code-length code, incomplete literal/length code and oversubscribed code-length code; returns -1 |
+| `test_deflate_accepts_allowed_incomplete_trees` | Distance code with no codes, and with a single 1-bit code, decode correctly (zlib-compatible exceptions) |
+| `test_deflate_round_trip_periodic` | Periodic input with periods 1..17 (overlapping matches around the 8-byte copy threshold); round-trip identity |
 
 ### 3.4 Archive Write Path (`test_archive.c`)
 

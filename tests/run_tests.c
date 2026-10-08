@@ -113,6 +113,11 @@ int test_deflate_limit_lengths_small_alphabets(void);
 int test_deflate_cl_code_always_complete(void);
 int test_deflate_header_cost_matches_emitted(void);
 int test_deflate_small_input_not_stored(void);
+int test_deflate_fixed_then_stored(void);
+int test_deflate_accepts_legacy_length_258(void);
+int test_deflate_rejects_incomplete_trees(void);
+int test_deflate_accepts_allowed_incomplete_trees(void);
+int test_deflate_round_trip_periodic(void);
 int test_edge_empty_archive(void);
 int test_edge_single_member(void);
 int test_edge_max_path_length(void);
@@ -290,6 +295,14 @@ static const test_case_t g_tests[] = {
      test_deflate_header_cost_matches_emitted},
     {"test_deflate_small_input_not_stored",
      test_deflate_small_input_not_stored},
+    {"test_deflate_fixed_then_stored", test_deflate_fixed_then_stored},
+    {"test_deflate_accepts_legacy_length_258",
+     test_deflate_accepts_legacy_length_258},
+    {"test_deflate_rejects_incomplete_trees",
+     test_deflate_rejects_incomplete_trees},
+    {"test_deflate_accepts_allowed_incomplete_trees",
+     test_deflate_accepts_allowed_incomplete_trees},
+    {"test_deflate_round_trip_periodic", test_deflate_round_trip_periodic},
     {"test_write_valid_sequence_zero_members",
      test_write_valid_sequence_zero_members},
     {"test_write_valid_sequence_one_member",

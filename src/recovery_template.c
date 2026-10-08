@@ -654,14 +654,30 @@ static int rec_br_get_bits(rec_bit_reader_t *br, unsigned int n, uint16_t *out)
 	return 0;
 }
 
+/* Which RFC 1951 alphabet a decode table is built for (validation rules). */
+enum {
+	REC_TREE_CODELEN = 0,
+	REC_TREE_LITLEN,
+	REC_TREE_DIST,
+};
+
+/*
+ * Build a direct decode table from canonical Huffman code lengths. The code
+ * is validated as in ark's deflate.c and zlib: oversubscribed codes are
+ * rejected; incomplete codes are rejected except a lit/len or distance code
+ * with exactly one code of length 1, or a distance code with no codes. The
+ * code-length code must be complete.
+ */
 static int rec_huff_build(rec_huff_table_t *tab, const uint8_t *lengths,
-                          size_t n_symbols, unsigned int max_bits)
+                          size_t n_symbols, unsigned int max_bits, int kind)
 {
 	uint16_t count[16];
 	uint16_t next_code[16];
 	unsigned int bits;
 	uint16_t code;
+	size_t codes;
 	size_t i;
+	long left;
 
 	if (max_bits > REC_DEFLATE_TABLE_BITS)
 		return -1;
@@ -672,11 +688,29 @@ static int rec_huff_build(rec_huff_table_t *tab, const uint8_t *lengths,
 	memset(count, 0, sizeof(count));
 	memset(next_code, 0, sizeof(next_code));
 
+	codes = 0U;
 	for (i = 0; i < n_symbols; i++) {
 		if (lengths[i] > max_bits)
 			return -1;
-		if (lengths[i] != 0U)
+		if (lengths[i] != 0U) {
 			count[lengths[i]]++;
+			codes++;
+		}
+	}
+
+	/* Kraft accounting: left counts unused codes of the current length. */
+	left = 1;
+	for (bits = 1U; bits <= max_bits; bits++) {
+		left = left * 2 - (long)count[bits];
+		if (left < 0)
+			return -1;
+	}
+	if (left > 0) {
+		if (kind == REC_TREE_CODELEN)
+			return -1;
+		if (!(codes == 1U && count[1] == 1U) &&
+		    !(kind == REC_TREE_DIST && codes == 0U))
+			return -1;
 	}
 
 	code = 0;
@@ -812,9 +846,9 @@ static int rec_decode_fixed_block(rec_bit_reader_t *br, uint8_t *dst,
 	for (i = 0; i < 32U; i++)
 		dist_len[i] = 5U;
 
-	if (rec_huff_build(&lit_tab, lit_len, 288U, 9U) != 0)
+	if (rec_huff_build(&lit_tab, lit_len, 288U, 9U, REC_TREE_LITLEN) != 0)
 		return -1;
-	if (rec_huff_build(&dist_tab, dist_len, 32U, 5U) != 0)
+	if (rec_huff_build(&dist_tab, dist_len, 32U, 5U, REC_TREE_DIST) != 0)
 		return -1;
 	return rec_decode_huffman_block(br, &lit_tab, &dist_tab, dst, dst_cap,
 	                                dst_pos);
@@ -854,7 +888,7 @@ static int rec_decode_dynamic_block(rec_bit_reader_t *br, uint8_t *dst,
 			return -1;
 		cl_len[rec_cl_order[i]] = (uint8_t)v;
 	}
-	if (rec_huff_build(&cl_tab, cl_len, 19U, 7U) != 0)
+	if (rec_huff_build(&cl_tab, cl_len, 19U, 7U, REC_TREE_CODELEN) != 0)
 		return -1;
 
 	n = 0U;
@@ -914,9 +948,12 @@ static int rec_decode_dynamic_block(rec_bit_reader_t *br, uint8_t *dst,
 		lit_len[i] = lens[i];
 	for (i = 0; i < hdist; i++)
 		dist_len[i] = lens[hlit + i];
-	if (rec_huff_build(&lit_tab, lit_len, 288U, 15U) != 0)
+	/* RFC 1951 section 3.2.7: every block must be able to end. */
+	if (lit_len[256] == 0U)
 		return -1;
-	if (rec_huff_build(&dist_tab, dist_len, 32U, 15U) != 0)
+	if (rec_huff_build(&lit_tab, lit_len, 288U, 15U, REC_TREE_LITLEN) != 0)
+		return -1;
+	if (rec_huff_build(&dist_tab, dist_len, 32U, 15U, REC_TREE_DIST) != 0)
 		return -1;
 
 	return rec_decode_huffman_block(br, &lit_tab, &dist_tab, dst, dst_cap,

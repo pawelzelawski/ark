@@ -21,8 +21,31 @@
 #define ARK_DEFLATE_HASH_SIZE (1U << ARK_DEFLATE_HASH_BITS)
 #define ARK_DEFLATE_HASH_MASK (ARK_DEFLATE_HASH_SIZE - 1U)
 
-#define ARK_DEFLATE_TABLE_BITS 15U
-#define ARK_DEFLATE_TABLE_SIZE (1U << ARK_DEFLATE_TABLE_BITS)
+/*
+ * Two-level Huffman decode tables. A root table indexed by the next
+ * root_bits input bits holds a symbol entry, or a link to a subtable for
+ * codes longer than root_bits. Entry layout (uint32_t):
+ *   bits 0..7   code bits consumed at this level (0 marks an invalid code)
+ *   bits 8..11  subtable index bits (link entries only)
+ *   bit 15      link flag
+ *   bits 16..31 symbol, or subtable offset for link entries
+ * Every subtable has 2^(longest code - root_bits) entries and a code longer
+ * than root_bits needs at most one, so table sizes are bounded by the
+ * alphabet size: 288 lit/len and 32 distance symbols, codes <= 15 bits.
+ */
+#define ARK_INFLATE_LINK 0x8000U
+#define ARK_INFLATE_LIT_ROOT 10U
+#define ARK_INFLATE_DIST_ROOT 8U
+#define ARK_INFLATE_CL_ROOT 7U
+#define ARK_INFLATE_FIXED_LIT_ROOT 9U
+#define ARK_INFLATE_FIXED_DIST_ROOT 5U
+#define ARK_INFLATE_LIT_TABLE                                                  \
+	((1U << ARK_INFLATE_LIT_ROOT) +                                        \
+	 288U * (1U << (15U - ARK_INFLATE_LIT_ROOT)))
+#define ARK_INFLATE_DIST_TABLE                                                 \
+	((1U << ARK_INFLATE_DIST_ROOT) +                                       \
+	 32U * (1U << (15U - ARK_INFLATE_DIST_ROOT)))
+#define ARK_INFLATE_CL_TABLE (1U << ARK_INFLATE_CL_ROOT)
 
 typedef struct {
 	uint8_t *dst;
@@ -40,10 +63,12 @@ typedef struct {
 	unsigned int nbits;
 } ark_bit_reader_t;
 
-typedef struct {
-	int16_t sym[ARK_DEFLATE_TABLE_SIZE];
-	uint8_t len[ARK_DEFLATE_TABLE_SIZE];
-} ark_huff_table_t;
+/* Which RFC 1951 alphabet a decode table is built for (validation rules). */
+typedef enum {
+	ARK_TREE_CODELEN = 0,
+	ARK_TREE_LITLEN,
+	ARK_TREE_DIST,
+} ark_tree_kind_t;
 
 typedef struct {
 	size_t len;
@@ -123,6 +148,19 @@ static const size_t g_default_block_candidates[] = {
  */
 static _Thread_local ark_match_finder_t g_match_finder;
 
+/*
+ * Shared by the compressor and the decompressor (see ARCHITECTURE.md
+ * section 15.3). Read 8 bytes from p as a little-endian 64-bit value without
+ * memcpy.
+ */
+static uint64_t load_u64_le(const uint8_t *p)
+{
+	return ((uint64_t)p[0]) | ((uint64_t)p[1] << 8) |
+	       ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+	       ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+	       ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
 /* Reverse the low n bits of v for Deflate's LSB-first bitstream. */
 static uint16_t bit_reverse(uint16_t v, unsigned int n)
 {
@@ -168,15 +206,34 @@ static int bw_flush_to_byte(ark_bit_writer_t *bw)
 	return 0;
 }
 
-/* Pull bytes from src until at least n bits are available or input ends. */
-static int br_ensure_bits(ark_bit_reader_t *br, unsigned int n)
+/*
+ * Top up the bit buffer. With at least 8 input bytes left, one little-endian
+ * 8-byte load fills it to 56..63 valid bits; near the end of the input it
+ * is filled byte by byte. Bits above nbits are always zero.
+ */
+static void br_refill(ark_bit_reader_t *br)
 {
-	while (br->nbits < n) {
-		if (br->pos >= br->len)
-			break;
-		br->bits |= ((uint64_t)br->src[br->pos++]) << br->nbits;
+	if (br->len - br->pos >= 8U) {
+		unsigned int nbytes;
+
+		nbytes = (63U - br->nbits) >> 3;
+		br->bits |= load_u64_le(br->src + br->pos) << br->nbits;
+		br->pos += nbytes;
+		br->nbits += nbytes * 8U;
+		br->bits &= ((uint64_t)1U << br->nbits) - 1U;
+		return;
+	}
+	while (br->nbits <= 48U && br->pos < br->len) {
+		br->bits |= (uint64_t)br->src[br->pos++] << br->nbits;
 		br->nbits += 8U;
 	}
+}
+
+/* Make at least n (<= 32) bits available; fails at the end of the input. */
+static int br_ensure_bits(ark_bit_reader_t *br, unsigned int n)
+{
+	if (br->nbits < n)
+		br_refill(br);
 	return br->nbits >= n ? 0 : -1;
 }
 
@@ -195,67 +252,121 @@ static int br_get_bits(ark_bit_reader_t *br, unsigned int n, uint16_t *out)
 	return 0;
 }
 
-/* Build a direct decode table from canonical Huffman code lengths. */
-static int huff_build(ark_huff_table_t *tab, const uint8_t *lengths,
-                      size_t n_symbols, unsigned int max_bits)
+/*
+ * Build a two-level decode table from canonical Huffman code lengths.
+ *
+ * Validates the code first, as zlib does (RFC 1951 section 3.2.2): an
+ * oversubscribed code is always rejected; an incomplete code is rejected
+ * except for a lit/len or distance code with exactly one code of length 1,
+ * or a distance code with no codes at all. The code-length code must be
+ * complete. Unused table entries keep length 0 and fail to decode.
+ *
+ * Returns 0 on success, -1 for an invalid code or a table that would not
+ * fit in tab_cap entries.
+ */
+static int inflate_table_build(uint32_t *tab, size_t tab_cap,
+                               const uint8_t *lengths, size_t n_symbols,
+                               unsigned int root_bits, ark_tree_kind_t kind)
 {
 	uint16_t count[16];
 	uint16_t next_code[16];
+	unsigned int max_len;
+	unsigned int sub_bits;
 	unsigned int bits;
-	uint16_t code;
+	size_t root_size;
+	size_t used;
+	size_t codes;
 	size_t i;
+	int32_t left;
+	uint16_t code;
 
-	if (max_bits > ARK_DEFLATE_TABLE_BITS)
-		return -1;
-
-	for (i = 0; i < ARK_DEFLATE_TABLE_SIZE; i++) {
-		tab->sym[i] = -1;
-		tab->len[i] = 0;
-	}
-	for (i = 0; i < 16U; i++) {
-		count[i] = 0;
-		next_code[i] = 0;
-	}
-
+	for (i = 0; i < 16U; i++)
+		count[i] = 0U;
+	max_len = 0U;
+	codes = 0U;
 	for (i = 0; i < n_symbols; i++) {
-		if (lengths[i] > max_bits)
+		if (lengths[i] > 15U)
 			return -1;
-		if (lengths[i] != 0U)
-			count[lengths[i]]++;
+		if (lengths[i] == 0U)
+			continue;
+		count[lengths[i]]++;
+		codes++;
+		if (lengths[i] > max_len)
+			max_len = lengths[i];
 	}
 
-	code = 0;
-	for (bits = 1; bits <= max_bits; bits++) {
+	/*
+	 * SAFETY: Kraft accounting. left is the number of unused codes of the
+	 * current length; it must never go negative (oversubscribed code).
+	 * Rejecting bad codes here also keeps every code prefix-free, which
+	 * the table fill below relies on.
+	 */
+	left = 1;
+	for (bits = 1U; bits <= 15U; bits++) {
+		left <<= 1;
+		left -= (int32_t)count[bits];
+		if (left < 0)
+			return -1;
+	}
+	if (left > 0) {
+		if (kind == ARK_TREE_CODELEN)
+			return -1;
+		if (!(codes == 1U && count[1] == 1U) &&
+		    !(kind == ARK_TREE_DIST && codes == 0U))
+			return -1;
+	}
+
+	root_size = (size_t)1U << root_bits;
+	if (root_size > tab_cap)
+		return -1;
+	for (i = 0; i < root_size; i++)
+		tab[i] = 0U;
+
+	code = 0U;
+	next_code[0] = 0U;
+	for (bits = 1U; bits <= 15U; bits++) {
 		code = (uint16_t)((code + count[bits - 1U]) << 1U);
 		next_code[bits] = code;
 	}
 
+	sub_bits = max_len > root_bits ? max_len - root_bits : 0U;
+	used = root_size;
 	for (i = 0; i < n_symbols; i++) {
-		uint8_t len;
-		uint16_t rev;
-		unsigned int fill_shift;
-		unsigned int fill_count;
-		unsigned int j;
+		unsigned int len;
+		size_t rev;
+		size_t j;
 
 		len = lengths[i];
 		if (len == 0U)
 			continue;
-		rev = bit_reverse(next_code[len], len);
-		next_code[len]++;
+		rev = bit_reverse(next_code[len]++, len);
+		if (len <= root_bits) {
+			for (j = rev; j < root_size; j += (size_t)1U << len)
+				tab[j] = ((uint32_t)i << 16) | len;
+		} else {
+			uint32_t *sub;
+			size_t root_idx;
+			size_t sub_size;
 
-		fill_shift = ARK_DEFLATE_TABLE_BITS - len;
-		fill_count = 1U << fill_shift;
-		for (j = 0; j < fill_count; j++) {
-			unsigned int idx;
-
-			idx = ((unsigned int)rev) | (j << len);
-			if (tab->len[idx] != 0U)
-				return -1;
-			tab->len[idx] = len;
-			tab->sym[idx] = (int16_t)i;
+			root_idx = rev & (root_size - 1U);
+			sub_size = (size_t)1U << sub_bits;
+			if ((tab[root_idx] & ARK_INFLATE_LINK) == 0U) {
+				if (tab_cap - used < sub_size)
+					return -1;
+				for (j = 0; j < sub_size; j++)
+					tab[used + j] = 0U;
+				tab[root_idx] =
+				    ((uint32_t)used << 16) | ARK_INFLATE_LINK |
+				    ((uint32_t)sub_bits << 8) | root_bits;
+				used += sub_size;
+			}
+			sub = tab + (tab[root_idx] >> 16);
+			for (j = rev >> root_bits; j < sub_size;
+			     j += (size_t)1U << (len - root_bits))
+				sub[j] =
+				    ((uint32_t)i << 16) | (len - root_bits);
 		}
 	}
-
 	return 0;
 }
 
@@ -308,28 +419,35 @@ static int build_codes(const uint8_t *lengths, size_t n_symbols,
 	return 0;
 }
 
-/* Decode one Huffman symbol from the bitstream using a direct lookup table. */
-static int huff_decode(ark_bit_reader_t *br, const ark_huff_table_t *tab,
-                       int *sym)
+/* Decode one Huffman symbol with a two-level table built for root_bits. */
+static int inflate_decode_sym(ark_bit_reader_t *br, const uint32_t *tab,
+                              unsigned int root_bits, unsigned int *sym)
 {
-	uint16_t idx;
-	uint8_t n;
+	uint32_t e;
+	unsigned int n;
 
-	if (br_ensure_bits(br, 1U) != 0)
-		return -1;
-	(void)br_ensure_bits(br, ARK_DEFLATE_TABLE_BITS);
+	if (br->nbits < 15U)
+		br_refill(br);
+	e = tab[br->bits & (((uint64_t)1U << root_bits) - 1U)];
+	if ((e & ARK_INFLATE_LINK) != 0U) {
+		unsigned int sub_bits;
 
-	idx = (uint16_t)(br->bits & (ARK_DEFLATE_TABLE_SIZE - 1U));
-	n = tab->len[idx];
-	if (n == 0U)
+		n = e & 0xffU;
+		if (n > br->nbits)
+			return -1;
+		br->bits >>= n;
+		br->nbits -= n;
+		sub_bits = (e >> 8) & 0xfU;
+		e = tab[(e >> 16) +
+		        (br->bits & (((uint64_t)1U << sub_bits) - 1U))];
+	}
+	n = e & 0xffU;
+	if (n == 0U || n > br->nbits)
 		return -1;
-	if (br_ensure_bits(br, n) != 0)
-		return -1;
-
-	*sym = tab->sym[idx];
 	br->bits >>= n;
 	br->nbits -= n;
-	return *sym >= 0 ? 0 : -1;
+	*sym = e >> 16;
+	return 0;
 }
 
 /* Emit one RFC 1951 stored block, splitting as needed at 65535 bytes. */
@@ -504,15 +622,6 @@ static unsigned int hash3(const uint8_t *p)
 	    (unsigned int)p[2];
 	h *= 0x1e35a7bdU;
 	return (h >> (32U - ARK_DEFLATE_HASH_BITS)) & ARK_DEFLATE_HASH_MASK;
-}
-
-/* Read 8 bytes from p as a little-endian 64-bit value without memcpy. */
-static uint64_t load_u64_le(const uint8_t *p)
-{
-	return ((uint64_t)p[0]) | ((uint64_t)p[1] << 8) |
-	       ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
-	       ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
-	       ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
 
 /* Start a fresh parse generation without clearing full hash/chain tables. */
@@ -1478,85 +1587,115 @@ static int compress_dynamic_default(const uint8_t *src, size_t src_len,
 	return bw.pos > (size_t)INT_MAX ? -1 : (int)bw.pos;
 }
 
+/* Store v at p as 8 little-endian bytes without memcpy. */
+static void store_u64_le(uint8_t *p, uint64_t v)
+{
+	unsigned int i;
+
+	for (i = 0; i < 8U; i++)
+		p[i] = (uint8_t)(v >> (i * 8U));
+}
+
+/*
+ * Copy a len-byte match that starts dist bytes back. Source and destination
+ * overlap whenever dist < len, so the copy runs forward: 8-byte words only
+ * when dist >= 8 (a word never reads bytes it writes), a fill for dist 1,
+ * and single bytes otherwise. Never writes past d[len - 1].
+ */
+static void copy_match(uint8_t *d, size_t dist, size_t len)
+{
+	const uint8_t *s;
+
+	s = d - dist;
+	if (dist == 1U) {
+		uint8_t v;
+
+		v = s[0];
+		while (len-- > 0U)
+			*d++ = v;
+		return;
+	}
+	if (dist >= 8U) {
+		while (len >= 8U) {
+			store_u64_le(d, load_u64_le(s));
+			d += 8;
+			s += 8;
+			len -= 8U;
+		}
+	}
+	while (len-- > 0U)
+		*d++ = *s++;
+}
+
 /* Decode one Huffman-coded Deflate block until end-of-block marker. */
-static int decode_huffman_block(ark_bit_reader_t *br,
-                                const ark_huff_table_t *lit_tab,
-                                const ark_huff_table_t *dist_tab, uint8_t *dst,
+static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
+                                unsigned int lit_root, const uint32_t *dist_tab,
+                                unsigned int dist_root, uint8_t *dst,
                                 size_t dst_cap, size_t *dst_pos)
 {
-	int sym;
-	size_t i;
+	size_t out;
 
+	out = *dst_pos;
 	for (;;) {
-		if (huff_decode(br, lit_tab, &sym) != 0)
+		unsigned int sym;
+		unsigned int li;
+		unsigned int dsym;
+		size_t len;
+		size_t dist;
+		uint16_t extra;
+
+		if (inflate_decode_sym(br, lit_tab, lit_root, &sym) != 0)
 			return -1;
-		if (sym < 256) {
-			if (*dst_pos >= dst_cap)
+		if (sym < 256U) {
+			if (out >= dst_cap)
 				return -1;
-			dst[(*dst_pos)++] = (uint8_t)sym;
+			dst[out++] = (uint8_t)sym;
 			continue;
 		}
-		if (sym == 256)
+		if (sym == 256U) {
+			*dst_pos = out;
 			return 0;
-		if (sym > 285)
+		}
+		if (sym > 285U)
 			return -1;
 
-		{
-			unsigned int li;
-			size_t len;
-			size_t dist;
-			uint16_t extra;
-			int dsym;
-
-			li = (unsigned int)(sym - 257);
-			len = g_len_base[li];
-			if (g_len_extra[li] != 0U) {
-				if (br_get_bits(br, g_len_extra[li], &extra) !=
-				    0)
-					return -1;
-				len += extra;
-			}
-
-			if (huff_decode(br, dist_tab, &dsym) != 0)
+		/* Code 284 with extra 31 (258) stays valid for old streams. */
+		li = sym - 257U;
+		len = g_len_base[li];
+		if (g_len_extra[li] != 0U) {
+			if (br_get_bits(br, g_len_extra[li], &extra) != 0)
 				return -1;
-			if (dsym < 0 || dsym > 29)
-				return -1;
-
-			dist = g_dist_base[dsym];
-			if (g_dist_extra[dsym] != 0U) {
-				if (br_get_bits(br, g_dist_extra[dsym],
-				                &extra) != 0)
-					return -1;
-				dist += extra;
-			}
-
-			/*
-			 * SAFETY: match copy must reference already-produced
-			 * bytes. Distances beyond dst_pos are invalid and must
-			 * fail hard.
-			 */
-			if (dist == 0U || dist > *dst_pos)
-				return -1;
-			if (*dst_pos + len > dst_cap)
-				return -1;
-
-			for (i = 0; i < len; i++)
-				dst[*dst_pos + i] = dst[*dst_pos + i - dist];
-			*dst_pos += len;
+			len += extra;
 		}
+		if (inflate_decode_sym(br, dist_tab, dist_root, &dsym) != 0)
+			return -1;
+		if (dsym > 29U)
+			return -1;
+		dist = g_dist_base[dsym];
+		if (g_dist_extra[dsym] != 0U) {
+			if (br_get_bits(br, g_dist_extra[dsym], &extra) != 0)
+				return -1;
+			dist += extra;
+		}
+
+		/*
+		 * SAFETY: match copy must reference already-produced bytes and
+		 * fit in dst. Distances beyond the output so far and lengths
+		 * beyond dst_cap are invalid and must fail hard.
+		 */
+		if (dist > out || len > dst_cap - out)
+			return -1;
+		copy_match(dst + out, dist, len);
+		out += len;
 	}
 }
 
 /*
- * Build RFC 1951 fixed-Huffman decode tables.
- *
- * The fixed tables are stream-invariant; build once and reuse across all
- * fixed blocks in a stream. This keeps decompressor-only table symbols local
- * to deflate.c, preserving the decompressor boundary used by recovery
- * amalgamation. See ARCHITECTURE.md section 15.3.
+ * Build RFC 1951 fixed-Huffman decode tables (section 3.2.6). Called at
+ * most once per ark_deflate_decompress call, on the first fixed block;
+ * the tables live in the caller's frame, so no state outlives the call.
  */
-static int build_fixed_decode_tables(ark_huff_table_t *lit_tab,
-                                     ark_huff_table_t *dist_tab)
+static int build_fixed_decode_tables(uint32_t *lit_tab, uint32_t *dist_tab)
 {
 	uint8_t lit_len[288];
 	uint8_t dist_len[32];
@@ -1573,33 +1712,25 @@ static int build_fixed_decode_tables(ark_huff_table_t *lit_tab,
 	for (i = 0; i < 32U; i++)
 		dist_len[i] = 5U;
 
-	if (huff_build(lit_tab, lit_len, 288U, 9U) != 0)
+	if (inflate_table_build(lit_tab, 1U << ARK_INFLATE_FIXED_LIT_ROOT,
+	                        lit_len, 288U, ARK_INFLATE_FIXED_LIT_ROOT,
+	                        ARK_TREE_LITLEN) != 0)
 		return -1;
-	if (huff_build(dist_tab, dist_len, 32U, 5U) != 0)
+	if (inflate_table_build(dist_tab, 1U << ARK_INFLATE_FIXED_DIST_ROOT,
+	                        dist_len, 32U, ARK_INFLATE_FIXED_DIST_ROOT,
+	                        ARK_TREE_DIST) != 0)
 		return -1;
 	return 0;
-}
-
-/* Decode one fixed-Huffman symbol set into dst; stops on end-of-block code. */
-static int decode_fixed_block(ark_bit_reader_t *br,
-                              const ark_huff_table_t *lit_tab,
-                              const ark_huff_table_t *dist_tab, uint8_t *dst,
-                              size_t dst_cap, size_t *dst_pos)
-{
-	return decode_huffman_block(br, lit_tab, dist_tab, dst, dst_cap,
-	                            dst_pos);
 }
 
 /* Decode one dynamic-Huffman Deflate block. */
 static int decode_dynamic_block(ark_bit_reader_t *br, uint8_t *dst,
                                 size_t dst_cap, size_t *dst_pos)
 {
-	ark_huff_table_t cl_tab;
-	ark_huff_table_t lit_tab;
-	ark_huff_table_t dist_tab;
+	uint32_t cl_tab[ARK_INFLATE_CL_TABLE];
+	uint32_t lit_tab[ARK_INFLATE_LIT_TABLE];
+	uint32_t dist_tab[ARK_INFLATE_DIST_TABLE];
 	uint8_t cl_len[19];
-	uint8_t lit_len[288];
-	uint8_t dist_len[32];
 	uint8_t lens[288 + 32];
 	uint16_t v;
 	size_t hlit;
@@ -1609,11 +1740,7 @@ static int decode_dynamic_block(ark_bit_reader_t *br, uint8_t *dst,
 	size_t i;
 
 	for (i = 0; i < 19U; i++)
-		cl_len[i] = 0;
-	for (i = 0; i < 288U; i++)
-		lit_len[i] = 0;
-	for (i = 0; i < 32U; i++)
-		dist_len[i] = 0;
+		cl_len[i] = 0U;
 
 	if (br_get_bits(br, 5U, &v) != 0)
 		return -1;
@@ -1633,106 +1760,100 @@ static int decode_dynamic_block(ark_bit_reader_t *br, uint8_t *dst,
 			return -1;
 		cl_len[g_cl_order[i]] = (uint8_t)v;
 	}
-
-	if (huff_build(&cl_tab, cl_len, 19U, 7U) != 0)
+	if (inflate_table_build(cl_tab, ARK_INFLATE_CL_TABLE, cl_len, 19U,
+	                        ARK_INFLATE_CL_ROOT, ARK_TREE_CODELEN) != 0)
 		return -1;
 
 	n = 0U;
 	while (n < hlit + hdist) {
-		int sym;
+		unsigned int sym;
+		uint8_t fill;
+		size_t rep;
 
-		if (huff_decode(br, &cl_tab, &sym) != 0)
+		if (inflate_decode_sym(br, cl_tab, ARK_INFLATE_CL_ROOT, &sym) !=
+		    0)
 			return -1;
-		if (sym >= 0 && sym <= 15) {
+		if (sym <= 15U) {
 			lens[n++] = (uint8_t)sym;
 			continue;
 		}
-		if (sym == 16) {
-			size_t rep;
-			uint8_t prev;
-
+		if (sym == 16U) {
 			if (n == 0U)
 				return -1;
 			if (br_get_bits(br, 2U, &v) != 0)
 				return -1;
+			fill = lens[n - 1U];
 			rep = (size_t)v + 3U;
-			if (n + rep > hlit + hdist)
-				return -1;
-			prev = lens[n - 1U];
-			for (i = 0; i < rep; i++)
-				lens[n++] = prev;
-			continue;
-		}
-		if (sym == 17) {
-			size_t rep;
-
+		} else if (sym == 17U) {
 			if (br_get_bits(br, 3U, &v) != 0)
 				return -1;
+			fill = 0U;
 			rep = (size_t)v + 3U;
-			if (n + rep > hlit + hdist)
-				return -1;
-			for (i = 0; i < rep; i++)
-				lens[n++] = 0U;
-			continue;
-		}
-		if (sym == 18) {
-			size_t rep;
-
+		} else if (sym == 18U) {
 			if (br_get_bits(br, 7U, &v) != 0)
 				return -1;
+			fill = 0U;
 			rep = (size_t)v + 11U;
-			if (n + rep > hlit + hdist)
-				return -1;
-			for (i = 0; i < rep; i++)
-				lens[n++] = 0U;
-			continue;
+		} else {
+			return -1;
 		}
-		return -1;
+		if (rep > hlit + hdist - n)
+			return -1;
+		for (i = 0; i < rep; i++)
+			lens[n++] = fill;
 	}
 
-	for (i = 0; i < hlit; i++)
-		lit_len[i] = lens[i];
-	for (i = 0; i < hdist; i++)
-		dist_len[i] = lens[hlit + i];
-
-	if (huff_build(&lit_tab, lit_len, 288U, 15U) != 0)
+	/* RFC 1951 section 3.2.7: every block must be able to end. */
+	if (lens[256] == 0U)
 		return -1;
-	if (huff_build(&dist_tab, dist_len, 32U, 15U) != 0)
+	if (inflate_table_build(lit_tab, ARK_INFLATE_LIT_TABLE, lens, hlit,
+	                        ARK_INFLATE_LIT_ROOT, ARK_TREE_LITLEN) != 0)
+		return -1;
+	if (inflate_table_build(dist_tab, ARK_INFLATE_DIST_TABLE, lens + hlit,
+	                        hdist, ARK_INFLATE_DIST_ROOT,
+	                        ARK_TREE_DIST) != 0)
 		return -1;
 
-	return decode_huffman_block(br, &lit_tab, &dist_tab, dst, dst_cap,
+	return decode_huffman_block(br, lit_tab, ARK_INFLATE_LIT_ROOT, dist_tab,
+	                            ARK_INFLATE_DIST_ROOT, dst, dst_cap,
 	                            dst_pos);
 }
 
-/* Decode one RFC 1951 stored block into dst. */
+/*
+ * Decode one RFC 1951 stored block into dst (section 3.2.4). The bit reader
+ * may hold input bytes read ahead; after dropping to a byte boundary they
+ * are given back so LEN, NLEN and the payload are read from the input.
+ */
 static int decode_stored_block(ark_bit_reader_t *br, uint8_t *dst,
                                size_t dst_cap, size_t *dst_pos)
 {
-	uint16_t len;
-	uint16_t nlen;
+	const uint8_t *p;
+	size_t len;
+	size_t nlen;
 	size_t i;
 
-	if ((br->nbits & 7U) != 0U) {
-		unsigned int drop;
+	br->nbits -= br->nbits & 7U;
+	br->pos -= br->nbits >> 3;
+	br->bits = 0U;
+	br->nbits = 0U;
 
-		drop = br->nbits & 7U;
-		br->bits >>= drop;
-		br->nbits -= drop;
-	}
-
-	if (br_get_bits(br, 16U, &len) != 0)
+	if (br->len - br->pos < 4U)
 		return -1;
-	if (br_get_bits(br, 16U, &nlen) != 0)
+	p = br->src + br->pos;
+	len = (size_t)p[0] | ((size_t)p[1] << 8);
+	nlen = (size_t)p[2] | ((size_t)p[3] << 8);
+	br->pos += 4U;
+	if ((len ^ 0xffffU) != nlen)
 		return -1;
-	if (((uint16_t)~len) != nlen)
+	if (len > dst_cap - *dst_pos)
 		return -1;
-	if (*dst_pos + len > dst_cap)
-		return -1;
-	if (br->pos + len > br->len)
+	if (len > br->len - br->pos)
 		return -1;
 
 	for (i = 0; i < len; i++)
-		dst[(*dst_pos)++] = br->src[br->pos++];
+		dst[*dst_pos + i] = br->src[br->pos + i];
+	*dst_pos += len;
+	br->pos += len;
 	return 0;
 }
 
@@ -1811,8 +1932,9 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
                                size_t dst_cap)
 {
 	ark_bit_reader_t br;
-	ark_huff_table_t fixed_lit_tab;
-	ark_huff_table_t fixed_dist_tab;
+	uint32_t fixed_lit_tab[1U << ARK_INFLATE_FIXED_LIT_ROOT];
+	uint32_t fixed_dist_tab[1U << ARK_INFLATE_FIXED_DIST_ROOT];
+	int fixed_ready;
 	size_t out_pos;
 
 	if (src == NULL && src_len != 0U)
@@ -1826,8 +1948,7 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	br.bits = 0;
 	br.nbits = 0;
 	out_pos = 0U;
-	if (build_fixed_decode_tables(&fixed_lit_tab, &fixed_dist_tab) != 0)
-		return -1;
+	fixed_ready = 0;
 
 	for (;;) {
 		uint16_t bfinal;
@@ -1843,9 +1964,16 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 			    0)
 				return -1;
 		} else if (btype == 1U) {
-			if (decode_fixed_block(&br, &fixed_lit_tab,
-			                       &fixed_dist_tab, dst, dst_cap,
-			                       &out_pos) != 0)
+			if (!fixed_ready) {
+				if (build_fixed_decode_tables(
+				        fixed_lit_tab, fixed_dist_tab) != 0)
+					return -1;
+				fixed_ready = 1;
+			}
+			if (decode_huffman_block(
+			        &br, fixed_lit_tab, ARK_INFLATE_FIXED_LIT_ROOT,
+			        fixed_dist_tab, ARK_INFLATE_FIXED_DIST_ROOT,
+			        dst, dst_cap, &out_pos) != 0)
 				return -1;
 		} else if (btype == 2U) {
 			if (decode_dynamic_block(&br, dst, dst_cap, &out_pos) !=

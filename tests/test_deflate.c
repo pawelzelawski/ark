@@ -730,3 +730,119 @@ int test_deflate_small_input_not_stored(void)
 		return 1;
 	return round_trip(in, sizeof(in));
 }
+
+/*
+ * decode_expect - Decompress a raw stream. want == NULL expects failure;
+ * otherwise the output must equal want[0..want_len).
+ */
+static int decode_expect(const uint8_t *src, size_t src_len,
+                         const uint8_t *want, size_t want_len)
+{
+	uint8_t out[512];
+	ssize_t n;
+
+	n = ark_deflate_decompress(src, src_len, out, sizeof(out));
+	if (want == NULL)
+		return n == -1 ? 0 : 1;
+	if (n < 0 || (size_t)n != want_len)
+		return 1;
+	return memcmp(out, want, want_len) == 0 ? 0 : 1;
+}
+
+int test_deflate_fixed_then_stored(void)
+{
+	/* Fixed block "A", then stored block "XYZ": the stored header must be
+	 * read from the input, not from bits buffered by the fixed block. */
+	static const uint8_t in[] = {0x72, 0x04, 0x04, 0x03, 0x00,
+	                             0xfc, 0xff, 0x58, 0x59, 0x5a};
+
+	return decode_expect(in, sizeof(in), (const uint8_t *)"AXYZ", 4U);
+}
+
+int test_deflate_accepts_legacy_length_258(void)
+{
+	/* Fixed block: 'A', then length 258 written as code 284 + extra 31
+	 * (pre-2026-10 ark encoders) at distance 1. */
+	static const uint8_t in[] = {0x73, 0x1c, 0xf9, 0x00, 0x00};
+	uint8_t want[259];
+
+	memset(want, 'A', sizeof(want));
+	return decode_expect(in, sizeof(in), want, sizeof(want));
+}
+
+int test_deflate_rejects_incomplete_trees(void)
+{
+	/* Code-length code with an unused code (incomplete). */
+	static const uint8_t cl_incomplete[] = {
+	    0x05, 0xc0, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+	};
+	/* Literal/length code with only 'A' and end-of-block, both 2 bits. */
+	static const uint8_t lit_incomplete[] = {
+	    0x05, 0x80, 0x01, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+	};
+	/* Code-length code with three 1-bit codes (oversubscribed). */
+	static const uint8_t cl_oversubscribed[] = {
+	    0x05, 0xc0, 0x81, 0x04, 0x00, 0x00, 0x00,
+	    0x00, 0x10, 0xb6, 0xfe, 0x52, 0x09,
+	};
+
+	if (decode_expect(cl_incomplete, sizeof(cl_incomplete), NULL, 0U) !=
+	        0 ||
+	    decode_expect(lit_incomplete, sizeof(lit_incomplete), NULL, 0U) !=
+	        0 ||
+	    decode_expect(cl_oversubscribed, sizeof(cl_oversubscribed), NULL,
+	                  0U) != 0)
+		return 1;
+	return 0;
+}
+
+int test_deflate_accepts_allowed_incomplete_trees(void)
+{
+	/* Dynamic block "AA" whose distance code has no codes at all. */
+	static const uint8_t no_dist[] = {0x05, 0xc0, 0x01, 0x05, 0x00,
+	                                  0x00, 0x00, 0x00, 0xa0, 0x6d,
+	                                  0xfd, 0x3f, 0x15, 0x02};
+	/* Dynamic block "A" + match(3, 1) with a single 1-bit distance code. */
+	static const uint8_t one_dist[] = {0x0d, 0xc0, 0x01, 0x01, 0x00,
+	                                   0x00, 0x00, 0x80, 0x90, 0x6d,
+	                                   0xfd, 0x3f, 0x15, 0x31};
+
+	if (decode_expect(no_dist, sizeof(no_dist), (const uint8_t *)"AA",
+	                  2U) != 0)
+		return 1;
+	return decode_expect(one_dist, sizeof(one_dist),
+	                     (const uint8_t *)"AAAA", 4U);
+}
+
+int test_deflate_round_trip_periodic(void)
+{
+	uint8_t *in;
+	size_t period;
+	size_t n;
+	size_t i;
+	int rc;
+
+	/* Periods 1..17 give match distances on both sides of the 8-byte
+	 * word-copy threshold, with long overlapping matches. */
+	in = malloc(17U * 600U);
+	if (in == NULL)
+		return 1;
+	n = 0U;
+	for (period = 1U; period <= 17U; period++) {
+		for (i = 0; i < 600U; i++)
+			in[n + i] = (uint8_t)(period * 16U + i % period);
+		n += 600U;
+	}
+	rc = round_trip(in, n);
+	free(in);
+	return rc;
+}

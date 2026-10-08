@@ -98,3 +98,12 @@ Datasets:
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | Baseline (`9173a31`) | 2026-10-08 | 29.212 | 3.4 | 128 | 36.297 | 18.370 | 20,801,154 | yes |
 | Encoder fixes: length 258 as code 285, Huffman length-limiter Kraft repair, run-length coded dynamic header | 2026-10-08 | 29.111 | 3.5 | 131 | 36.210 | 17.760 | 20,148,320 | yes |
+| Decoder: two-level tables, 64-bit bit reader, word match copies, strict code validation | 2026-10-08 | 29.111 | 3.5 | 261 | 36.210 | 17.760 | 20,148,320 | yes |
+
+Decoder change in detail (same machine, back to back, old vs new decoder on
+the same streams):
+- Mixed corpus, 244 chunks of 1 MiB: 122 -> 261 MB/s.
+- `/usr/include` per file, 7,586 streams: 31 -> 330 MB/s; per-stream cost
+  444 -> 42 us (table setup dominated small files).
+- `ark verify` of the `/usr/include` archive (release build): 4.09 -> 1.00 s.
+- `ark_deflate_decompress` stack frame: 492,360 -> 61,608 bytes.
