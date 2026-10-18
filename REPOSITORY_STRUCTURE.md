@@ -444,7 +444,9 @@ make install      # install ark binary and man page to PREFIX
 
 Platform detected via `OS != uname -s`. `-DARK_TEST` is defined in
 `make test`, `make dev`, `make valgrind`, and `make test-tsan` so that
-fault injection stubs are always active during development.
+fault injection stubs are always active during development. The same
+targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
+test accessors.
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates

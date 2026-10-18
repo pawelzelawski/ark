@@ -44,17 +44,17 @@ CFLAGS_DEV = $(CFLAGS_COMMON)                             \
 
 CFLAGS_RELEASE = $(CFLAGS_COMMON) -O2
 
-CFLAGS_TEST = $(CFLAGS_DEV) -DARK_TEST
+CFLAGS_TEST = $(CFLAGS_DEV) -DARK_TEST -DARK_DEFLATE_TEST
 
 CFLAGS_TSAN = $(CFLAGS_COMMON)                            \
 	-O1 -g3                                              \
 	-fsanitize=thread                                    \
 	-fno-omit-frame-pointer                              \
-	-DARK_TEST
+	-DARK_TEST -DARK_DEFLATE_TEST
 
 CFLAGS_VG = $(CFLAGS_COMMON)                              \
 	-O0 -g3 -gdwarf-4                                    \
-	-DARK_TEST
+	-DARK_TEST -DARK_DEFLATE_TEST
 
 INCLUDES = -I. -I./src -I./vendor/libchevron/include -I./$(BUILD_DIR)
 

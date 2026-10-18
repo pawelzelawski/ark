@@ -1591,6 +1591,7 @@ ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
 		return ark_fail(err, ARK_ERR_FMT_DATA,
 		                "expected chunk length overflows size_t", 0);
 
+	/* The Deflate component reports only -1; map it to ARK_ERR_FMT_DATA. */
 	dec_len = ark_deflate_decompress(src, src_len, dst, dst_cap);
 	if (dec_len < 0)
 		return ark_fail(err, ARK_ERR_FMT_DATA, "invalid deflate stream",

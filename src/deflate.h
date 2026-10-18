@@ -15,11 +15,11 @@
 #include <sys/types.h>
 
 /*
- * ARK_CHUNK_SIZE - Maximum input size in bytes for one ark_deflate_compress
- * call.  The caller must split larger payloads into chunks of this size.
- * See ARCHITECTURE.md section 7.4.
+ * ARK_DEFLATE_MAX_INPUT - Maximum input size in bytes for one
+ * ark_deflate_compress call. The compressor's working tables are sized for
+ * it; the caller splits larger payloads. See ARCHITECTURE.md section 7.4.
  */
-#define ARK_CHUNK_SIZE 1048576U
+#define ARK_DEFLATE_MAX_INPUT 1048576U
 
 typedef enum { ARK_DEFLATE_DEFAULT, ARK_DEFLATE_FAST } ark_deflate_mode_t;
 
@@ -30,8 +30,11 @@ typedef enum { ARK_DEFLATE_DEFAULT, ARK_DEFLATE_FAST } ark_deflate_mode_t;
  * - src_len: uncompressed input size in bytes.
  *
  * Returns a maximum compressed size that is safe to use for dst allocation
- * before calling ark_deflate_compress().
- * Failure contract: does not fail.
+ * before calling ark_deflate_compress(): src_len plus 5 bytes per started
+ * 65,535-byte stored block plus 1 byte of bit padding.
+ * Failure contract: returns 0 when that bound is not representable in
+ * size_t (src_len within a few bytes of SIZE_MAX). Every representable
+ * bound is at least 6, so 0 never means "no output space needed".
  * Preconditions: none.
  */
 size_t ark_deflate_bound(size_t src_len);
@@ -41,16 +44,17 @@ size_t ark_deflate_bound(size_t src_len);
  *
  * Parameters:
  * - src: input byte buffer; may be NULL only when src_len is 0.
- * - src_len: number of input bytes; at most ARK_CHUNK_SIZE.
+ * - src_len: number of input bytes; at most ARK_DEFLATE_MAX_INPUT.
  * - dst: writable output buffer owned by the caller.
  * - dst_cap: writable byte capacity of dst.
  * - mode: ARCHITECTURE.md section 7.4 compressor behavior selector.
  *
  * Returns compressed byte count on success, -1 on failure.
  * Failure contract: returns -1 for invalid arguments, unsupported mode, input
- * larger than ARK_CHUNK_SIZE, or dst_cap smaller than ark_deflate_bound().
+ * larger than ARK_DEFLATE_MAX_INPUT, or dst_cap smaller than
+ * ark_deflate_bound().
  * Preconditions:
- * - src_len must be at most 1048576 bytes (one ARK chunk).
+ * - src_len must be at most ARK_DEFLATE_MAX_INPUT bytes.
  * - dst_cap must be at least ark_deflate_bound(src_len).
  */
 ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
@@ -69,8 +73,6 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
  * Returns decompressed byte count on success, -1 on failure.
  * Failure contract: returns -1 for invalid arguments, malformed Deflate input,
  * reserved block types, invalid back-references, or output buffer overflow.
- * This component does not produce ark_error_t codes; archive.c synthesizes
- * ARK_ERR_FMT_DATA when ark_deflate_decompress() returns -1.
  * Preconditions: dst_cap must describe the full writable extent of dst.
  */
 ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,

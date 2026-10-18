@@ -44,8 +44,8 @@ tests/
 └── test_integration.c    # end-to-end create → verify → extract pipelines
 ```
 
-`make test` builds all test files with `-DARK_TEST` against all source files
-and runs the binary.
+`make test` builds all test files with `-DARK_TEST` and `-DARK_DEFLATE_TEST`
+against all source files and runs the binary.
 
 ### 2.2 Test Assertion Macro
 
@@ -140,7 +140,8 @@ Command sequence points that are not syscalls use `ark_test_cli_fault_inject`
 in `src/main.c` (for example `ARK_CLI_FAULT_CLEANUP_GROW`, which fails the
 extraction cleanup-tracker allocation). Deflate encoder internals are reached
 through stateless `ark_deflate_test_*` accessors compiled only with
-`-DARK_TEST`.
+`-DARK_DEFLATE_TEST`, the codec's own test flag, so `deflate.c` does not
+depend on ark's `ARK_TEST`.
 
 ---
 
@@ -202,6 +203,9 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_deflate_round_trip_sub_chunk` | 512KB input; round-trip identity |
 | `test_deflate_incompressible_within_bound` | Incompressible input; compressed size <= `ark_deflate_bound(src_len)` |
 | `test_deflate_bound_non_zero` | `ark_deflate_bound(n) > n` for all tested n |
+| `test_deflate_bound_exact_values` | Bound = n + 5 per started 65,535-byte block + 1 (one block for n = 0), pinned at block edges and `ARK_DEFLATE_MAX_INPUT` |
+| `test_deflate_bound_overflow` | `ark_deflate_bound(SIZE_MAX)` is 0; near `SIZE_MAX` every result is 0 or larger than n (no wrap) |
+| `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes: `ark_deflate_compress` returns -1 |
 | `test_deflate_stored_block_valid` | Incompressible chunk stored as Deflate stored block; decompresses correctly |
 | `test_deflate_default_emits_dynamic_block` | Default mode emits a dynamic-Huffman block for compressible input |
 | `test_deflate_fast_emits_fixed_block` | Fast mode emits a fixed-Huffman block for compressible input |

@@ -1862,16 +1862,23 @@ static int decode_stored_block(ark_bit_reader_t *br, uint8_t *dst,
  * ark_deflate_bound - Return safe maximum compressed size for src_len bytes.
  *
  * The bound accounts for stored-block framing in the worst incompressible
- * case (RFC 1951) and includes one-byte headroom for bit padding.
- * See ARCHITECTURE.md sections 7.1 and 7.2.
+ * case (RFC 1951) and includes one-byte headroom for bit padding. Returns 0
+ * when the bound does not fit in size_t. See ARCHITECTURE.md sections 7.1,
+ * 7.2 and 7.4.
  */
 size_t ark_deflate_bound(size_t src_len)
 {
 	size_t blocks;
 	size_t overhead;
 
-	blocks = (src_len == 0U) ? 1U : ((src_len + 65534U) / 65535U);
+	/* Ceiling division; src_len + 65534 would wrap near SIZE_MAX. */
+	blocks = src_len / 65535U + (src_len % 65535U != 0U ? 1U : 0U);
+	if (blocks == 0U)
+		blocks = 1U;
+	/* blocks <= SIZE_MAX / 65535, so blocks * 5 + 1 cannot wrap. */
 	overhead = blocks * 5U + 1U;
+	if (src_len > SIZE_MAX - overhead)
+		return 0U;
 	return src_len + overhead;
 }
 
@@ -1893,7 +1900,7 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 	if (dst == NULL)
 		return -1;
-	if (src_len > ARK_CHUNK_SIZE)
+	if (src_len > ARK_DEFLATE_MAX_INPUT)
 		return -1;
 	if (src_len != 0U && src == NULL)
 		return -1;
@@ -1993,27 +2000,27 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	return (ssize_t)out_pos;
 }
 
-#ifdef ARK_TEST
+#ifdef ARK_DEFLATE_TEST
 /*
- * ARK_TEST-only accessors for encoder internals. They keep no state and are
- * compiled out of production builds; tests declare them locally.
+ * ARK_DEFLATE_TEST-only accessors for encoder internals. They keep no state and
+ * are compiled out of production builds; tests declare them locally.
  */
 
-/* ARK_TEST only: map a match length to its length symbol and extra bits. */
+/* ARK_DEFLATE_TEST only: match length to length symbol + extra bits. */
 int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,
                                    unsigned int *extra_n, uint16_t *extra_v)
 {
 	return length_symbol(len, sym, extra_n, extra_v);
 }
 
-/* ARK_TEST only: build length-limited Huffman code lengths. */
+/* ARK_DEFLATE_TEST only: build length-limited Huffman code lengths. */
 int ark_deflate_test_limit_lengths(const uint32_t *freq, size_t n_symbols,
                                    uint8_t *lengths, unsigned int max_bits)
 {
 	return build_length_limited_lengths(freq, n_symbols, lengths, max_bits);
 }
 
-/* ARK_TEST only: build the code-length plan; returns CL lengths + HCLEN. */
+/* ARK_DEFLATE_TEST only: code-length plan; returns CL lengths + HCLEN. */
 int ark_deflate_test_cl_plan(const uint8_t *lit_len, size_t hlit,
                              const uint8_t *dist_len, size_t hdist,
                              uint8_t cl_len[19], size_t *hclen)
@@ -2030,8 +2037,8 @@ int ark_deflate_test_cl_plan(const uint8_t *lit_len, size_t hlit,
 }
 
 /*
- * ARK_TEST only: report the costed and the actually emitted size, in bits,
- * of a dynamic block header (including the 3-bit block header).
+ * ARK_DEFLATE_TEST only: report the costed and the actually emitted size, in
+ * bits, of a dynamic block header (including the 3-bit block header).
  */
 int ark_deflate_test_header_bits(const uint8_t *lit_len, size_t hlit,
                                  const uint8_t *dist_len, size_t hdist,

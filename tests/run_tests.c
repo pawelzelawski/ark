@@ -101,6 +101,9 @@ int test_deflate_round_trip_exact_chunk(void);
 int test_deflate_round_trip_sub_chunk(void);
 int test_deflate_incompressible_within_bound(void);
 int test_deflate_bound_non_zero(void);
+int test_deflate_bound_exact_values(void);
+int test_deflate_bound_overflow(void);
+int test_deflate_rejects_oversize_input(void);
 int test_deflate_stored_block_valid(void);
 int test_deflate_default_emits_dynamic_block(void);
 int test_deflate_fast_emits_fixed_block(void);
@@ -274,6 +277,10 @@ static const test_case_t g_tests[] = {
     {"test_deflate_incompressible_within_bound",
      test_deflate_incompressible_within_bound},
     {"test_deflate_bound_non_zero", test_deflate_bound_non_zero},
+    {"test_deflate_bound_exact_values", test_deflate_bound_exact_values},
+    {"test_deflate_bound_overflow", test_deflate_bound_overflow},
+    {"test_deflate_rejects_oversize_input",
+     test_deflate_rejects_oversize_input},
     {"test_deflate_stored_block_valid", test_deflate_stored_block_valid},
     {"test_deflate_default_emits_dynamic_block",
      test_deflate_default_emits_dynamic_block},

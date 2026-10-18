@@ -5,7 +5,7 @@
 
 #include "deflate.h"
 
-/* ARK_TEST-only encoder accessors defined in src/deflate.c. */
+/* ARK_DEFLATE_TEST-only encoder accessors defined in src/deflate.c. */
 int ark_deflate_test_length_symbol(size_t, unsigned int *, unsigned int *,
                                    uint16_t *);
 int ark_deflate_test_limit_lengths(const uint32_t *, size_t, uint8_t *,
@@ -114,11 +114,11 @@ int test_deflate_round_trip_exact_chunk(void)
 	uint8_t *data;
 	int rc;
 
-	data = malloc(ARK_CHUNK_SIZE);
+	data = malloc(ARK_DEFLATE_MAX_INPUT);
 	if (data == NULL)
 		return 1;
-	fill_pattern(data, ARK_CHUNK_SIZE);
-	rc = round_trip(data, ARK_CHUNK_SIZE);
+	fill_pattern(data, ARK_DEFLATE_MAX_INPUT);
+	rc = round_trip(data, ARK_DEFLATE_MAX_INPUT);
 	free(data);
 	return rc;
 }
@@ -128,11 +128,11 @@ int test_deflate_round_trip_sub_chunk(void)
 	uint8_t *data;
 	int rc;
 
-	data = malloc(ARK_CHUNK_SIZE / 2U);
+	data = malloc(ARK_DEFLATE_MAX_INPUT / 2U);
 	if (data == NULL)
 		return 1;
-	fill_pattern(data, ARK_CHUNK_SIZE / 2U);
-	rc = round_trip(data, ARK_CHUNK_SIZE / 2U);
+	fill_pattern(data, ARK_DEFLATE_MAX_INPUT / 2U);
+	rc = round_trip(data, ARK_DEFLATE_MAX_INPUT / 2U);
 	free(data);
 	return rc;
 }
@@ -181,7 +181,7 @@ int test_deflate_bound_non_zero(void)
 	    1024U,
 	    65535U,
 	    65536U,
-	    ARK_CHUNK_SIZE,
+	    ARK_DEFLATE_MAX_INPUT,
 	};
 	size_t i;
 
@@ -190,6 +190,83 @@ int test_deflate_bound_non_zero(void)
 			return 1;
 	}
 	return 0;
+}
+
+/*
+ * test_deflate_bound_exact_values - The bound is src_len + 5 bytes per
+ * started 65,535-byte stored block + 1, with one block for empty input.
+ * Pins the values so the overflow-safe arithmetic changes none of them.
+ */
+int test_deflate_bound_exact_values(void)
+{
+	static const size_t cases[][2] = {
+	    {0U, 6U},
+	    {1U, 7U},
+	    {65534U, 65540U},
+	    {65535U, 65541U},
+	    {65536U, 65547U},
+	    {131070U, 131081U},
+	    {131071U, 131087U},
+	    {ARK_DEFLATE_MAX_INPUT, ARK_DEFLATE_MAX_INPUT + 17U * 5U + 1U},
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		if (ark_deflate_bound(cases[i][0]) != cases[i][1])
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * test_deflate_bound_overflow - Near SIZE_MAX the bound is not
+ * representable: ark_deflate_bound returns 0 instead of a wrapped value,
+ * and every non-zero result is larger than its input.
+ */
+int test_deflate_bound_overflow(void)
+{
+	size_t k;
+
+	if (ark_deflate_bound(SIZE_MAX) != 0U)
+		return 1;
+	for (k = 0U; k < 70000U; k += 7U) {
+		size_t n = SIZE_MAX - k;
+		size_t b = ark_deflate_bound(n);
+
+		if (b != 0U && b <= n)
+			return 1;
+	}
+	if (ark_deflate_bound(SIZE_MAX / 2U) <= SIZE_MAX / 2U)
+		return 1;
+	return 0;
+}
+
+/*
+ * test_deflate_rejects_oversize_input - One byte more than
+ * ARK_DEFLATE_MAX_INPUT is rejected without writing output.
+ */
+int test_deflate_rejects_oversize_input(void)
+{
+	uint8_t *data;
+	uint8_t *comp;
+	size_t len;
+	size_t bound;
+	int rc;
+
+	len = (size_t)ARK_DEFLATE_MAX_INPUT + 1U;
+	bound = ark_deflate_bound(len);
+	data = calloc(1U, len);
+	comp = malloc(bound);
+	rc = 1;
+	if (data != NULL && comp != NULL) {
+		ssize_t n = ark_deflate_compress(data, len, comp, bound,
+		                                 ARK_DEFLATE_DEFAULT);
+
+		rc = n == -1 ? 0 : 1;
+	}
+	free(comp);
+	free(data);
+	return rc;
 }
 
 int test_deflate_stored_block_valid(void)
@@ -518,7 +595,7 @@ int test_deflate_zero_run_uses_code_285(void)
 	ssize_t fast_len;
 	int rc;
 
-	in = calloc(1U, ARK_CHUNK_SIZE);
+	in = calloc(1U, ARK_DEFLATE_MAX_INPUT);
 	if (in == NULL)
 		return 1;
 	/*
@@ -526,10 +603,12 @@ int test_deflate_zero_run_uses_code_285(void)
 	 * extra bits) 1 MiB of zeros needs ~1.1 KiB in default mode and
 	 * ~6.5 KiB in fast mode; the old 284+31 form needed 4,783 and 9,149.
 	 */
-	def_len = compress_size(in, ARK_CHUNK_SIZE, ARK_DEFLATE_DEFAULT, NULL);
-	fast_len = compress_size(in, ARK_CHUNK_SIZE, ARK_DEFLATE_FAST, NULL);
+	def_len =
+	    compress_size(in, ARK_DEFLATE_MAX_INPUT, ARK_DEFLATE_DEFAULT, NULL);
+	fast_len =
+	    compress_size(in, ARK_DEFLATE_MAX_INPUT, ARK_DEFLATE_FAST, NULL);
 	rc = def_len > 0 && def_len < 2048 && fast_len > 0 && fast_len < 8192
-	         ? round_trip(in, ARK_CHUNK_SIZE)
+	         ? round_trip(in, ARK_DEFLATE_MAX_INPUT)
 	         : 1;
 	free(in);
 	return rc;

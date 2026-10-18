@@ -16,6 +16,16 @@
 
 #include "deflate.h"
 
+/*
+ * ARK_CHUNK_SIZE - Uncompressed size of every chunk except a member's last
+ * one; each chunk is one independent Deflate stream. See ARCHITECTURE.md
+ * section 6.2.
+ */
+#define ARK_CHUNK_SIZE 1048576U
+
+_Static_assert(ARK_CHUNK_SIZE <= ARK_DEFLATE_MAX_INPUT,
+               "one ark chunk must fit one ark_deflate_compress call");
+
 typedef enum {
 	ARK_OK = 0,
 

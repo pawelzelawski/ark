@@ -728,11 +728,19 @@ typedef enum {
     ARK_DEFLATE_FAST       /* greedy parsing, faster compression (--fast flag) */
 } ark_deflate_mode_t;
 
-/* Returns the maximum compressed size for src_len bytes of uncompressed input.
-   Caller uses this to allocate dst before calling ark_deflate_compress. */
+/* Largest input of one ark_deflate_compress call (1 MiB). ark's chunk size,
+   ARK_CHUNK_SIZE in archive.h (section 6.2), is checked against it at
+   compile time. */
+#define ARK_DEFLATE_MAX_INPUT 1048576U
+
+/* Returns the maximum compressed size for src_len bytes of uncompressed input:
+   src_len + 5 bytes per started 65,535-byte stored block + 1. Caller uses
+   this to allocate dst before calling ark_deflate_compress. Returns 0 when
+   the bound does not fit in size_t; every valid bound is at least 6. */
 size_t  ark_deflate_bound(size_t src_len);
 
 /* Compress src into dst. Returns compressed size on success, -1 on error.
+   src_len must be at most ARK_DEFLATE_MAX_INPUT;
    dst must be at least ark_deflate_bound(src_len) bytes.
    When compressed output >= src_len, emits a Deflate stored block. */
 ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len,
@@ -740,7 +748,8 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len,
                               ark_deflate_mode_t mode);
 
 /* Decompress src into dst. Returns decompressed size on success, -1 on error.
-   dst must be large enough to hold the decompressed output. */
+   dst must be large enough to hold the decompressed output. The component
+   reports only -1; archive.c maps it to ARK_ERR_FMT_DATA. */
 ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len,
                                 uint8_t       *dst, size_t dst_cap);
 ```
