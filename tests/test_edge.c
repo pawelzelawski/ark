@@ -43,6 +43,8 @@ static ark_write_ctx_t *ctx_from_storage(write_ctx_storage_t *storage)
 
 static void meta_init(ark_member_meta_t *meta, const char *path)
 {
+	size_t len;
+
 	/* Minimal regular-file metadata baseline used by writer edge checks. */
 	memset(meta, 0, sizeof(*meta));
 	meta->type = 0x01U;
@@ -50,7 +52,11 @@ static void meta_init(ark_member_meta_t *meta, const char *path)
 	meta->uid = 1000U;
 	meta->gid = 1000U;
 	meta->mtime = 1U;
-	(void)strncpy(meta->path, path, sizeof(meta->path) - 1);
+	/* Bounded copy; the memset above supplies the terminating NUL. */
+	len = strlen(path);
+	if (len > sizeof(meta->path) - 1U)
+		len = sizeof(meta->path) - 1U;
+	memcpy(meta->path, path, len);
 }
 
 int test_edge_empty_archive(void)

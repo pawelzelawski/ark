@@ -1302,8 +1302,15 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			}
 		}
 
+#if SIZE_MAX / 4U < UINT32_MAX
+		/*
+		 * SAFETY: only a size_t narrower than 34 bits can overflow
+		 * chunk_count * 4; on LP64 the check is always false and gcc
+		 * -Wtype-limits rejects it, so it is compiled where it matters.
+		 */
 		if ((size_t)m->chunk_count > SIZE_MAX / sizeof(uint32_t))
 			goto fmt_index;
+#endif
 		chunk_bytes = (size_t)m->chunk_count * sizeof(uint32_t);
 		if (m->chunk_count > 0U) {
 			if (off > index_len || index_len - off < chunk_bytes)

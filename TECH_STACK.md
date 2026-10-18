@@ -157,8 +157,10 @@ OpenBSD 7.x via the base system.
 
 **Minimum version**: GCC 11.0
 
-GCC is supported as a secondary compiler. GCC builds are validated on Linux
-only. TSan is not run under GCC - the TSan build target requires Clang.
+GCC is supported as a secondary compiler. Release builds use Clang; GCC
+builds are validated on Linux only: CI builds and tests with
+`make CC=gcc dev test release` on Linux amd64, and that job is required.
+TSan is not run under GCC - the TSan build target requires Clang.
 GCC 11.0 is the default on Ubuntu 22.04 LTS.
 
 ### 4.3 Compiler Flags
@@ -391,11 +393,17 @@ Clang availability and fails with a clear message when built with GCC.
 
 **Purpose**: Static analysis.
 
-**Installation**: included with Clang.
+**Installation**: included with Clang on Linux distributions; on OpenBSD
+from the `llvm` package (`pkg_add llvm%21`), which installs
+`/usr/local/bin/clang-tidy`.
 
 ```sh
 make lint
 ```
+
+CI runs `make lint` with current tool versions, so CI and the development
+machines report the same findings: on Linux in a `fedora:44` container, on
+OpenBSD 7.9 (amd64 and arm64) with `llvm%21` and `cppcheck`.
 
 ### 7.5 cppcheck
 

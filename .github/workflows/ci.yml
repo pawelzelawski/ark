@@ -25,13 +25,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y clang clang-tidy cppcheck valgrind
+        run: sudo apt-get update -qq && sudo apt-get install -y clang valgrind
 
       - name: Build (dev)
         run: make dev
-
-      - name: Lint
-        run: make lint
 
       - name: Test (ASan/UBSan)
         run: make test
@@ -45,6 +42,58 @@ jobs:
       - name: Build (release)
         run: make release
 
+  # Lint runs with the same current cppcheck/clang-tidy as the development
+  # machine (Fedora), so CI and local `make lint` report the same findings.
+  lint-fedora:
+    name: Lint (Fedora 44)
+    runs-on: ubuntu-24.04
+    container: fedora:44
+
+    steps:
+      - name: Install dependencies
+        run: >-
+          dnf install -y --setopt=install_weak_deps=False
+          clang clang-tools-extra cppcheck make gawk git diffutils
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          clang --version | head -n 1
+          clang-tidy --version | grep -i version
+          cppcheck --version
+
+      - name: Lint
+        run: |
+          make build/recovery_template_data.h
+          make lint
+
+  # ark builds with clang; gcc keeps the code (and the codec/hash files that
+  # become a separate library) building and passing with a second compiler.
+  build-and-test-gcc:
+    name: Linux amd64 (gcc)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y gcc clang
+
+      - name: Compiler version
+        run: gcc --version | head -n 1
+
+      - name: Build (dev, gcc)
+        run: make CC=gcc dev
+
+      - name: Test (ASan/UBSan, gcc)
+        run: make CC=gcc test
+
+      - name: Build (release, gcc)
+        run: make CC=gcc release
+
   build-and-test-openbsd-amd64:
     name: OpenBSD amd64
     runs-on: ubuntu-latest
@@ -53,10 +102,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and test in OpenBSD
-        uses: vmactions/openbsd-vm@v1.3.8
+        uses: vmactions/openbsd-vm@v1.4.8
         with:
+          release: "7.9"
           usesh: true
+          # Same lint tools as the development OpenBSD machine (7.9):
+          # clang-tidy from llvm 21, cppcheck 2.18.
+          prepare: |
+            pkg_add -I llvm%21 cppcheck
           run: |
+            set -e
             make dev
             make test || {
               echo "make test failed; collecting backtrace from build/tests/run_tests"
@@ -83,6 +138,7 @@ jobs:
               fi
               exit 1
             }
+            make lint
 
   build-and-test-openbsd-arm64:
     name: OpenBSD arm64
@@ -92,11 +148,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and test in OpenBSD
-        uses: vmactions/openbsd-vm@v1.3.8
+        uses: vmactions/openbsd-vm@v1.4.8
         with:
+          release: "7.9"
           usesh: true
           arch: aarch64
+          # Same lint tools as the development OpenBSD machine (7.9):
+          # clang-tidy from llvm 21, cppcheck 2.18.
+          prepare: |
+            pkg_add -I llvm%21 cppcheck
           run: |
+            set -e
             make dev
             make test || {
               echo "make test failed; collecting backtrace from build/tests/run_tests"
@@ -123,4 +185,5 @@ jobs:
               fi
               exit 1
             }
+            make lint
 
