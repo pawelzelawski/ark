@@ -158,6 +158,25 @@ static int write_pattern_file(const char *path, size_t total, uint32_t seed)
  *
  * OWNERSHIP: on success *out is owned by the caller and must be freed.
  */
+/* Archive builder defined in test_archive.c. */
+size_t test_archive_one_chunk(uint8_t *, size_t, const uint8_t *, size_t,
+                              uint64_t, size_t *);
+
+/* Write len bytes to a new file at path. Returns 0 on success, -1 on error. */
+static int write_bytes_file(const char *path, const uint8_t *buf, size_t len)
+{
+	int fd;
+	int rc;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd == -1)
+		return -1;
+	rc = write_full_fd(fd, buf, len);
+	if (close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
 static int read_file_bytes(const char *path, uint8_t **out, size_t *out_len)
 {
 	struct stat st;
@@ -1014,6 +1033,75 @@ int test_integration_generate_reader(void)
 		goto cleanup;
 	rc = compare_tree(src, out) == 0 ? 0 : 1;
 cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
+/*
+ * test_integration_generate_reader_rejects_legacy_258 - The generated reader
+ * applies the decoder's RFC 1951 rule: a chunk coding length 258 as code
+ * 284 + extra 31 (pre-v1.1.0 encoders) fails recovery, while the same
+ * archive with 284 + 30 (length 257) recovers. Archives are hand-built with
+ * valid hashes, so only the length rule differs. See ARCHITECTURE.md 7.4.
+ */
+int test_integration_generate_reader_rejects_legacy_258(void)
+{
+	/* Fixed block 'A', code 284 + extra 31 or 30, distance 1, EOB. */
+	static const uint8_t legacy[] = {0x73, 0x1c, 0xf9, 0x00, 0x00};
+	static const uint8_t valid[] = {0x73, 0x1c, 0xf1, 0x00, 0x00};
+	char root[PATH_MAX], out_bad[PATH_MAX], out_ok[PATH_MAX];
+	char bad_ark[PATH_MAX], ok_ark[PATH_MAX], member[PATH_MAX];
+	char recovery_c[PATH_MAX], recover_bin[PATH_MAX];
+	char *gen_argv[] = {(char *)g_ark_bin, "generate-reader", recovery_c,
+	                    NULL};
+	char *cc_argv[] = {"cc", "-O2", recovery_c, "-o", recover_bin, NULL};
+	char *bad_argv[] = {recover_bin, bad_ark, NULL};
+	char *ok_argv[] = {recover_bin, ok_ark, NULL};
+	uint8_t buf[512];
+	uint8_t *got;
+	size_t got_len;
+	size_t index_len;
+	size_t len;
+	size_t i;
+	int rc;
+
+	got = NULL;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(out_bad, sizeof(out_bad), root, "out-bad") != 0 ||
+	    path_join(out_ok, sizeof(out_ok), root, "out-ok") != 0 ||
+	    path_join(bad_ark, sizeof(bad_ark), root, "legacy.ark") != 0 ||
+	    path_join(ok_ark, sizeof(ok_ark), root, "valid.ark") != 0 ||
+	    path_join(member, sizeof(member), out_ok, "a") != 0 ||
+	    path_join(recovery_c, sizeof(recovery_c), root, "recovery.c") !=
+	        0 ||
+	    path_join(recover_bin, sizeof(recover_bin), root, "recover") != 0)
+		goto cleanup;
+	if (mkdir(out_bad, 0700) != 0 || mkdir(out_ok, 0700) != 0)
+		goto cleanup;
+	len = test_archive_one_chunk(buf, sizeof(buf), legacy, sizeof(legacy),
+	                             259U, &index_len);
+	if (len == 0U || write_bytes_file(bad_ark, buf, len) != 0)
+		goto cleanup;
+	len = test_archive_one_chunk(buf, sizeof(buf), valid, sizeof(valid),
+	                             258U, &index_len);
+	if (len == 0U || write_bytes_file(ok_ark, buf, len) != 0)
+		goto cleanup;
+	if (run_ark(gen_argv, 0, NULL, NULL) != 0 ||
+	    run_program(cc_argv, NULL, NULL, NULL) != 0)
+		goto cleanup;
+	if (run_program(bad_argv, out_bad, "/dev/null", "/dev/null") == 0)
+		goto cleanup;
+	if (run_program(ok_argv, out_ok, "/dev/null", "/dev/null") != 0 ||
+	    read_file_bytes(member, &got, &got_len) != 0 || got_len != 258U)
+		goto cleanup;
+	for (i = 0; i < got_len; i++) {
+		if (got[i] != 'A')
+			goto cleanup;
+	}
+	rc = 0;
+cleanup:
+	free(got);
 	(void)remove_tree(root);
 	return rc;
 }

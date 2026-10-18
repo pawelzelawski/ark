@@ -99,7 +99,8 @@ src/
 │                       #   ark_deflate_enc_size()   - encoder memory size
 │                       #   ark_deflate_enc_init()   - encoder in caller memory
 │                       #   ark_deflate_enc_oneshot()- compress one chunk
-│                       #   ark_deflate_decompress() - decompress one chunk
+│                       #   ark_deflate_dec_oneshot()- decompress one chunk
+│                       #     and report the input bytes used
 │                       #   ark_deflate_bound()      - maximum compressed
 │                       #     output size for a given input size; used by
 │                       #     main.c to size output buffers
@@ -530,7 +531,7 @@ Checks: >
 | `ark_deflate_enc_size` | `src/deflate.c` | Public; encoder memory size query |
 | `ark_deflate_enc_init` | `src/deflate.c` | Public; encoder in caller memory (`pool_init`) |
 | `ark_deflate_enc_oneshot` | `src/deflate.c` | Public; called by worker threads |
-| `ark_deflate_decompress` | `src/deflate.c` | Public; called by worker threads |
+| `ark_deflate_dec_oneshot` | `src/deflate.c` | Public; called by worker threads and `ark_read_chunk` |
 | `ark_deflate_bound` | `src/deflate.c` | Public; output buffer sizing |
 | `ark_write_init` | `src/archive.c` | Public |
 | `ark_write_header` | `src/archive.c` | Public |

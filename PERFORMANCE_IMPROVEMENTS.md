@@ -144,3 +144,13 @@ byte-identical.
 |---|---|---|---|
 | Default | 8.77 -> 7.42 | 31.85 -> 27.16 (-14.7 %) | 1.48 -> 0.75 |
 | Fast | 1.08 -> 1.03 | 4.33 -> 4.19 (-3.3 %) | 0.21 -> 0.11 |
+
+**Decoder status API and exact table sizes** (decode tables sized for the
+worst-case code instead of a per-symbol bound: lit/len 10,240 -> 5,408 and
+distance 4,352 -> 1,536 entries; dynamic-block stack about 57 -> 28 KiB).
+Best of 5 interleaved decodes, then `perf stat`, old -> new:
+
+| Data | Best decode (s) | Cycles (G) |
+|---|---|---|
+| 32 MiB corpus slice, 32 streams | 0.135 -> 0.127 | n/a |
+| `/usr/include` per file, 7,661 streams | 0.311 -> 0.297 | 3.278 -> 3.100 (-5.4 %) |

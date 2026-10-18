@@ -519,6 +519,9 @@ is the sole source of structural metadata.
 Each member's content is split into fixed-size 1MB chunks before compression.
 Each chunk is compressed independently as a complete Deflate stream. The last
 chunk of a member contains the remaining bytes and may be smaller than 1MB.
+A stored chunk is exactly one Deflate stream: readers reject a chunk with
+bytes after the stream's final block (`ARK_ERR_FMT_DATA`), since those bytes
+would be covered by the member hash yet never decoded.
 
 **Chunk size: 1MB (1,048,576 bytes) uncompressed.**
 
@@ -556,18 +559,20 @@ inside the single I/O thread and keeps parallelism entirely within
 `main.c`.
 
 **Decompression threading model (extract).** The extract path is symmetric
-with the create path. Worker threads call `ark_deflate_decompress` directly
+with the create path. Worker threads call `ark_deflate_dec_oneshot` directly
 from `deflate.h`. Workers never call `ark_read_chunk`. `ark_read_ctx_t` is
 not thread-safe and is never accessed from worker threads; it is used only
 by the I/O thread for index and metadata access. Each worker receives a
-compressed chunk buffer and an output buffer; it calls `ark_deflate_decompress`
+compressed chunk buffer and an output buffer; it calls `ark_deflate_dec_oneshot`
 and writes the result and the decompressed byte count to its ring buffer slot.
+A chunk whose stream ends before the chunk does (bytes after the final block)
+counts as a failed call.
 The I/O thread drains the ring buffer in sequence order and performs the
 decompressed-length validation: for each non-final chunk, the decompressed
 length must equal 1,048,576 bytes; for the final chunk it must equal
 `size_original mod 1,048,576` (or 1,048,576 if `size_original` is an exact
-multiple). A length mismatch or a failed `ark_deflate_decompress` call (return
--1) causes the I/O thread to set `ARK_ERR_FMT_DATA` in the shared error struct,
+multiple). A length mismatch or a failed `ark_deflate_dec_oneshot` call (a
+status other than `ARK_DEFLATE_OK`) causes the I/O thread to set `ARK_ERR_FMT_DATA` in the shared error struct,
 set the cancellation flag, join all workers, and proceed to cleanup. The I/O
 thread owns all `ARK_ERR_FMT_DATA` generation for decompression; worker threads
 signal failure only by writing an abort sentinel to their ring buffer slot.
@@ -592,8 +597,9 @@ is set. This requirement applies to both create and extract subcommands.
 
 **Worker-to-I/O error propagation.** A worker thread may itself encounter
 a fatal error. On the create path this means `ark_deflate_enc_oneshot`
-returning a status other than `ARK_DEFLATE_OK`. On the extract path this means `ark_deflate_decompress`
-returning -1. In neither case does the worker generate an `ark_err_t`
+returning a status other than `ARK_DEFLATE_OK`. On the extract path this means `ark_deflate_dec_oneshot`
+returning a status other than `ARK_DEFLATE_OK`, or a chunk with bytes after
+its stream. In neither case does the worker generate an `ark_err_t`
 error code: error classification (`ARK_ERR_IO_WRITE` for compression
 failure, `ARK_ERR_FMT_DATA` for decompression failure) is the I/O
 thread's responsibility. Workers signal failure only via the abort
@@ -783,12 +789,29 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
    the bound does not fit in size_t; every valid bound is at least 6. */
 size_t  ark_deflate_bound(size_t src_len);
 
-/* Decompress src into dst. Returns decompressed size on success, -1 on error.
-   dst must be large enough to hold the decompressed output. The component
-   reports only -1; archive.c maps it to ARK_ERR_FMT_DATA. */
-ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len,
-                                uint8_t       *dst, size_t dst_cap);
+/* Decode one raw RFC 1951 stream with the full 32 KiB window. Bytes after
+   the stream's final block are allowed and left unread: *src_used gets the
+   bytes up to and including the one holding the final block's last bit, so
+   back-to-back streams can be decoded one after another. *dst_len gets the
+   output size. ERR_DATA for malformed or truncated input, ERR_OUTPUT when
+   the output exceeds dst_cap, ERR_USAGE for NULL arguments; both counts are
+   0 after a failure. ark maps every failure to ARK_ERR_FMT_DATA and
+   requires *src_used to equal the chunk size (section 6.2). */
+ark_deflate_status_t ark_deflate_dec_oneshot(const uint8_t *src,
+                                             size_t src_len, size_t *src_used,
+                                             uint8_t *dst, size_t dst_cap,
+                                             size_t *dst_len);
 ```
+
+**Decoder strictness.** The decoder follows RFC 1951 strictly: invalid or
+incomplete Huffman codes (except the one-code cases RFC 1951 allows),
+distances beyond the output, the reserved block type and code 284 with extra
+value 31 are rejected. Length 258 has exactly one code, 285; ark encoders
+before v1.1.0 wrote it as 284 + 31, so archives from v1.0.0 that contain
+258-byte matches must be re-created (zlib still accepts that form; ark and
+its recovery reader do not). The decoder uses no workspace: its Huffman
+tables live on the stack, sized for the worst-case code (about 28 KiB in a
+dynamic block).
 
 **Level semantics.** `ARK_DEFLATE_LEVEL_DEFAULT` uses lazy matching and
 cost-based block boundary decisions. This is the default level used by the
@@ -2486,12 +2509,12 @@ int ark_read_find_member(const ark_read_ctx_t *ctx,
    size_original is an exact multiple). A src_len mismatch against the
    indexed compressed chunk size returns -1 with ARK_ERR_FMT_DATA. A
    decompressed length mismatch returns -1 with ARK_ERR_FMT_DATA. An invalid
-   Deflate stream returns -1 with
+   Deflate stream, or bytes after the stream's final block, returns -1 with
    ARK_ERR_FMT_DATA. Returns decompressed bytes written on success, -1 on
    error. chunk_index must be in range [0, meta->chunk_count).
    Single-threaded extraction: main.c calls this in the main loop after
    reading each compressed chunk. Parallel extraction: workers call
-   ark_deflate_decompress directly and never call this function; the I/O
+   ark_deflate_dec_oneshot directly and never call this function; the I/O
    thread performs length validation and ARK_ERR_FMT_DATA classification
    after draining each ring buffer slot (see §6.3). */
 ssize_t ark_read_chunk(ark_read_ctx_t          *ctx,

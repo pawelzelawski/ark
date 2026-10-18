@@ -12,7 +12,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/types.h>
 
 /*
  * ARK_DEFLATE_MAX_INPUT - Largest max_input an encoder accepts, so the largest
@@ -31,7 +30,7 @@
 #define ARK_DEFLATE_MAX_WINDOW_BITS 15U
 
 /*
- * ark_deflate_status_t - Result of the encoder (and later decoder) calls.
+ * ark_deflate_status_t - Result of the encoder and decoder calls.
  * END, NEED_INPUT and NEED_OUTPUT are reserved for the streaming calls.
  */
 typedef enum {
@@ -140,21 +139,30 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 size_t ark_deflate_bound(size_t src_len);
 
 /*
- * ark_deflate_decompress - Decompress one Deflate stream into dst.
+ * ark_deflate_dec_oneshot - Decode one complete raw RFC 1951 stream.
  *
  * Parameters:
- * - src: compressed Deflate byte stream; may be NULL only when src_len is 0.
- * - src_len: compressed input byte count.
- * - dst: writable output buffer owned by the caller; may be NULL only when
- *   dst_cap is 0.
- * - dst_cap: maximum decompressed output bytes to write.
+ * - src: compressed bytes; may be NULL only when src_len is 0. Bytes after
+ *   the stream's final block are allowed and left unread.
+ * - src_len: number of bytes available at src.
+ * - src_used: receives the bytes the stream occupies, up to and including
+ *   the byte holding the last bit of its final block.
+ * - dst: output buffer owned by the caller; may be NULL only when dst_cap
+ *   is 0.
+ * - dst_cap: byte capacity of dst.
+ * - dst_len: receives the decompressed size.
  *
- * Returns decompressed byte count on success, -1 on failure.
- * Failure contract: returns -1 for invalid arguments, malformed Deflate input,
- * reserved block types, invalid back-references, or output buffer overflow.
+ * Returns ARK_DEFLATE_OK on success.
+ * Failure contract: ARK_DEFLATE_ERR_USAGE for NULL out-parameters or a NULL
+ * buffer with a non-zero size; ARK_DEFLATE_ERR_DATA for malformed or
+ * truncated input (including length 258 coded as 284 + 31, which RFC 1951
+ * does not allow); ARK_DEFLATE_ERR_OUTPUT when the output exceeds dst_cap.
+ * src_used and dst_len are 0 after a failure; dst contents are unspecified.
  * Preconditions: dst_cap must describe the full writable extent of dst.
+ * Uses about 30 KiB of stack for decode tables.
  */
-ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
-                               size_t dst_cap);
+ark_deflate_status_t ark_deflate_dec_oneshot(const uint8_t *src, size_t src_len,
+                                             size_t *src_used, uint8_t *dst,
+                                             size_t dst_cap, size_t *dst_len);
 
 #endif /* ARK_DEFLATE_H */

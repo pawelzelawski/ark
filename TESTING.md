@@ -192,11 +192,13 @@ published in the reference repository. The test vectors cover input lengths
 
 ### 3.3 Deflate (`test_deflate.c`)
 
-The Deflate API has no `ark_error_t *` parameter. The encoder returns an
-`ark_deflate_status_t`; `ark_deflate_decompress` returns -1 on failure with
-no error code. `ARK_ERR_FMT_DATA` is synthesized by `ark_read_chunk` in
-`archive.c` after `ark_deflate_decompress` returns -1, and is verified via
-`ark_read_chunk` in `test_archive.c` (§3.5). Most tests compress through
+The Deflate API has no `ark_error_t *` parameter; encoder and decoder return
+an `ark_deflate_status_t`. `ARK_ERR_FMT_DATA` is synthesized by
+`ark_read_chunk` in `archive.c` for any decoder failure or bytes after the
+stream, and is verified via `ark_read_chunk` in `test_archive.c` (§3.5).
+Decoder tests decode through `test_deflate_decompress` (size or -1) or call
+`ark_deflate_dec_oneshot` directly when they check statuses or `src_used`;
+hand-built streams use a small test-side bit writer (`tbits_t`). Most tests compress through
 `test_deflate_compress` (in `test_deflate.c`, also used by `test_archive.c`),
 which runs a fresh window-15 encoder and returns the size or -1.
 
@@ -237,7 +239,11 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_header_cost_matches_emitted` | Costed dynamic header size equals the emitted bits for dense and sparse code lengths |
 | `test_deflate_small_input_not_stored` | 128-byte text input compresses to a smaller dynamic block, not a stored block |
 | `test_deflate_fixed_then_stored` | Fixed block followed by a stored block decodes correctly (bit reader gives back read-ahead bytes) |
-| `test_deflate_accepts_legacy_length_258` | Length 258 written as code 284 + extra 31 (older ark encoders) still decodes |
+| `test_deflate_rejects_legacy_length_258` | Length 258 written as code 284 + extra 31 (pre-v1.1.0 ark encoders) is `ARK_DEFLATE_ERR_DATA`; 284 + 30 (length 257) decodes |
+| `test_deflate_dec_src_used_bit_offsets` | Fixed blocks ending at each of the 8 bit offsets, followed by junk bytes: `src_used` counts exactly the stream's bytes |
+| `test_deflate_dec_src_used_concatenated` | Stored, fixed and dynamic streams back to back plus junk: each `src_used` equals its stream size and the three decode in turn |
+| `test_deflate_dec_status_codes` | NULL out-parameters or buffers are `ERR_USAGE`; one byte short of output is `ERR_OUTPUT` (Huffman and stored data); truncated or malformed input is `ERR_DATA`; counts are 0 after a failure |
+| `test_deflate_table_worst_case` | The worst-case complete lit/len (286 symbols) and distance (32 symbols) codes fill their decode tables exactly: they fit at the capacity and fail one entry below |
 | `test_deflate_rejects_incomplete_trees` | Incomplete code-length code, incomplete literal/length code and oversubscribed code-length code; returns -1 |
 | `test_deflate_accepts_allowed_incomplete_trees` | Distance code with no codes, and with a single 1-bit code, decode correctly (zlib-compatible exceptions) |
 | `test_deflate_round_trip_periodic` | Periodic input with periods 1..17 (overlapping matches around the 8-byte copy threshold); round-trip identity |
@@ -340,6 +346,8 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_read_chunk_invalid_deflate` | Compressed bytes are not a valid Deflate stream; `ARK_ERR_FMT_DATA` |
 | `test_read_chunk_length_mismatch` | Decompressed size does not match expected chunk size; `ARK_ERR_FMT_DATA` |
 | `test_read_chunk_compressed_size_mismatch` | Supplied compressed byte count does not match index chunk size; `ARK_ERR_FMT_DATA` |
+| `test_read_chunk_trailing_bytes` | Hand-built archive whose chunk is a Deflate stream plus one byte (chunk size and hashes cover it): `ARK_ERR_FMT_DATA` "bytes after deflate stream"; without the byte the chunk decodes |
+| `test_extract_chunk_trailing_bytes` | Same archives through extract (worker pool path): the exact one extracts, the padded one fails with `ARK_ERR_FMT_DATA` and leaves no file |
 | `test_read_empty_file_chunk_count_zero` | Regular file with chunk_count=0; `ark_read_member_meta` reports correctly |
 | `test_read_find_member` | Path lookup returns each member's position (out-of-order members); near-miss paths and prefixes not found; -1 before `ark_read_index` and for NULL arguments |
 | `test_read_index_many_members` | 20,000 members in reverse name order parse; lookups return the right positions |
@@ -580,6 +588,7 @@ test. These tests are the final gate before a phase is declared complete.
 | `test_integration_list` | list subcommand; output includes all member paths, sizes, types |
 | `test_integration_generate_reader` | generate-reader output is valid C11; compiles with `cc -O2`; runs against test archive |
 | `test_integration_generate_reader_strict_c11` | generate-reader output builds with `-std=c11 -Wall -Wextra -Wpedantic -Werror` using `cc` (required) and `clang`/`gcc` when installed; each build recovers the test tree |
+| `test_integration_generate_reader_rejects_legacy_258` | The recovery reader fails on a hand-built archive whose chunk codes length 258 as 284 + 31 and recovers the same archive with 284 + 30 (258 bytes of `A`) |
 | `test_integration_generate_reader_no_follow` | Recovery reader refuses to write through a pre-existing symlink at a regular-file member path (empty and non-empty); symlink target unchanged |
 | `test_integration_deterministic` | Same source content archived twice; archives are bit-identical |
 | `test_integration_large_archive` | Archive containing 1000 files of mixed sizes; create, verify, extract; all clean |

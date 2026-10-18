@@ -83,6 +83,8 @@ int test_read_verify_out_of_order_chunk(void);
 int test_read_chunk_invalid_deflate(void);
 int test_read_chunk_length_mismatch(void);
 int test_read_chunk_compressed_size_mismatch(void);
+int test_read_chunk_trailing_bytes(void);
+int test_extract_chunk_trailing_bytes(void);
 int test_read_empty_file_chunk_count_zero(void);
 int test_blake3_vectors_all(void);
 int test_blake3_empty(void);
@@ -130,7 +132,11 @@ int test_deflate_cl_code_always_complete(void);
 int test_deflate_header_cost_matches_emitted(void);
 int test_deflate_small_input_not_stored(void);
 int test_deflate_fixed_then_stored(void);
-int test_deflate_accepts_legacy_length_258(void);
+int test_deflate_rejects_legacy_length_258(void);
+int test_deflate_dec_src_used_bit_offsets(void);
+int test_deflate_dec_src_used_concatenated(void);
+int test_deflate_dec_status_codes(void);
+int test_deflate_table_worst_case(void);
 int test_deflate_rejects_incomplete_trees(void);
 int test_deflate_accepts_allowed_incomplete_trees(void);
 int test_deflate_round_trip_periodic(void);
@@ -215,6 +221,7 @@ int test_integration_selective_member(void);
 int test_integration_list(void);
 int test_integration_generate_reader(void);
 int test_integration_generate_reader_strict_c11(void);
+int test_integration_generate_reader_rejects_legacy_258(void);
 int test_integration_generate_reader_no_follow(void);
 int test_integration_deterministic(void);
 int test_integration_large_archive(void);
@@ -339,8 +346,14 @@ static const test_case_t g_tests[] = {
     {"test_deflate_small_input_not_stored",
      test_deflate_small_input_not_stored},
     {"test_deflate_fixed_then_stored", test_deflate_fixed_then_stored},
-    {"test_deflate_accepts_legacy_length_258",
-     test_deflate_accepts_legacy_length_258},
+    {"test_deflate_rejects_legacy_length_258",
+     test_deflate_rejects_legacy_length_258},
+    {"test_deflate_dec_src_used_bit_offsets",
+     test_deflate_dec_src_used_bit_offsets},
+    {"test_deflate_dec_src_used_concatenated",
+     test_deflate_dec_src_used_concatenated},
+    {"test_deflate_dec_status_codes", test_deflate_dec_status_codes},
+    {"test_deflate_table_worst_case", test_deflate_table_worst_case},
     {"test_deflate_rejects_incomplete_trees",
      test_deflate_rejects_incomplete_trees},
     {"test_deflate_accepts_allowed_incomplete_trees",
@@ -454,6 +467,8 @@ static const test_case_t g_tests[] = {
     {"test_read_chunk_length_mismatch", test_read_chunk_length_mismatch},
     {"test_read_chunk_compressed_size_mismatch",
      test_read_chunk_compressed_size_mismatch},
+    {"test_read_chunk_trailing_bytes", test_read_chunk_trailing_bytes},
+    {"test_extract_chunk_trailing_bytes", test_extract_chunk_trailing_bytes},
     {"test_read_empty_file_chunk_count_zero",
      test_read_empty_file_chunk_count_zero},
     {"test_fault_archive_header_dst_cap_undersize",
@@ -585,6 +600,8 @@ static const test_case_t g_tests[] = {
     {"test_integration_generate_reader", test_integration_generate_reader},
     {"test_integration_generate_reader_strict_c11",
      test_integration_generate_reader_strict_c11},
+    {"test_integration_generate_reader_rejects_legacy_258",
+     test_integration_generate_reader_rejects_legacy_258},
     {"test_integration_generate_reader_no_follow",
      test_integration_generate_reader_no_follow},
     {"test_integration_deterministic", test_integration_deterministic},

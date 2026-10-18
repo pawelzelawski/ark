@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "archive.h"
 #include "blake3.h"
@@ -10,6 +12,9 @@
 
 /* Compress helper defined in test_deflate.c (fresh encoder per call). */
 ssize_t test_deflate_compress(const uint8_t *, size_t, uint8_t *, size_t, int);
+/* In-process extract defined in src/main.c (ARK_TEST). */
+int ark_test_extract_archive(const char *, const char *, int, const char *, int,
+                             ark_error_t *);
 
 typedef ark_write_ctx_storage_t write_ctx_storage_t;
 
@@ -2233,6 +2238,178 @@ int test_read_chunk_compressed_size_mismatch(void)
 		return 1;
 	ark_read_free(ctx);
 	return err.code == ARK_ERR_FMT_DATA ? 0 : 1;
+}
+
+/*
+ * test_archive_one_chunk - Serialize a valid one-member archive: regular file
+ * "a" of size_original bytes stored as the single chunk `chunk`, with BLAKE3
+ * member and index hashes. Writes header, chunk, index and footer into buf;
+ * reports the index size and returns the archive length, or 0 when buf is
+ * too small. Shared with test_integration.c.
+ */
+size_t test_archive_one_chunk(uint8_t *buf, size_t cap, const uint8_t *chunk,
+                              size_t chunk_len, uint64_t size_original,
+                              size_t *index_len)
+{
+	read_entry_t e;
+	uint8_t index[256];
+	uint8_t digest[32];
+	uint32_t csz[1];
+	size_t off;
+
+	csz[0] = (uint32_t)chunk_len;
+	entry_base(&e, 0x01U, "a");
+	e.size_original = size_original;
+	e.size_compressed = chunk_len;
+	e.data_offset = 16U;
+	e.chunk_count = 1U;
+	e.chunk_sizes = csz;
+	hash_bytes(ARK_HASH_BLAKE3, chunk, chunk_len, e.hash);
+	if (build_index(&e, 1U, index, sizeof(index), index_len) != 0)
+		return 0U;
+	if (16U + chunk_len + *index_len + 64U > cap)
+		return 0U;
+	hash_bytes(ARK_HASH_BLAKE3, index, *index_len, digest);
+	build_header(buf, ARK_HASH_BLAKE3);
+	off = 16U;
+	memcpy(buf + off, chunk, chunk_len);
+	off += chunk_len;
+	memcpy(buf + off, index, *index_len);
+	off += *index_len;
+	build_footer(buf + off, 16U + chunk_len, *index_len, 1U, digest);
+	return off + 64U;
+}
+
+/*
+ * One-member archive "a" whose single chunk is a Deflate stream of "abc"
+ * followed by `extra` zero bytes; the chunk size, member hash and index hash
+ * all cover the padding, so only the stream-end check can reject it. Reports
+ * the chunk and index sizes; returns the archive length, or 0.
+ */
+static size_t build_padded_chunk_archive(uint8_t *buf, size_t cap, size_t extra,
+                                         size_t *chunk_len, size_t *index_len)
+{
+	uint8_t src[] = {0x61U, 0x62U, 0x63U};
+	uint8_t comp[128];
+	ssize_t clen;
+
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
+	if (clen <= 0 || (size_t)clen + extra > sizeof(comp))
+		return 0U;
+	memset(comp + clen, 0, extra);
+	*chunk_len = (size_t)clen + extra;
+	return test_archive_one_chunk(buf, cap, comp, *chunk_len, sizeof(src),
+	                              index_len);
+}
+
+/*
+ * ark_read_chunk accepts a chunk that is exactly one Deflate stream and
+ * rejects the same chunk with one byte after the stream (ARK_ERR_FMT_DATA).
+ */
+int test_read_chunk_trailing_bytes(void)
+{
+	size_t extra;
+
+	for (extra = 0U; extra <= 1U; extra++) {
+		read_ctx_storage_t storage;
+		ark_read_ctx_t *ctx;
+		ark_error_t err;
+		const ark_member_meta_t *meta;
+		uint8_t buf[512];
+		uint8_t out[64];
+		size_t len;
+		size_t chunk_len;
+		size_t index_len;
+		ssize_t n;
+
+		len = build_padded_chunk_archive(buf, sizeof(buf), extra,
+		                                 &chunk_len, &index_len);
+		if (len == 0U ||
+		    parse_index_ok(buf, buf + len - 64U, buf + 16U + chunk_len,
+		                   index_len, &storage, &ctx) != 0)
+			return 1;
+		meta = ark_read_member_meta(ctx, 0U);
+		if (meta == NULL)
+			return 1;
+		n = ark_read_chunk(ctx, meta, 0U, buf + 16U, chunk_len, out,
+		                   sizeof(out), &err);
+		ark_read_free(ctx);
+		if (extra == 0U && (n != 3 || memcmp(out, "abc", 3U) != 0))
+			return 1;
+		if (extra != 0U &&
+		    (n != -1 || err.code != ARK_ERR_FMT_DATA ||
+		     strstr(err.msg, "bytes after deflate stream") == NULL))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Extract (worker pool path) restores the exact-stream archive and fails
+ * the padded one with ARK_ERR_FMT_DATA, leaving no extracted file.
+ */
+int test_extract_chunk_trailing_bytes(void)
+{
+	char dir[] = "/tmp/ark-trailing.XXXXXX";
+	char arc[64];
+	char out_dir[64];
+	char member[80];
+	size_t extra;
+	int rc;
+
+	if (mkdtemp(dir) == NULL)
+		return 1;
+	(void)snprintf(arc, sizeof(arc), "%s/t.ark", dir);
+	(void)snprintf(out_dir, sizeof(out_dir), "%s/out", dir);
+	(void)snprintf(member, sizeof(member), "%s/a", out_dir);
+	rc = 0;
+	for (extra = 0U; rc == 0 && extra <= 1U; extra++) {
+		ark_error_t err;
+		uint8_t buf[512];
+		size_t len;
+		size_t chunk_len;
+		size_t index_len;
+		FILE *f;
+		int xrc;
+
+		len = build_padded_chunk_archive(buf, sizeof(buf), extra,
+		                                 &chunk_len, &index_len);
+		f = fopen(arc, "wb");
+		if (len == 0U || f == NULL) {
+			if (f != NULL)
+				(void)fclose(f);
+			rc = 1;
+			break;
+		}
+		if (fwrite(buf, 1U, len, f) != len)
+			rc = 1;
+		if (fclose(f) != 0 || rc != 0 || mkdir(out_dir, 0700) != 0) {
+			rc = 1;
+			break;
+		}
+		memset(&err, 0, sizeof(err));
+		xrc = ark_test_extract_archive(arc, out_dir, 0, NULL, 1, &err);
+		if (extra == 0U) {
+			uint8_t got[8];
+
+			f = fopen(member, "rb");
+			if (xrc != 0 || f == NULL ||
+			    fread(got, 1U, sizeof(got), f) != 3U ||
+			    memcmp(got, "abc", 3U) != 0)
+				rc = 1;
+			if (f != NULL)
+				(void)fclose(f);
+		} else if (xrc != -1 || err.code != ARK_ERR_FMT_DATA ||
+		           access(member, F_OK) == 0) {
+			rc = 1;
+		}
+		(void)unlink(member);
+		(void)rmdir(out_dir);
+	}
+	(void)unlink(arc);
+	(void)rmdir(dir);
+	return rc;
 }
 
 int test_read_empty_file_chunk_count_zero(void)

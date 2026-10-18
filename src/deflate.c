@@ -1,10 +1,10 @@
 /*
  * deflate.c - RFC 1951 Deflate component implementation.
  *
- * Implements ark_deflate_bound, the encoder (ark_deflate_enc_*) and
- * ark_deflate_decompress from deflate.h. This component performs pure
- * in-memory transformation only: no I/O, no component-owned allocation and
- * no global or thread-local mutable state; encoder state lives in caller
+ * Implements ark_deflate_bound, the encoder (ark_deflate_enc_*) and the
+ * decoder (ark_deflate_dec_oneshot) from deflate.h. This component performs
+ * pure in-memory transformation only: no I/O, no component-owned allocation
+ * and no global or thread-local mutable state; encoder state lives in caller
  * memory. See ARCHITECTURE.md section 7.
  */
 
@@ -28,9 +28,18 @@
  *   bits 8..11  subtable index bits (link entries only)
  *   bit 15      link flag
  *   bits 16..31 symbol, or subtable offset for link entries
- * Every subtable has 2^(longest code - root_bits) entries and a code longer
- * than root_bits needs at most one, so table sizes are bounded by the
- * alphabet size: 288 lit/len and 32 distance symbols, codes <= 15 bits.
+ * All subtables of one table have 2^(longest code - root_bits) entries, one
+ * per root prefix that has codes longer than root_bits.
+ *
+ * Worst-case table sizes (exact for this layout). A table needs
+ * 2^root + p * 2^(L - root) entries for longest code L and p long-code root
+ * prefixes. The code must be complete (the one-code exceptions are tiny),
+ * so the prefix holding the length-L code needs at least L - root + 1
+ * symbols, every other long-code prefix at least 2, and the remaining
+ * 2^root - p root slots at least popcount(2^root - p) shorter codes. With at
+ * most 286 lit/len symbols (root 10) that allows p = 137 at L = 15; with at
+ * most 32 distance symbols (root 8), p = 10. Codes reaching these sizes
+ * are tested (test_deflate_table_worst_case).
  */
 #define ARK_INFLATE_LINK 0x8000U
 #define ARK_INFLATE_LIT_ROOT 10U
@@ -40,11 +49,15 @@
 #define ARK_INFLATE_FIXED_DIST_ROOT 5U
 #define ARK_INFLATE_LIT_TABLE                                                  \
 	((1U << ARK_INFLATE_LIT_ROOT) +                                        \
-	 288U * (1U << (15U - ARK_INFLATE_LIT_ROOT)))
+	 137U * (1U << (15U - ARK_INFLATE_LIT_ROOT)))
 #define ARK_INFLATE_DIST_TABLE                                                 \
 	((1U << ARK_INFLATE_DIST_ROOT) +                                       \
-	 32U * (1U << (15U - ARK_INFLATE_DIST_ROOT)))
+	 10U * (1U << (15U - ARK_INFLATE_DIST_ROOT)))
 #define ARK_INFLATE_CL_TABLE (1U << ARK_INFLATE_CL_ROOT)
+
+/* Internal decoder results: malformed input, or output larger than dst. */
+#define ARK_INFLATE_ERR_DATA (-1)
+#define ARK_INFLATE_ERR_OUTPUT (-2)
 
 typedef struct {
 	uint8_t *dst;
@@ -1641,7 +1654,7 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 			return -1;
 		if (sym < 256U) {
 			if (out >= dst_cap)
-				return -1;
+				return ARK_INFLATE_ERR_OUTPUT;
 			dst[out++] = (uint8_t)sym;
 			continue;
 		}
@@ -1652,7 +1665,6 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 		if (sym > 285U)
 			return -1;
 
-		/* Code 284 with extra 31 (258) stays valid for old streams. */
 		li = sym - 257U;
 		len = g_len_base[li];
 		if (g_len_extra[li] != 0U) {
@@ -1660,6 +1672,13 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 				return -1;
 			len += extra;
 		}
+		/*
+		 * RFC 1951 section 3.2.5: code 284 covers lengths 227..257;
+		 * 258 is code 285 only. Pre-v1.1.0 ark wrote 258 as 284 + 31;
+		 * such streams are rejected (ARCHITECTURE.md section 7.4).
+		 */
+		if (sym == 284U && len == 258U)
+			return -1;
 		if (inflate_decode_sym(br, dist_tab, dist_root, &dsym) != 0)
 			return -1;
 		if (dsym > 29U)
@@ -1674,11 +1693,13 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 		/*
 		 * SAFETY: match copy must reference already-produced bytes
 		 * inside the window and fit in dst. Distances beyond the output
-		 * so far or the window and lengths beyond dst_cap are invalid
-		 * and must fail hard.
+		 * so far or the window are malformed input; lengths beyond
+		 * dst_cap are an output overflow. Both must fail hard.
 		 */
-		if (dist > out || dist > max_dist || len > dst_cap - out)
+		if (dist > out || dist > max_dist)
 			return -1;
+		if (len > dst_cap - out)
+			return ARK_INFLATE_ERR_OUTPUT;
 		copy_match(dst + out, dist, len);
 		out += len;
 	}
@@ -1840,7 +1861,7 @@ static int decode_stored_block(ark_bit_reader_t *br, uint8_t *dst,
 	if ((len ^ 0xffffU) != nlen)
 		return -1;
 	if (len > dst_cap - *dst_pos)
-		return -1;
+		return ARK_INFLATE_ERR_OUTPUT;
 	if (len > br->len - br->pos)
 		return -1;
 
@@ -1997,21 +2018,19 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
  * Decode one raw RFC 1951 stream whose back-references stay within max_dist
  * bytes. Supports stored blocks (BTYPE 00), fixed-Huffman blocks (BTYPE 01),
  * and dynamic-Huffman blocks (BTYPE 10). Reserved BTYPE 11 and all malformed
- * input are rejected. Returns decompressed byte count, -1 on error.
+ * input are rejected. Decoding stops after the final block; *src_used gets
+ * the bytes up to and including the one holding its last bit, *dst_len the
+ * output size. Returns 0, ARK_INFLATE_ERR_DATA or ARK_INFLATE_ERR_OUTPUT.
  */
-static ssize_t inflate_window(const uint8_t *src, size_t src_len, uint8_t *dst,
-                              size_t dst_cap, size_t max_dist)
+static int inflate_window(const uint8_t *src, size_t src_len, uint8_t *dst,
+                          size_t dst_cap, size_t max_dist, size_t *src_used,
+                          size_t *dst_len)
 {
 	ark_bit_reader_t br;
 	uint32_t fixed_lit_tab[1U << ARK_INFLATE_FIXED_LIT_ROOT];
 	uint32_t fixed_dist_tab[1U << ARK_INFLATE_FIXED_DIST_ROOT];
 	int fixed_ready;
 	size_t out_pos;
-
-	if (src == NULL && src_len != 0U)
-		return -1;
-	if (dst == NULL && dst_cap != 0U)
-		return -1;
 
 	br.src = src;
 	br.len = src_len;
@@ -2024,54 +2043,85 @@ static ssize_t inflate_window(const uint8_t *src, size_t src_len, uint8_t *dst,
 	for (;;) {
 		uint16_t bfinal;
 		uint16_t btype;
+		int rc;
 
 		if (br_get_bits(&br, 1U, &bfinal) != 0)
-			return -1;
+			return ARK_INFLATE_ERR_DATA;
 		if (br_get_bits(&br, 2U, &btype) != 0)
-			return -1;
+			return ARK_INFLATE_ERR_DATA;
 
 		if (btype == 0U) {
-			if (decode_stored_block(&br, dst, dst_cap, &out_pos) !=
-			    0)
-				return -1;
+			rc = decode_stored_block(&br, dst, dst_cap, &out_pos);
 		} else if (btype == 1U) {
 			if (!fixed_ready) {
 				if (build_fixed_decode_tables(
 				        fixed_lit_tab, fixed_dist_tab) != 0)
-					return -1;
+					return ARK_INFLATE_ERR_DATA;
 				fixed_ready = 1;
 			}
-			if (decode_huffman_block(
-			        &br, fixed_lit_tab, ARK_INFLATE_FIXED_LIT_ROOT,
-			        fixed_dist_tab, ARK_INFLATE_FIXED_DIST_ROOT,
-			        max_dist, dst, dst_cap, &out_pos) != 0)
-				return -1;
+			rc = decode_huffman_block(
+			    &br, fixed_lit_tab, ARK_INFLATE_FIXED_LIT_ROOT,
+			    fixed_dist_tab, ARK_INFLATE_FIXED_DIST_ROOT,
+			    max_dist, dst, dst_cap, &out_pos);
 		} else if (btype == 2U) {
-			if (decode_dynamic_block(&br, max_dist, dst, dst_cap,
-			                         &out_pos) != 0)
-				return -1;
+			rc = decode_dynamic_block(&br, max_dist, dst, dst_cap,
+			                          &out_pos);
 		} else {
-			return -1;
+			rc = ARK_INFLATE_ERR_DATA;
 		}
+		if (rc != 0)
+			return rc;
 
 		if (bfinal != 0U)
 			break;
 	}
 
-	return (ssize_t)out_pos;
+	/*
+	 * The 64-bit reader may have loaded bytes past the final block; whole
+	 * bytes still in the bit buffer were not consumed.
+	 */
+	*src_used = br.pos - (size_t)(br.nbits >> 3);
+	*dst_len = out_pos;
+	return 0;
+}
+
+/* Map an internal decoder result to the public status. */
+static ark_deflate_status_t inflate_status(int rc)
+{
+	if (rc == 0)
+		return ARK_DEFLATE_OK;
+	if (rc == ARK_INFLATE_ERR_OUTPUT)
+		return ARK_DEFLATE_ERR_OUTPUT;
+	return ARK_DEFLATE_ERR_DATA;
 }
 
 /*
- * ark_deflate_decompress - Decompress one raw RFC 1951 Deflate stream with
- * the full 32 KiB window.
- *
- * Returns decompressed byte count on success, -1 on error.
+ * ark_deflate_dec_oneshot - Decode one raw RFC 1951 stream with the full
+ * 32 KiB window and report the input bytes it used. See ARCHITECTURE.md
+ * section 7.4.
  */
-ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
-                               size_t dst_cap)
+ark_deflate_status_t ark_deflate_dec_oneshot(const uint8_t *src, size_t src_len,
+                                             size_t *src_used, uint8_t *dst,
+                                             size_t dst_cap, size_t *dst_len)
 {
-	return inflate_window(src, src_len, dst, dst_cap,
-	                      ARK_DEFLATE_WINDOW_SIZE);
+	size_t used;
+	size_t len;
+	int rc;
+
+	if (src_used == NULL || dst_len == NULL)
+		return ARK_DEFLATE_ERR_USAGE;
+	*src_used = 0U;
+	*dst_len = 0U;
+	if ((src == NULL && src_len != 0U) || (dst == NULL && dst_cap != 0U))
+		return ARK_DEFLATE_ERR_USAGE;
+
+	rc = inflate_window(src, src_len, dst, dst_cap, ARK_DEFLATE_WINDOW_SIZE,
+	                    &used, &len);
+	if (rc != 0)
+		return inflate_status(rc);
+	*src_used = used;
+	*dst_len = len;
+	return ARK_DEFLATE_OK;
 }
 
 #ifdef ARK_DEFLATE_TEST
@@ -2082,19 +2132,52 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
  */
 
 /*
- * ARK_DEFLATE_TEST only: decode like ark_deflate_decompress but reject any
+ * ARK_DEFLATE_TEST only: decode like ark_deflate_dec_oneshot but reject any
  * back-reference further than 1 << window_bits bytes (strict window check
- * for encoder tests). Returns -1 for window_bits outside 8..15.
+ * for encoder tests). ARK_DEFLATE_ERR_USAGE for window_bits outside 8..15.
  */
-ssize_t ark_deflate_test_decompress_window(const uint8_t *src, size_t src_len,
-                                           uint8_t *dst, size_t dst_cap,
-                                           unsigned int window_bits)
+ark_deflate_status_t
+ark_deflate_test_decompress_window(const uint8_t *src, size_t src_len,
+                                   uint8_t *dst, size_t dst_cap,
+                                   unsigned int window_bits, size_t *dst_len)
 {
+	size_t used;
+	int rc;
+
+	*dst_len = 0U;
 	if (window_bits < ARK_DEFLATE_MIN_WINDOW_BITS ||
 	    window_bits > ARK_DEFLATE_MAX_WINDOW_BITS)
+		return ARK_DEFLATE_ERR_USAGE;
+	rc = inflate_window(src, src_len, dst, dst_cap,
+	                    (size_t)1U << window_bits, &used, dst_len);
+	return inflate_status(rc);
+}
+
+/*
+ * ARK_DEFLATE_TEST only: decode-table capacity for a lit/len (dist == 0) or
+ * distance (dist != 0) table.
+ */
+size_t ark_deflate_test_table_cap(int dist)
+{
+	return dist ? ARK_INFLATE_DIST_TABLE : ARK_INFLATE_LIT_TABLE;
+}
+
+/*
+ * ARK_DEFLATE_TEST only: build a dynamic lit/len or distance decode table
+ * from code lengths into at most cap entries (cap <= the table capacity).
+ * Returns 0 when it fits, -1 for an invalid code or a table larger than cap.
+ */
+int ark_deflate_test_table_fits(const uint8_t *lengths, size_t n_symbols,
+                                int dist, size_t cap)
+{
+	uint32_t tab[ARK_INFLATE_LIT_TABLE];
+
+	if (cap > ark_deflate_test_table_cap(dist))
 		return -1;
-	return inflate_window(src, src_len, dst, dst_cap,
-	                      (size_t)1U << window_bits);
+	return inflate_table_build(tab, cap, lengths, n_symbols,
+	                           dist ? ARK_INFLATE_DIST_ROOT
+	                                : ARK_INFLATE_LIT_ROOT,
+	                           dist ? ARK_TREE_DIST : ARK_TREE_LITLEN);
 }
 
 /* ARK_DEFLATE_TEST only: match length to length symbol + extra bits. */

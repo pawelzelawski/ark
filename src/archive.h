@@ -329,7 +329,8 @@ int ark_read_find_member(const ark_read_ctx_t *ctx, const char *path,
  *
  * Returns decompressed byte count on success, -1 on failure.
  * Failure contract: compressed byte-count mismatch, invalid Deflate stream,
- * or expected decompressed-length mismatch maps to ARK_ERR_FMT_DATA via err.
+ * bytes after the stream's final block, or expected decompressed-length
+ * mismatch maps to ARK_ERR_FMT_DATA via err.
  * Preconditions: chunk_index in [0, meta->chunk_count).
  *
  * See ARCHITECTURE.md section 16.4.

@@ -2,10 +2,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 #include "deflate.h"
 
-/* ARK_DEFLATE_TEST-only encoder accessors defined in src/deflate.c. */
+/* ARK_DEFLATE_TEST-only accessors defined in src/deflate.c. */
 int ark_deflate_test_length_symbol(size_t, unsigned int *, unsigned int *,
                                    uint16_t *);
 int ark_deflate_test_limit_lengths(const uint32_t *, size_t, uint8_t *,
@@ -14,8 +15,11 @@ int ark_deflate_test_cl_plan(const uint8_t *, size_t, const uint8_t *, size_t,
                              uint8_t[19], size_t *);
 int ark_deflate_test_header_bits(const uint8_t *, size_t, const uint8_t *,
                                  size_t, size_t *, size_t *);
-ssize_t ark_deflate_test_decompress_window(const uint8_t *, size_t, uint8_t *,
-                                           size_t, unsigned int);
+ark_deflate_status_t ark_deflate_test_decompress_window(const uint8_t *, size_t,
+                                                        uint8_t *, size_t,
+                                                        unsigned int, size_t *);
+size_t ark_deflate_test_table_cap(int);
+int ark_deflate_test_table_fits(const uint8_t *, size_t, int, size_t);
 
 static void fill_pattern(uint8_t *buf, size_t len)
 {
@@ -81,6 +85,23 @@ ssize_t test_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	return st == ARK_DEFLATE_OK ? (ssize_t)dst_len : -1;
 }
 
+/*
+ * test_deflate_decompress - Decode one stream with ark_deflate_dec_oneshot;
+ * return the decompressed size or -1 for any failure status. Bytes after
+ * the stream are ignored here; tests of src_used check it directly.
+ */
+static ssize_t test_deflate_decompress(const uint8_t *src, size_t src_len,
+                                       uint8_t *dst, size_t dst_cap)
+{
+	size_t used;
+	size_t n;
+
+	if (ark_deflate_dec_oneshot(src, src_len, &used, dst, dst_cap, &n) !=
+	    ARK_DEFLATE_OK)
+		return -1;
+	return (ssize_t)n;
+}
+
 static int round_trip(const uint8_t *src, size_t src_len)
 {
 	uint8_t *comp;
@@ -107,7 +128,7 @@ static int round_trip(const uint8_t *src, size_t src_len)
 		return 1;
 	}
 
-	out_len = ark_deflate_decompress(comp, (size_t)comp_len, out, src_len);
+	out_len = test_deflate_decompress(comp, (size_t)comp_len, out, src_len);
 	if (out_len < 0 || (size_t)out_len != src_len) {
 		free(out);
 		free(comp);
@@ -376,7 +397,7 @@ int test_deflate_stored_block_valid(void)
 		return 1;
 	}
 
-	out_len = ark_deflate_decompress(comp, (size_t)comp_len, out, len);
+	out_len = test_deflate_decompress(comp, (size_t)comp_len, out, len);
 	rc = (out_len == (ssize_t)len && memcmp(out, data, len) == 0) ? 0 : 1;
 
 	free(out);
@@ -440,7 +461,7 @@ int test_deflate_invalid_stream(void)
 	const uint8_t bad[] = {0x06};
 	uint8_t out[32];
 
-	return ark_deflate_decompress(bad, sizeof(bad), out, sizeof(out)) < 0
+	return test_deflate_decompress(bad, sizeof(bad), out, sizeof(out)) < 0
 	           ? 0
 	           : 1;
 }
@@ -466,8 +487,8 @@ int test_deflate_truncated_stream(void)
 		return 1;
 	}
 
-	if (ark_deflate_decompress(comp, (size_t)comp_len - 1U, out,
-	                           sizeof(out)) >= 0) {
+	if (test_deflate_decompress(comp, (size_t)comp_len - 1U, out,
+	                            sizeof(out)) >= 0) {
 		free(comp);
 		return 1;
 	}
@@ -497,7 +518,7 @@ int test_deflate_output_buffer_too_small(void)
 		return 1;
 	}
 
-	if (ark_deflate_decompress(comp, (size_t)comp_len, out, sizeof(out)) >=
+	if (test_deflate_decompress(comp, (size_t)comp_len, out, sizeof(out)) >=
 	    0) {
 		free(comp);
 		return 1;
@@ -532,7 +553,7 @@ int test_deflate_output_buffer_exact(void)
 
 	memset(out, 0xa5, sizeof(out));
 	out_len =
-	    ark_deflate_decompress(comp, (size_t)comp_len, out, sizeof(in));
+	    test_deflate_decompress(comp, (size_t)comp_len, out, sizeof(in));
 	if (out_len != (ssize_t)sizeof(in)) {
 		free(comp);
 		return 1;
@@ -693,8 +714,8 @@ int test_deflate_round_trip_all_match_lengths(void)
 			fast_len = test_deflate_compress(
 			    in, n, comp, bound, ARK_DEFLATE_LEVEL_FAST);
 			if (fast_len > 0 &&
-			    ark_deflate_decompress(comp, (size_t)fast_len, out,
-			                           n) == (ssize_t)n &&
+			    test_deflate_decompress(comp, (size_t)fast_len, out,
+			                            n) == (ssize_t)n &&
 			    memcmp(in, out, n) == 0)
 				rc = 0;
 		}
@@ -857,6 +878,69 @@ int test_deflate_small_input_not_stored(void)
 	return round_trip(in, sizeof(in));
 }
 
+/* Test-side bit writer for hand-built Deflate streams (LSB first). */
+typedef struct {
+	uint8_t buf[64];
+	size_t bits;
+} tbits_t;
+
+static void tb_init(tbits_t *t)
+{
+	memset(t, 0, sizeof(*t));
+}
+
+/* Append n bits of v, least significant bit first (header fields, extras). */
+static void tb_put(tbits_t *t, uint32_t v, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (((v >> i) & 1U) != 0U)
+			t->buf[t->bits >> 3] |= (uint8_t)(1U << (t->bits & 7U));
+		t->bits++;
+	}
+}
+
+/* Append a Huffman code of n bits, most significant bit first. */
+static void tb_put_code(tbits_t *t, uint32_t code, unsigned int n)
+{
+	while (n > 0U) {
+		n--;
+		tb_put(t, (code >> n) & 1U, 1U);
+	}
+}
+
+/* Append one fixed-Huffman lit/len symbol (RFC 1951 section 3.2.6). */
+static void tb_fixed_sym(tbits_t *t, unsigned int sym)
+{
+	if (sym < 144U)
+		tb_put_code(t, 0x30U + sym, 8U);
+	else if (sym < 256U)
+		tb_put_code(t, 0x190U + sym - 144U, 9U);
+	else if (sym < 280U)
+		tb_put_code(t, sym - 256U, 7U);
+	else
+		tb_put_code(t, 0xc0U + sym - 280U, 8U);
+}
+
+static size_t tb_bytes(const tbits_t *t)
+{
+	return (t->bits + 7U) >> 3;
+}
+
+/* Final fixed block: 'A', code 284 with the given extra, distance 1, EOB. */
+static void tb_fixed_match_stream(tbits_t *t, uint32_t extra)
+{
+	tb_init(t);
+	tb_put(t, 1U, 1U);
+	tb_put(t, 1U, 2U);
+	tb_fixed_sym(t, 'A');
+	tb_fixed_sym(t, 284U);
+	tb_put(t, extra, 5U);
+	tb_put_code(t, 0U, 5U);
+	tb_fixed_sym(t, 256U);
+}
+
 /*
  * decode_expect - Decompress a raw stream. want == NULL expects failure;
  * otherwise the output must equal want[0..want_len).
@@ -867,7 +951,7 @@ static int decode_expect(const uint8_t *src, size_t src_len,
 	uint8_t out[512];
 	ssize_t n;
 
-	n = ark_deflate_decompress(src, src_len, out, sizeof(out));
+	n = test_deflate_decompress(src, src_len, out, sizeof(out));
 	if (want == NULL)
 		return n == -1 ? 0 : 1;
 	if (n < 0 || (size_t)n != want_len)
@@ -885,15 +969,28 @@ int test_deflate_fixed_then_stored(void)
 	return decode_expect(in, sizeof(in), (const uint8_t *)"AXYZ", 4U);
 }
 
-int test_deflate_accepts_legacy_length_258(void)
+int test_deflate_rejects_legacy_length_258(void)
 {
-	/* Fixed block: 'A', then length 258 written as code 284 + extra 31
-	 * (pre-2026-10 ark encoders) at distance 1. */
-	static const uint8_t in[] = {0x73, 0x1c, 0xf9, 0x00, 0x00};
-	uint8_t want[259];
+	tbits_t legacy;
+	tbits_t max284;
+	uint8_t out[300];
+	uint8_t want[258];
+	size_t used;
+	size_t n;
 
+	/*
+	 * Fixed block: 'A', then code 284 + extra 31 (length 258, as written
+	 * by pre-v1.1.0 ark encoders) at distance 1: not allowed by RFC 1951.
+	 * The same stream with extra 30 (length 257) stays valid.
+	 */
+	tb_fixed_match_stream(&legacy, 31U);
+	tb_fixed_match_stream(&max284, 30U);
+	if (ark_deflate_dec_oneshot(legacy.buf, tb_bytes(&legacy), &used, out,
+	                            sizeof(out), &n) != ARK_DEFLATE_ERR_DATA ||
+	    used != 0U || n != 0U)
+		return 1;
 	memset(want, 'A', sizeof(want));
-	return decode_expect(in, sizeof(in), want, sizeof(want));
+	return decode_expect(max284.buf, tb_bytes(&max284), want, sizeof(want));
 }
 
 int test_deflate_rejects_incomplete_trees(void)
@@ -1252,12 +1349,12 @@ int test_deflate_window_bits_round_trip(void)
 			                            &n) != ARK_DEFLATE_OK) {
 				rc = 1;
 			} else {
-				ssize_t d;
+				size_t d;
 
-				d = ark_deflate_test_decompress_window(
-				    comp, n, out, len, wb);
-				if (d < 0 || (size_t)d != len ||
-				    memcmp(in, out, len) != 0)
+				if (ark_deflate_test_decompress_window(
+				        comp, n, out, len, wb, &d) !=
+				        ARK_DEFLATE_OK ||
+				    d != len || memcmp(in, out, len) != 0)
 					rc = 1;
 			}
 			free(enc);
@@ -1346,6 +1443,7 @@ int test_deflate_window_checker_rejects_far(void)
 	rc = in == NULL || comp == NULL || out == NULL;
 	if (rc == 0) {
 		ssize_t n;
+		size_t d;
 		unsigned int wb;
 
 		fill_windowed(in, len);
@@ -1353,21 +1451,249 @@ int test_deflate_window_checker_rejects_far(void)
 		                          ARK_DEFLATE_LEVEL_DEFAULT);
 		if (n < 0 ||
 		    ark_deflate_test_decompress_window(
-		        comp, (size_t)n, out, len, 15U) != (ssize_t)len)
+		        comp, (size_t)n, out, len, 15U, &d) != ARK_DEFLATE_OK ||
+		    d != len)
 			rc = 1;
 		for (wb = 8U; rc == 0 && wb <= 14U; wb++) {
 			if (ark_deflate_test_decompress_window(
-			        comp, (size_t)n, out, len, wb) != -1)
+			        comp, (size_t)n, out, len, wb, &d) !=
+			    ARK_DEFLATE_ERR_DATA)
 				rc = 1;
 		}
 		if (rc == 0 && (ark_deflate_test_decompress_window(
-		                    comp, (size_t)n, out, len, 7U) != -1 ||
+		                    comp, (size_t)n, out, len, 7U, &d) !=
+		                    ARK_DEFLATE_ERR_USAGE ||
 		                ark_deflate_test_decompress_window(
-		                    comp, (size_t)n, out, len, 16U) != -1))
+		                    comp, (size_t)n, out, len, 16U, &d) !=
+		                    ARK_DEFLATE_ERR_USAGE))
 			rc = 1;
 	}
 	free(out);
 	free(comp);
 	free(in);
 	return rc;
+}
+
+/*
+ * A stream's final block may end at any bit of its last byte: src_used
+ * counts that byte and none of the bytes after it. Fixed blocks of b 9-bit
+ * literals (b = 0..7) end at every bit offset.
+ */
+int test_deflate_dec_src_used_bit_offsets(void)
+{
+	static const uint8_t junk[3] = {0xa5U, 0x00U, 0xffU};
+	unsigned int b;
+
+	for (b = 0U; b < 8U; b++) {
+		tbits_t t;
+		uint8_t in[67];
+		uint8_t out[16];
+		size_t bytes;
+		size_t used;
+		size_t n;
+		unsigned int i;
+
+		tb_init(&t);
+		tb_put(&t, 1U, 1U);
+		tb_put(&t, 1U, 2U);
+		for (i = 0; i < b; i++)
+			tb_fixed_sym(&t, 200U + i);
+		tb_fixed_sym(&t, 256U);
+		if (t.bits != 10U + 9U * b)
+			return 1;
+		bytes = tb_bytes(&t);
+		memcpy(in, t.buf, bytes);
+		memcpy(in + bytes, junk, sizeof(junk));
+		if (ark_deflate_dec_oneshot(in, bytes + sizeof(junk), &used,
+		                            out, sizeof(out),
+		                            &n) != ARK_DEFLATE_OK ||
+		    used != bytes || n != b)
+			return 1;
+		for (i = 0; i < b; i++) {
+			if (out[i] != (uint8_t)(200U + i))
+				return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * src_used for each block type (stored, fixed, dynamic) with trailing bytes
+ * after the stream, and back-to-back streams decoded one after the other.
+ */
+int test_deflate_dec_src_used_concatenated(void)
+{
+	/* Random input stores, a short pattern takes a fixed block at the
+	 * fast level, mixed input takes dynamic blocks at the default level. */
+	static const int levels[3] = {ARK_DEFLATE_LEVEL_DEFAULT,
+	                              ARK_DEFLATE_LEVEL_FAST,
+	                              ARK_DEFLATE_LEVEL_DEFAULT};
+	static const size_t lens[3] = {3000U, 5000U, 70000U};
+	uint8_t *in[3] = {NULL, NULL, NULL};
+	uint8_t *cat;
+	uint8_t *out;
+	size_t clen[3];
+	size_t total;
+	size_t off;
+	size_t k;
+	int rc;
+
+	rc = 1;
+	cat = malloc(ark_deflate_bound(70000U) * 3U + 16U);
+	out = malloc(70000U);
+	for (k = 0; k < 3U; k++)
+		in[k] = malloc(lens[k]);
+	if (cat == NULL || out == NULL || in[0] == NULL || in[1] == NULL ||
+	    in[2] == NULL)
+		goto done;
+	fill_randomish(in[0], lens[0]);
+	fill_pattern(in[1], lens[1]);
+	fill_windowed(in[2], lens[2]);
+
+	total = 0U;
+	for (k = 0; k < 3U; k++) {
+		ssize_t c;
+
+		c = test_deflate_compress(in[k], lens[k], cat + total,
+		                          ark_deflate_bound(lens[k]),
+		                          levels[k]);
+		/* Expected first block types: stored, fixed, dynamic. */
+		if (c <= 0 || ((cat[total] >> 1) & 3) != (int)k)
+			goto done;
+		clen[k] = (size_t)c;
+		total += clen[k];
+	}
+	memset(cat + total, 0x5a, 16U);
+
+	off = 0U;
+	for (k = 0; k < 3U; k++) {
+		size_t used;
+		size_t n;
+
+		if (ark_deflate_dec_oneshot(cat + off, total + 16U - off, &used,
+		                            out, lens[k],
+		                            &n) != ARK_DEFLATE_OK ||
+		    used != clen[k] || n != lens[k] ||
+		    memcmp(out, in[k], n) != 0)
+			goto done;
+		off += used;
+	}
+	rc = off == total ? 0 : 1;
+done:
+	for (k = 0; k < 3U; k++)
+		free(in[k]);
+	free(out);
+	free(cat);
+	return rc;
+}
+
+/*
+ * Status codes: NULL out-parameters and NULL buffers with a size are usage
+ * errors; output one byte short is ERR_OUTPUT for Huffman and stored data;
+ * truncated and malformed input are ERR_DATA; counts are 0 after failure.
+ */
+int test_deflate_dec_status_codes(void)
+{
+	static const uint8_t bad[] = {0x06};
+	uint8_t in[1024];
+	uint8_t rnd[600];
+	uint8_t comp[2048];
+	uint8_t out[1024];
+	size_t used;
+	size_t n;
+	ssize_t c;
+	ssize_t cr;
+
+	fill_pattern(in, sizeof(in));
+	fill_randomish(rnd, sizeof(rnd));
+	c = test_deflate_compress(in, sizeof(in), comp, sizeof(comp),
+	                          ARK_DEFLATE_LEVEL_DEFAULT);
+	if (c <= 1)
+		return 1;
+	if (ark_deflate_dec_oneshot(comp, (size_t)c, NULL, out, sizeof(out),
+	                            &n) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_oneshot(comp, (size_t)c, &used, out, sizeof(out),
+	                            NULL) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_oneshot(NULL, 4U, &used, out, sizeof(out), &n) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_oneshot(comp, (size_t)c, &used, NULL, 4U, &n) !=
+	        ARK_DEFLATE_ERR_USAGE)
+		return 1;
+	used = 9U;
+	n = 9U;
+	if (ark_deflate_dec_oneshot(comp, (size_t)c, &used, out,
+	                            sizeof(in) - 1U,
+	                            &n) != ARK_DEFLATE_ERR_OUTPUT ||
+	    used != 0U || n != 0U)
+		return 1;
+	if (ark_deflate_dec_oneshot(comp, (size_t)c - 1U, &used, out,
+	                            sizeof(out), &n) != ARK_DEFLATE_ERR_DATA ||
+	    ark_deflate_dec_oneshot(bad, sizeof(bad), &used, out, sizeof(out),
+	                            &n) != ARK_DEFLATE_ERR_DATA)
+		return 1;
+	cr = test_deflate_compress(rnd, sizeof(rnd), comp, sizeof(comp),
+	                           ARK_DEFLATE_LEVEL_DEFAULT);
+	if (cr <= 0 || (comp[0] & 0x06U) != 0U)
+		return 1;
+	if (ark_deflate_dec_oneshot(comp, (size_t)cr, &used, out,
+	                            sizeof(rnd) - 1U,
+	                            &n) != ARK_DEFLATE_ERR_OUTPUT ||
+	    ark_deflate_dec_oneshot(comp, (size_t)cr, &used, out, sizeof(rnd),
+	                            &n) != ARK_DEFLATE_OK ||
+	    used != (size_t)cr || n != sizeof(rnd))
+		return 1;
+	return 0;
+}
+
+/*
+ * Build the worst-case complete code for a decode table: popcount(2^root -
+ * p) codes up to root bits, a chain root+1..15,15 in one root prefix and two
+ * root+1 codes in each of the other p - 1 prefixes. It must fill the table
+ * capacity exactly (fits at cap, fails at cap - 1).
+ */
+static int table_worst_case(int dist, unsigned int root, size_t p,
+                            size_t n_symbols)
+{
+	uint8_t lengths[288];
+	size_t cap;
+	size_t slots;
+	size_t k;
+	unsigned int bit;
+	unsigned int len;
+
+	memset(lengths, 0, sizeof(lengths));
+	k = 0U;
+	slots = ((size_t)1U << root) - p;
+	for (bit = root; bit-- > 0U;) {
+		if (((slots >> bit) & 1U) != 0U)
+			lengths[k++] = (uint8_t)(root - bit);
+	}
+	for (len = root + 1U; len <= 15U; len++)
+		lengths[k++] = (uint8_t)len;
+	lengths[k++] = 15U;
+	while (k + 2U <= n_symbols && p > 1U) {
+		lengths[k++] = (uint8_t)(root + 1U);
+		lengths[k++] = (uint8_t)(root + 1U);
+		p--;
+	}
+	if (p != 1U || k != n_symbols)
+		return 1;
+	cap = ark_deflate_test_table_cap(dist);
+	if (cap != ((size_t)1U << root) + (n_symbols == 286U ? 137U : 10U) *
+	                                      ((size_t)1U << (15U - root)))
+		return 1;
+	if (ark_deflate_test_table_fits(lengths, n_symbols, dist, cap) != 0)
+		return 1;
+	return ark_deflate_test_table_fits(lengths, n_symbols, dist,
+	                                   cap - 1U) == -1
+	           ? 0
+	           : 1;
+}
+
+/* Decode tables are sized exactly for the worst-case lit/len and dist codes. */
+int test_deflate_table_worst_case(void)
+{
+	if (table_worst_case(0, 10U, 137U, 286U) != 0)
+		return 1;
+	return table_worst_case(1, 8U, 10U, 32U);
 }

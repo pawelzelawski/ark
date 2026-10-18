@@ -812,6 +812,9 @@ static int rec_decode_huffman_block(rec_bit_reader_t *br,
 					return -1;
 				len += extra;
 			}
+			/* RFC 1951: 258 is code 285 only, never 284 + 31. */
+			if (sym == 284 && len == 258U)
+				return -1;
 			if (rec_huff_decode(br, dist_tab, &dsym) != 0)
 				return -1;
 			if (dsym < 0 || dsym > 29)

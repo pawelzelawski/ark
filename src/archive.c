@@ -1560,7 +1560,8 @@ ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
                        uint8_t *dst, size_t dst_cap, ark_error_t *err)
 {
 	uint64_t expected_u64;
-	ssize_t dec_len;
+	size_t used;
+	size_t dec_len;
 
 	if (ctx == NULL || meta == NULL || dst == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null read chunk argument",
@@ -1591,16 +1592,24 @@ ssize_t ark_read_chunk(const ark_read_ctx_t *ctx, const ark_member_meta_t *meta,
 		return ark_fail(err, ARK_ERR_FMT_DATA,
 		                "expected chunk length overflows size_t", 0);
 
-	/* The Deflate component reports only -1; map it to ARK_ERR_FMT_DATA. */
-	dec_len = ark_deflate_decompress(src, src_len, dst, dst_cap);
-	if (dec_len < 0)
+	/* Every Deflate failure status maps to ARK_ERR_FMT_DATA. */
+	if (ark_deflate_dec_oneshot(src, src_len, &used, dst, dst_cap,
+	                            &dec_len) != ARK_DEFLATE_OK)
 		return ark_fail(err, ARK_ERR_FMT_DATA, "invalid deflate stream",
 		                0);
+	/*
+	 * SAFETY: a chunk is exactly one Deflate stream (ARCHITECTURE.md
+	 * section 6.2). Bytes after its final block would be covered by the
+	 * member hash yet never decoded, so they are rejected.
+	 */
+	if (used != src_len)
+		return ark_fail(err, ARK_ERR_FMT_DATA,
+		                "bytes after deflate stream in chunk", 0);
 	if ((uint64_t)dec_len != expected_u64)
 		return ark_fail(err, ARK_ERR_FMT_DATA,
 		                "decompressed chunk length mismatch", 0);
 
-	return dec_len;
+	return (ssize_t)dec_len;
 }
 
 int ark_read_verify_member_begin(ark_read_ctx_t *ctx,

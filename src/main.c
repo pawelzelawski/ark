@@ -1199,8 +1199,9 @@ static void *worker_compress(void *arg)
  * worker_decompress - Worker thread loop for decompress-mode pools.
  *
  * Each dequeued compressed chunk is decompressed with
- * ark_deflate_decompress and published to the ring buffer slot identified by
- * seq.
+ * ark_deflate_dec_oneshot and published to the ring buffer slot identified by
+ * seq. A chunk must be exactly one Deflate stream: bytes after its final
+ * block fail the chunk like malformed data.
  *
  * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.1.
  */
@@ -1217,7 +1218,8 @@ static void *worker_decompress(void *arg)
 	for (;;) {
 		pool_work_t work;
 		uint8_t *out;
-		ssize_t out_len;
+		size_t out_len;
+		size_t used;
 		int rc;
 
 		if (__atomic_load_n((int *)&pool->cancelled,
@@ -1264,9 +1266,10 @@ static void *worker_decompress(void *arg)
 
 		out = work.dst;
 
-		out_len = ark_deflate_decompress(work.src, work.src_len, out,
-		                                 ARK_CHUNK_SIZE);
-		if (out_len < 0) {
+		if (ark_deflate_dec_oneshot(work.src, work.src_len, &used, out,
+		                            ARK_CHUNK_SIZE,
+		                            &out_len) != ARK_DEFLATE_OK ||
+		    used != work.src_len) {
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
 			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK,
@@ -1274,8 +1277,8 @@ static void *worker_decompress(void *arg)
 			break;
 		}
 
-		if (ring_buf_write(pool->ring, work.seq, out, (size_t)out_len,
-		                   ARK_OK, NULL) != 0) {
+		if (ring_buf_write(pool->ring, work.seq, out, out_len, ARK_OK,
+		                   NULL) != 0) {
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
