@@ -201,6 +201,7 @@ int test_integration_overwrite_symlink(void);
 int test_integration_selective_member(void);
 int test_integration_list(void);
 int test_integration_generate_reader(void);
+int test_integration_generate_reader_strict_c11(void);
 int test_integration_generate_reader_no_follow(void);
 int test_integration_deterministic(void);
 int test_integration_large_archive(void);
@@ -543,6 +544,8 @@ static const test_case_t g_tests[] = {
     {"test_integration_selective_member", test_integration_selective_member},
     {"test_integration_list", test_integration_list},
     {"test_integration_generate_reader", test_integration_generate_reader},
+    {"test_integration_generate_reader_strict_c11",
+     test_integration_generate_reader_strict_c11},
     {"test_integration_generate_reader_no_follow",
      test_integration_generate_reader_no_follow},
     {"test_integration_deterministic", test_integration_deterministic},

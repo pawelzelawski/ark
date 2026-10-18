@@ -2052,7 +2052,12 @@ The ~200-250 line cost of including both is accepted in exchange for
 universal applicability.
 
 The generated file is approximately 2,200-2,700 lines of C11. It compiles
-with any C11 compiler: `cc -O2 recovery.c -o recover && ./recover archive.ark`.
+with any C11 compiler on a POSIX.1-2008 system:
+`cc -O2 recovery.c -o recover && ./recover archive.ark`. The reader needs
+POSIX.1-2008 for its file operations (`open` with `O_NOFOLLOW` and
+`O_CLOEXEC`, `mkdir`, `symlink`, `link`, `strdup`), so the generated source
+defines `_POSIX_C_SOURCE 200809L` before its first `#include`; a strict
+`cc -std=c11 -Wall -Wextra -Wpedantic` build then needs no extra flags.
 
 **Endian neutrality.** The ark format is strictly little-endian throughout.
 The generated `recovery.c` must parse all multi-byte integer fields using

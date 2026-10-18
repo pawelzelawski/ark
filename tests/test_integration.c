@@ -1018,6 +1018,73 @@ cleanup:
 	return rc;
 }
 /*
+ * test_integration_generate_reader_strict_c11 - The generated reader builds
+ * as strict C11 with every warning an error, using each available compiler
+ * (cc is required; clang and gcc when installed), and each build recovers
+ * the source tree. Guards the feature-test macro in recovery_template.c.
+ * See ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_strict_c11(void)
+{
+	static const char *const compilers[] = {"cc", "clang", "gcc"};
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recovery_c[PATH_MAX], recover_bin[PATH_MAX];
+	char *gen_argv[] = {(char *)g_ark_bin, "generate-reader", recovery_c,
+	                    NULL};
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	size_t i;
+	int rc;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(archive, sizeof(archive), root, "reader.ark") != 0 ||
+	    path_join(recovery_c, sizeof(recovery_c), root, "recovery.c") != 0)
+		goto cleanup;
+	if (make_basic_tree(src) != 0 ||
+	    create_archive(archive, src, NULL) != 0 ||
+	    run_ark(gen_argv, 0, NULL, NULL) != 0)
+		goto cleanup;
+	for (i = 0U; i < sizeof(compilers) / sizeof(compilers[0]); i++) {
+		char *probe_argv[] = {(char *)compilers[i], "--version", NULL};
+		char *cc_argv[] = {(char *)compilers[i],
+		                   "-std=c11",
+		                   "-Wall",
+		                   "-Wextra",
+		                   "-Wpedantic",
+		                   "-Werror",
+		                   "-O2",
+		                   recovery_c,
+		                   "-o",
+		                   recover_bin,
+		                   NULL};
+		char name[32];
+
+		if (run_program(probe_argv, NULL, NULL, "/dev/null") != 0) {
+			if (i == 0U)
+				goto cleanup;
+			continue;
+		}
+		(void)snprintf(name, sizeof(name), "recover-%s", compilers[i]);
+		if (path_join(recover_bin, sizeof(recover_bin), root, name) !=
+		    0)
+			goto cleanup;
+		(void)snprintf(name, sizeof(name), "out-%s", compilers[i]);
+		if (path_join(out, sizeof(out), root, name) != 0 ||
+		    mkdir(out, 0700) != 0)
+			goto cleanup;
+		if (run_program(cc_argv, NULL, NULL, NULL) != 0)
+			goto cleanup;
+		if (run_program(recover_argv, out, NULL, NULL) != 0 ||
+		    compare_tree(src, out) != 0)
+			goto cleanup;
+	}
+	rc = 0;
+cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
+/*
  * test_integration_generate_reader_no_follow - The recovery reader must not
  * write through a symlink that already exists at a regular-file member path
  * (non-empty and empty file paths). Recovery fails instead and the symlink

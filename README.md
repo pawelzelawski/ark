@@ -108,8 +108,8 @@ recovery.c
 ```
 
 If this repository disappears, or if `ark` is not installed many years later,
-anyone with a C11 compiler can build the recovery reader and extract the
-archive:
+anyone with a C11 compiler on a POSIX system (POSIX.1-2008) can build the
+recovery reader and extract the archive:
 
 ```sh
 cc -O2 recovery.c -o recover

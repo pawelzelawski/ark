@@ -560,6 +560,7 @@ test. These tests are the final gate before a phase is declared complete.
 | `test_integration_selective_member` | Archive with three members; --member extracts only one |
 | `test_integration_list` | list subcommand; output includes all member paths, sizes, types |
 | `test_integration_generate_reader` | generate-reader output is valid C11; compiles with `cc -O2`; runs against test archive |
+| `test_integration_generate_reader_strict_c11` | generate-reader output builds with `-std=c11 -Wall -Wextra -Wpedantic -Werror` using `cc` (required) and `clang`/`gcc` when installed; each build recovers the test tree |
 | `test_integration_generate_reader_no_follow` | Recovery reader refuses to write through a pre-existing symlink at a regular-file member path (empty and non-empty); symlink target unchanged |
 | `test_integration_deterministic` | Same source content archived twice; archives are bit-identical |
 | `test_integration_large_archive` | Archive containing 1000 files of mixed sizes; create, verify, extract; all clean |

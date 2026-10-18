@@ -125,6 +125,9 @@ Print each member path as it is verified.
 .El
 .It Cm generate-reader Op Ar output.c
 Write a standalone C11 recovery reader.
+It builds with any C11 compiler on a POSIX.1-2008 system, including a strict
+.Fl std=c11
+build.
 If
 .Ar output.c
 is omitted, the output path is

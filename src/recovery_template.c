@@ -2,7 +2,7 @@
  * recovery_template.c - standalone ark recovery reader.
  *
  * This file is embedded by `ark generate-reader` and is intended to be built
- * independently as C11:
+ * independently as C11 on a POSIX.1-2008 system:
  *
  *   cc -O2 recovery.c -o recover
  *   ./recover archive.ark
@@ -15,6 +15,14 @@
  * - Section 2.2: little-endian format fields decoded byte-by-byte
  * - Section 8.2: member hash is over compressed bytes
  */
+
+/*
+ * The reader uses POSIX.1-2008 interfaces (strdup, symlink, link, O_NOFOLLOW,
+ * O_CLOEXEC). A strict C11 build (cc -std=c11) hides them unless the source
+ * requests them, so the feature-test macro must precede every #include.
+ * ARCHITECTURE.md section 15.2.
+ */
+#define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
 #include <fcntl.h>
