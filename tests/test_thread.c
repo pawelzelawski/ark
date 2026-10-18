@@ -35,8 +35,7 @@ int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
 void ring_buf_free(ring_buf_t *);
 
 ark_pool_t *pool_test_init(int, int, ark_error_t *);
-int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
-                     ark_deflate_mode_t);
+int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
 int pool_test_read(ark_pool_t *, uint64_t, uint8_t **, size_t *, int *,
                    ark_err_t *, ark_error_t *);
 void pool_test_cancel(ark_pool_t *);
@@ -50,7 +49,7 @@ unsigned int pool_get_error_event(const ark_pool_t *);
 unsigned int pool_get_abort_event(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
 int ark_test_create_archive(const char *, const char **, size_t, int,
-                            ark_hash_alg_t, ark_deflate_mode_t, ark_error_t *);
+                            ark_hash_alg_t, int, ark_error_t *);
 
 typedef struct {
 	ring_buf_t *ring;
@@ -338,11 +337,11 @@ static int create_and_compare_archives(const char *src_dir, const char *a_path,
 	 * byte-identical output regardless of worker completion order.
 	 */
 	if (ark_test_create_archive(a_path, sources, 1U, a_workers,
-	                            ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
 	                            &err) != 0)
 		goto fail;
 	if (ark_test_create_archive(b_path, sources, 1U, b_workers,
-	                            ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
 	                            &err) != 0)
 		goto fail;
 	if (read_file_bytes(a_path, &a_bytes, &a_len) != 0)
@@ -804,8 +803,7 @@ int test_worker_error_triggers_cancel(void)
 		pool_test_shutdown(pool);
 		return 1;
 	}
-	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) == 0) {
+	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src)) == 0) {
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -823,10 +821,8 @@ int test_cancel_workers_exit_cleanly(void)
 	if (pool == NULL)
 		return 1;
 
-	if (pool_test_submit(pool, 0U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) != 0 ||
-	    pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) != 0) {
+	if (pool_test_submit(pool, 0U, g_pool_src, sizeof(g_pool_src)) != 0 ||
+	    pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src)) != 0) {
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -836,8 +832,7 @@ int test_cancel_workers_exit_cleanly(void)
 		pool_test_shutdown(pool);
 		return 1;
 	}
-	if (pool_test_submit(pool, 2U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) == 0) {
+	if (pool_test_submit(pool, 2U, g_pool_src, sizeof(g_pool_src)) == 0) {
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -857,10 +852,8 @@ int test_cancel_join_completes(void)
 	if (pool == NULL)
 		return 1;
 
-	if (pool_test_submit(pool, 0U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) != 0 ||
-	    pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) != 0) {
+	if (pool_test_submit(pool, 0U, g_pool_src, sizeof(g_pool_src)) != 0 ||
+	    pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src)) != 0) {
 		pool_test_shutdown(pool);
 		return 1;
 	}
@@ -1064,8 +1057,7 @@ int test_quiescence_sequence_order(void)
 		(void)remove_tree(tmp);
 		return 1;
 	}
-	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) == 0) {
+	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src)) == 0) {
 		pool_test_shutdown(pool);
 		(void)close(fd);
 		(void)remove_tree(tmp);
@@ -1115,8 +1107,7 @@ int test_no_cleanup_race(void)
 	if (pool == NULL)
 		return 1;
 
-	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src),
-	                     ARK_DEFLATE_DEFAULT) != 0) {
+	if (pool_test_submit(pool, 1U, g_pool_src, sizeof(g_pool_src)) != 0) {
 		pool_test_shutdown(pool);
 		return 1;
 	}

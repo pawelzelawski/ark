@@ -106,6 +106,14 @@ int test_deflate_bound_non_zero(void);
 int test_deflate_bound_exact_values(void);
 int test_deflate_bound_overflow(void);
 int test_deflate_rejects_oversize_input(void);
+int test_deflate_enc_size_query(void);
+int test_deflate_enc_rejects_invalid_params(void);
+int test_deflate_enc_init_memory_checks(void);
+int test_deflate_enc_oneshot_status(void);
+int test_deflate_enc_reuse_deterministic(void);
+int test_deflate_window_bits_round_trip(void);
+int test_deflate_window_limits_distance(void);
+int test_deflate_window_checker_rejects_far(void);
 int test_deflate_stored_block_valid(void);
 int test_deflate_default_emits_dynamic_block(void);
 int test_deflate_fast_emits_fixed_block(void);
@@ -291,6 +299,20 @@ static const test_case_t g_tests[] = {
     {"test_deflate_bound_overflow", test_deflate_bound_overflow},
     {"test_deflate_rejects_oversize_input",
      test_deflate_rejects_oversize_input},
+    {"test_deflate_enc_size_query", test_deflate_enc_size_query},
+    {"test_deflate_enc_rejects_invalid_params",
+     test_deflate_enc_rejects_invalid_params},
+    {"test_deflate_enc_init_memory_checks",
+     test_deflate_enc_init_memory_checks},
+    {"test_deflate_enc_oneshot_status", test_deflate_enc_oneshot_status},
+    {"test_deflate_enc_reuse_deterministic",
+     test_deflate_enc_reuse_deterministic},
+    {"test_deflate_window_bits_round_trip",
+     test_deflate_window_bits_round_trip},
+    {"test_deflate_window_limits_distance",
+     test_deflate_window_limits_distance},
+    {"test_deflate_window_checker_rejects_far",
+     test_deflate_window_checker_rejects_far},
     {"test_deflate_stored_block_valid", test_deflate_stored_block_valid},
     {"test_deflate_default_emits_dynamic_block",
      test_deflate_default_emits_dynamic_block},

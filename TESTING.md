@@ -138,7 +138,8 @@ runs one guest thread at a time.
 
 Command sequence points that are not syscalls use `ark_test_cli_fault_inject`
 in `src/main.c` (for example `ARK_CLI_FAULT_CLEANUP_GROW`, which fails the
-extraction cleanup-tracker allocation). Deflate encoder internals are reached
+extraction cleanup-tracker allocation). Deflate encoder internals and a
+window-limited decoder (`ark_deflate_test_decompress_window`) are reached
 through stateless `ark_deflate_test_*` accessors compiled only with
 `-DARK_DEFLATE_TEST`, the codec's own test flag, so `deflate.c` does not
 depend on ark's `ARK_TEST`.
@@ -191,12 +192,13 @@ published in the reference repository. The test vectors cover input lengths
 
 ### 3.3 Deflate (`test_deflate.c`)
 
-`ark_deflate_compress` and `ark_deflate_decompress` have no `ark_error_t *`
-parameter. Both return -1 on failure with no error code. `ARK_ERR_FMT_DATA`
-is synthesized by `ark_read_chunk` in `archive.c` after
-`ark_deflate_decompress` returns -1. Deflate unit tests check only for -1
-returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
-`test_archive.c` (§3.5).
+The Deflate API has no `ark_error_t *` parameter. The encoder returns an
+`ark_deflate_status_t`; `ark_deflate_decompress` returns -1 on failure with
+no error code. `ARK_ERR_FMT_DATA` is synthesized by `ark_read_chunk` in
+`archive.c` after `ark_deflate_decompress` returns -1, and is verified via
+`ark_read_chunk` in `test_archive.c` (§3.5). Most tests compress through
+`test_deflate_compress` (in `test_deflate.c`, also used by `test_archive.c`),
+which runs a fresh window-15 encoder and returns the size or -1.
 
 | Test case | What is verified |
 |---|---|
@@ -210,17 +212,25 @@ returns. `ARK_ERR_FMT_DATA` is verified via `ark_read_chunk` in
 | `test_deflate_bound_non_zero` | `ark_deflate_bound(n) > n` for all tested n |
 | `test_deflate_bound_exact_values` | Bound = n + 5 per started 65,535-byte block + 1 (one block for n = 0), pinned at block edges and `ARK_DEFLATE_MAX_INPUT` |
 | `test_deflate_bound_overflow` | `ark_deflate_bound(SIZE_MAX)` is 0; near `SIZE_MAX` every result is 0 or larger than n (no wrap) |
-| `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes: `ark_deflate_compress` returns -1 |
+| `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes on an encoder with the maximum `max_input`: rejected without output |
+| `test_deflate_enc_size_query` | Encoder size: 256 KiB plus a small header at window 15, independent of level and `max_input`, exactly 8 bytes per window byte between window sizes 8 and 15 |
+| `test_deflate_enc_rejects_invalid_params` | NULL params, levels 0/2/9, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 1: size 0 and no encoder |
+| `test_deflate_enc_init_memory_checks` | `enc_init` rejects NULL, one byte too short and misaligned memory; exact size gives an encoder at the start of the memory |
+| `test_deflate_enc_oneshot_status` | NULL `dst_len` or encoder and input above `max_input` give `ERR_USAGE`, `dst_cap` one below the bound gives `ERR_OUTPUT`, `dst_len` 0 after each; the encoder then compresses exactly like a fresh one |
+| `test_deflate_enc_reuse_deterministic` | One encoder compressing A, B, A at both levels gives each time the bytes a fresh encoder gives (no state carried between calls) |
+| `test_deflate_window_bits_round_trip` | Window bits 8..15 at both levels: mixed input with repeats at short, ~256 B and ~32 KiB distances round-trips through `ark_deflate_test_decompress_window`, which rejects any distance beyond the encoder's window |
+| `test_deflate_window_limits_distance` | A random block repeated just beyond the window (bits 8..14) stays incompressible, while window 15 matches the repeat |
+| `test_deflate_window_checker_rejects_far` | The window-limited test decoder is strict: a window-15 stream with ~32 KiB distances decodes at 15 and fails at every window 8..14; window bits 7 and 16 are refused |
 | `test_deflate_stored_block_valid` | Incompressible chunk stored as Deflate stored block; decompresses correctly |
-| `test_deflate_default_emits_dynamic_block` | Default mode emits a dynamic-Huffman block for compressible input |
-| `test_deflate_fast_emits_fixed_block` | Fast mode emits a fixed-Huffman block for compressible input |
+| `test_deflate_default_emits_dynamic_block` | Default level emits a dynamic-Huffman block for compressible input |
+| `test_deflate_fast_emits_fixed_block` | Fast level emits a fixed-Huffman block for compressible input |
 | `test_deflate_invalid_stream` | Corrupt compressed bytes fed to decompress; returns -1 |
 | `test_deflate_truncated_stream` | Compressed bytes truncated; returns -1 |
 | `test_deflate_output_buffer_too_small` | Correct compressed stream but insufficient output capacity; returns -1 |
 | `test_deflate_output_buffer_exact` | Output buffer exactly the right size; no overflow |
 | `test_deflate_length_symbol_mapping` | Length symbol and extra bits at code boundaries; 258 maps to code 285 with no extra bits; 2 and 259 rejected |
 | `test_deflate_zero_run_uses_code_285` | 1MB of zeros compresses below 2KB (default) and 8KB (fast); round-trip identity |
-| `test_deflate_round_trip_all_match_lengths` | Runs of every match length 3..260; round-trip identity in default and fast mode |
+| `test_deflate_round_trip_all_match_lengths` | Runs of every match length 3..260; round-trip identity at the default and fast levels |
 | `test_deflate_limit_lengths_fibonacci` | Fibonacci frequencies (17..30 symbols) limited to 15 bits; all used symbols coded; Kraft sum exactly 1 |
 | `test_deflate_limit_lengths_small_alphabets` | Distance (30, 15 bits) and code-length (19, 7 bits) alphabets complete; single used symbol gets one 1-bit code; no used symbol gives symbol 0 a 1-bit code |
 | `test_deflate_cl_code_always_complete` | Code-length plan with only one used symbol is completed with a second 1-bit code |

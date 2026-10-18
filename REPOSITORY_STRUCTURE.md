@@ -46,7 +46,8 @@ src/
 ├── sha256.h            # SHA-256 public API.
 │                       #
 │                       # Types:
-│                       #   ark_sha256_ctx_t   - opaque streaming context
+│                       #   ark_sha256_ctx_t   - streaming context (struct
+│                       #     defined in the header; stack-allocatable)
 │                       #
 │                       # Functions:
 │                       #   ark_sha256_init()   - initialise context
@@ -65,7 +66,8 @@ src/
 ├── blake3.h            # BLAKE3 public API.
 │                       #
 │                       # Types:
-│                       #   ark_blake3_ctx_t   - opaque streaming context
+│                       #   ark_blake3_ctx_t   - streaming context (struct
+│                       #     defined in the header; stack-allocatable)
 │                       #
 │                       # Functions:
 │                       #   ark_blake3_init()   - initialise context
@@ -86,16 +88,27 @@ src/
 │
 ├── deflate.h           # Deflate compress/decompress public API.
 │                       #
+│                       # Types:
+│                       #   ark_deflate_params_t - level, window bits,
+│                       #     max input
+│                       #   ark_deflate_enc_t    - opaque encoder in
+│                       #     caller memory
+│                       #   ark_deflate_status_t - call result
+│                       #
 │                       # Functions:
-│                       #   ark_deflate_compress()  - compress one chunk
-│                       #   ark_deflate_decompress()- decompress one chunk
-│                       #   ark_deflate_bound()     - maximum compressed
+│                       #   ark_deflate_enc_size()   - encoder memory size
+│                       #   ark_deflate_enc_init()   - encoder in caller memory
+│                       #   ark_deflate_enc_oneshot()- compress one chunk
+│                       #   ark_deflate_decompress() - decompress one chunk
+│                       #   ark_deflate_bound()      - maximum compressed
 │                       #     output size for a given input size; used by
 │                       #     main.c to size output buffers
 │                       #
-│                       # No I/O, no allocation. Caller owns all buffers.
-│                       # Caller is responsible for providing output buffers
-│                       #   at least ark_deflate_bound(src_len) bytes.
+│                       # No I/O, no allocation, no global or thread-local
+│                       #   state. Caller owns all buffers and the encoder
+│                       #   memory. Caller is responsible for providing
+│                       #   output buffers at least
+│                       #   ark_deflate_bound(src_len) bytes.
 │                       # Implements RFC 1951. See ARCHITECTURE.md §7.
 │
 ├── deflate.c           # Deflate implementation.
@@ -116,7 +129,6 @@ src/
 │                       #   ark_error_t        - error detail struct
 │                       #   ark_err_t          - error code enum
 │                       #   ark_hash_alg_t     - BLAKE3 or SHA-256
-│                       #   ark_deflate_mode_t - compressor quality
 │                       #
 │                       # Write path:
 │                       #   ark_write_init()         - initialise context
@@ -212,7 +224,8 @@ src/
                         #   parse_args()          - validate flags and operands
                         #
                         # Thread pool (create and extract):
-                        #   pool_init()           - allocate worker pool
+                        #   pool_init()           - allocate worker pool and
+                        #                           per-worker encoders
                         #   pool_submit()         - submit chunk to worker queue
                         #   pool_shutdown()       - cancel flag, join, free
                         #   worker_compress()     - worker thread: compress one chunk
@@ -446,7 +459,7 @@ Platform detected via `OS != uname -s`. `-DARK_TEST` is defined in
 `make test`, `make dev`, `make valgrind`, and `make test-tsan` so that
 fault injection stubs are always active during development. The same
 targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
-test accessors.
+test accessors and a window-limited test decoder.
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates
@@ -514,7 +527,9 @@ Checks: >
 | `ark_blake3_update` | `src/blake3.c` | Public |
 | `ark_blake3_final` | `src/blake3.c` | Public |
 | `ark_blake3` | `src/blake3.c` | Public; single-shot wrapper |
-| `ark_deflate_compress` | `src/deflate.c` | Public; called by worker threads |
+| `ark_deflate_enc_size` | `src/deflate.c` | Public; encoder memory size query |
+| `ark_deflate_enc_init` | `src/deflate.c` | Public; encoder in caller memory (`pool_init`) |
+| `ark_deflate_enc_oneshot` | `src/deflate.c` | Public; called by worker threads |
 | `ark_deflate_decompress` | `src/deflate.c` | Public; called by worker threads |
 | `ark_deflate_bound` | `src/deflate.c` | Public; output buffer sizing |
 | `ark_write_init` | `src/archive.c` | Public |

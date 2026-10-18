@@ -87,8 +87,8 @@ int test_edge_max_path_length(void)
 
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, path);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;

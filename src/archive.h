@@ -24,7 +24,7 @@
 #define ARK_CHUNK_SIZE 1048576U
 
 _Static_assert(ARK_CHUNK_SIZE <= ARK_DEFLATE_MAX_INPUT,
-               "one ark chunk must fit one ark_deflate_compress call");
+               "one ark chunk must fit one ark_deflate_enc_oneshot call");
 
 typedef enum {
 	ARK_OK = 0,
@@ -151,8 +151,9 @@ typedef union {
 /*
  * ark_write_init - Initialize a write context.
  *
- * hash_alg selects archive hash algorithm; mode selects compressor behavior
- * passed through to writer-side chunk handling policy.
+ * hash_alg selects archive hash algorithm; level is the compression level
+ * (ARK_DEFLATE_LEVEL_FAST or ARK_DEFLATE_LEVEL_DEFAULT) recorded with the
+ * write context.
  *
  * Returns 0 on success, -1 on failure.
  * Failure contract: populates err when non-NULL.
@@ -161,8 +162,8 @@ typedef union {
  *
  * See ARCHITECTURE.md section 16.3.
  */
-int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg,
-                   ark_deflate_mode_t mode, ark_error_t *err);
+int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg, int level,
+                   ark_error_t *err);
 
 /*
  * ark_write_header - Serialize fixed 16-byte header into dst.

@@ -8,6 +8,9 @@
 #include "blake3.h"
 #include "sha256.h"
 
+/* Compress helper defined in test_deflate.c (fresh encoder per call). */
+ssize_t test_deflate_compress(const uint8_t *, size_t, uint8_t *, size_t, int);
+
 typedef ark_write_ctx_storage_t write_ctx_storage_t;
 
 static uint16_t le16_get(const uint8_t *p)
@@ -68,8 +71,8 @@ int test_write_valid_sequence_zero_members(void)
 	ssize_t idx_len;
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -101,8 +104,8 @@ int test_write_valid_sequence_one_member(void)
 	meta.size_original = sizeof(chunk);
 	meta.data_offset = 16U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -153,8 +156,8 @@ int test_write_valid_sequence_multi_member(void)
 	meta_init(&hard, 0x04U, "h");
 	(void)snprintf(hard.link, sizeof(hard.link), "%s", "f");
 
-	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -204,8 +207,8 @@ int test_write_chunk_outside_member(void)
 	const uint8_t in[1] = {0x00};
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -228,8 +231,8 @@ int test_write_member_begin_while_active(void)
 	meta.size_original = 1U;
 	meta.data_offset = 16U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -249,8 +252,8 @@ int test_write_member_end_outside_member(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -274,8 +277,8 @@ int test_write_index_before_member_end(void)
 	meta.size_original = 1U;
 	meta.data_offset = 16U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -296,8 +299,8 @@ int test_write_footer_before_index(void)
 	uint8_t footer[64];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -320,8 +323,8 @@ int test_write_chunk_non_regular_member(void)
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x02U, "d");
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -345,14 +348,14 @@ int test_write_free_any_state(void)
 	ark_write_free(ctx);
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	ark_write_free(ctx);
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -361,8 +364,8 @@ int test_write_free_any_state(void)
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x01U, "f");
 	meta.size_original = 0U;
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -381,8 +384,8 @@ int test_write_header_dst_cap_undersize(void)
 	uint8_t header[15];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != -1)
 		return 1;
@@ -400,8 +403,8 @@ int test_write_footer_dst_cap_undersize(void)
 	uint8_t footer[63];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -426,8 +429,8 @@ int test_write_index_dst_cap_undersize(void)
 	meta_init(&meta, 0x01U, "a");
 	meta.size_original = 0U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -449,8 +452,8 @@ int test_write_header_magic(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -469,8 +472,8 @@ int test_write_header_version(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -486,8 +489,8 @@ int test_write_header_flags_zero(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -503,8 +506,8 @@ int test_write_header_comp_alg(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -520,8 +523,8 @@ int test_write_header_hash_alg(void)
 	uint8_t header[16];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -530,8 +533,8 @@ int test_write_header_hash_alg(void)
 		return 1;
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -548,8 +551,8 @@ int test_write_header_reserved_zero(void)
 	size_t i;
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -571,8 +574,8 @@ int test_write_footer_magic_confirm(void)
 	uint8_t footer[64];
 
 	ctx = ctx_from_storage(&storage);
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -603,8 +606,8 @@ int test_write_footer_index_offset(void)
 	meta.size_original = sizeof(chunk);
 	meta.data_offset = 16U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -645,8 +648,8 @@ int test_write_index_little_endian(void)
 	meta.size_original = 0U;
 	meta.data_offset = 0U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -688,8 +691,8 @@ int test_write_empty_file_chunk_count_zero(void)
 	meta.size_original = 0U;
 	meta.data_offset = 0U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -729,8 +732,8 @@ int test_write_member_hash_non_file_types(void)
 	meta_init(&hard, 0x04U, "h");
 	(void)snprintf(hard.link, sizeof(hard.link), "%s", "d");
 
-	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -781,8 +784,8 @@ int test_write_index_hash_matches_footer(void)
 	meta_init(&meta, 0x01U, "a");
 	meta.size_original = 0U;
 
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -820,8 +823,8 @@ int test_write_member_hash_matches_compressed_bytes(void)
 	meta.size_original = sizeof(chunk);
 	meta.data_offset = 16U;
 
-	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -851,8 +854,8 @@ int test_write_member_begin_invalid_type(void)
 
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0xffU, "bad");
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -872,8 +875,8 @@ int test_write_member_begin_rejects_bad_path(void)
 
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x01U, "a/../b");
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -894,8 +897,8 @@ int test_write_member_begin_rejects_bad_link(void)
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x03U, "s");
 	(void)snprintf(meta.link, sizeof(meta.link), "%s", "/target");
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -917,8 +920,8 @@ int test_write_member_begin_rejects_chunk_sizes(void)
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x01U, "a");
 	meta.chunk_sizes = chunk_sizes;
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -945,8 +948,8 @@ int test_write_size_compressed_owned_by_context(void)
 	meta.size_original = sizeof(chunk);
 	meta.size_compressed = 999U;
 	meta.data_offset = 16U;
-	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err) !=
-	    0)
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
 		return 1;
 	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
 		return 1;
@@ -1969,8 +1972,8 @@ int test_read_verify_hash_match(void)
 	size_t index_len;
 	const ark_member_meta_t *meta;
 
-	clen = ark_deflate_compress(src, sizeof(src), comp, sizeof(comp),
-	                            ARK_DEFLATE_DEFAULT);
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
 	if (clen <= 0)
 		return 1;
 	csz[0] = (uint32_t)clen;
@@ -2021,8 +2024,8 @@ int test_read_verify_hash_mismatch(void)
 	size_t index_len;
 	const ark_member_meta_t *meta;
 
-	clen = ark_deflate_compress(src, sizeof(src), comp, sizeof(comp),
-	                            ARK_DEFLATE_DEFAULT);
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
 	if (clen <= 0)
 		return 1;
 	memcpy(bad, comp, (size_t)clen);
@@ -2156,8 +2159,8 @@ int test_read_chunk_length_mismatch(void)
 	size_t index_len;
 	const ark_member_meta_t *meta;
 
-	clen = ark_deflate_compress(src, sizeof(src), comp, sizeof(comp),
-	                            ARK_DEFLATE_DEFAULT);
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
 	if (clen <= 0)
 		return 1;
 	csz[0] = (uint32_t)clen;
@@ -2203,8 +2206,8 @@ int test_read_chunk_compressed_size_mismatch(void)
 	size_t index_len;
 	const ark_member_meta_t *meta;
 
-	clen = ark_deflate_compress(src, sizeof(src), comp, sizeof(comp),
-	                            ARK_DEFLATE_DEFAULT);
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
 	if (clen <= 1)
 		return 1;
 	csz[0] = (uint32_t)clen;

@@ -533,13 +533,20 @@ Independent chunk compression is the primary mechanism for multi-core
 utilisation. The writer compresses chunks in parallel using a
 producer-consumer model: one thread traverses the filesystem and feeds
 raw chunks, a pool of worker threads compress independently using
-`ark_deflate_compress` directly, output is collected and written
+`ark_deflate_enc_oneshot` directly, output is collected and written
 sequentially by the I/O thread. The reader decompresses chunks in
 parallel using the same model.
 
-**Compression threading model.** Worker threads call `ark_deflate_compress`
+**Compression threading model.** Worker threads call `ark_deflate_enc_oneshot`
 directly from `deflate.h`. Each worker operates on independent input and
-output buffers with no shared state. Compressed results are placed into
+output buffers and its own Deflate encoder, with no shared state.
+`pool_init` allocates, per compress worker, an input buffer of
+`ARK_CHUNK_SIZE`, an output buffer of `ark_deflate_bound(ARK_CHUNK_SIZE)` and
+the encoder memory reported by `ark_deflate_enc_size` (level from the CLI,
+`window_bits` 15, `max_input` `ARK_CHUNK_SIZE`: about 256 KiB). The pool is
+created once per command, so no memory is allocated per chunk. The Deflate
+component itself keeps no global or thread-local state. Compressed results
+are placed into
 a fixed-size ring buffer indexed by chunk sequence number. The I/O thread
 drains the ring buffer in sequence order, calling `ark_write_chunk` with
 the pre-compressed bytes for each chunk in order. `ark_write_chunk` is
@@ -584,8 +591,8 @@ worker thread may access shared context state after the cancellation flag
 is set. This requirement applies to both create and extract subcommands.
 
 **Worker-to-I/O error propagation.** A worker thread may itself encounter
-a fatal error. On the create path this means `ark_deflate_compress`
-returning -1. On the extract path this means `ark_deflate_decompress`
+a fatal error. On the create path this means `ark_deflate_enc_oneshot`
+returning a status other than `ARK_DEFLATE_OK`. On the extract path this means `ark_deflate_decompress`
 returning -1. In neither case does the worker generate an `ark_err_t`
 error code: error classification (`ARK_ERR_IO_WRITE` for compression
 failure, `ARK_ERR_FMT_DATA` for decompression failure) is the I/O
@@ -703,7 +710,9 @@ the Huffman table and compressed literals/references.
 
 Implemented in `deflate.c` / `deflate.h` as a standalone component with a
 clean API: caller provides input bytes and receives output bytes. No I/O,
-no allocation owned by the component. The caller owns all buffers.
+no allocation owned by the component, no global or thread-local mutable
+state. The caller owns all buffers, including the encoder's working memory
+(the hash-chain match finder), whose size it obtains from a size query.
 
 Estimated implementation size: ~2,000-2,500 lines of C11 for compressor
 and decompressor combined.
@@ -718,34 +727,61 @@ and decompressor combined.
 ### 7.4 Public API
 
 Implemented in `deflate.c` / `deflate.h` as a standalone component. No I/O,
-no allocation owned by the component. The caller owns all buffers. The
-component is extractable for reuse in other projects without modification.
+no allocation owned by the component, no global or thread-local mutable
+state. The caller owns all buffers and all encoder memory. The component is
+extractable for reuse in other projects without modification. The API is the
+v2 design of the `v1.2` round; streaming encoder and decoder calls are added
+later on the same types.
 
 ```c
-typedef enum {
-    ARK_DEFLATE_DEFAULT,   /* lazy matching + cost-chosen dynamic blocks,
-                              archival quality (default) */
-    ARK_DEFLATE_FAST       /* greedy parsing, faster compression (--fast flag) */
-} ark_deflate_mode_t;
-
-/* Largest input of one ark_deflate_compress call (1 MiB). ark's chunk size,
-   ARK_CHUNK_SIZE in archive.h (section 6.2), is checked against it at
-   compile time. */
+/* Largest max_input of an encoder (1 MiB), so the largest input of one
+   ark_deflate_enc_oneshot call. ark's chunk size, ARK_CHUNK_SIZE in
+   archive.h (section 6.2), is checked against it at compile time. */
 #define ARK_DEFLATE_MAX_INPUT 1048576U
+
+#define ARK_DEFLATE_LEVEL_FAST    1   /* greedy parsing, one fixed block (--fast) */
+#define ARK_DEFLATE_LEVEL_DEFAULT 6   /* lazy matching + cost-chosen dynamic blocks */
+#define ARK_DEFLATE_MIN_WINDOW_BITS 8U
+#define ARK_DEFLATE_MAX_WINDOW_BITS 15U
+
+typedef enum {
+    ARK_DEFLATE_OK = 0,
+    ARK_DEFLATE_END, ARK_DEFLATE_NEED_INPUT, ARK_DEFLATE_NEED_OUTPUT, /* streaming */
+    ARK_DEFLATE_ERR_USAGE,   /* bad argument or parameters, input above max_input */
+    ARK_DEFLATE_ERR_DATA,    /* malformed input (decoder) */
+    ARK_DEFLATE_ERR_OUTPUT   /* dst too small */
+} ark_deflate_status_t;
+
+typedef struct {
+    int          level;        /* ARK_DEFLATE_LEVEL_FAST or _DEFAULT */
+    unsigned int window_bits;  /* 8..15: no distance exceeds 1 << window_bits */
+    size_t       max_input;    /* 1..ARK_DEFLATE_MAX_INPUT */
+    int          streaming;    /* must be 0 for now */
+} ark_deflate_params_t;
+
+typedef struct ark_deflate_enc ark_deflate_enc_t;   /* opaque, in caller memory */
+
+/* Bytes of encoder memory for params; 0 when params are invalid. */
+size_t ark_deflate_enc_size(const ark_deflate_params_t *params);
+
+/* Initialize an encoder in mem (aligned for uint64_t, at least the size
+   query). Returns the encoder (located in mem) or NULL. */
+ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
+                                        const ark_deflate_params_t *params);
+
+/* Compress src into one complete raw RFC 1951 stream (final block marked).
+   dst_cap must be at least ark_deflate_bound(src_len). When compressed
+   output >= src_len, emits Deflate stored blocks. */
+ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
+                                             const uint8_t *src, size_t src_len,
+                                             uint8_t *dst, size_t dst_cap,
+                                             size_t *dst_len);
 
 /* Returns the maximum compressed size for src_len bytes of uncompressed input:
    src_len + 5 bytes per started 65,535-byte stored block + 1. Caller uses
-   this to allocate dst before calling ark_deflate_compress. Returns 0 when
+   this to allocate dst before calling ark_deflate_enc_oneshot. Returns 0 when
    the bound does not fit in size_t; every valid bound is at least 6. */
 size_t  ark_deflate_bound(size_t src_len);
-
-/* Compress src into dst. Returns compressed size on success, -1 on error.
-   src_len must be at most ARK_DEFLATE_MAX_INPUT;
-   dst must be at least ark_deflate_bound(src_len) bytes.
-   When compressed output >= src_len, emits a Deflate stored block. */
-ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len,
-                              uint8_t       *dst, size_t dst_cap,
-                              ark_deflate_mode_t mode);
 
 /* Decompress src into dst. Returns decompressed size on success, -1 on error.
    dst must be large enough to hold the decompressed output. The component
@@ -754,10 +790,27 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len,
                                 uint8_t       *dst, size_t dst_cap);
 ```
 
-**Mode semantics.** `ARK_DEFLATE_DEFAULT` uses lazy matching and
-cost-based block boundary decisions. This is the default mode used by the
-`ark` CLI. `ARK_DEFLATE_FAST` uses greedy parsing for users who explicitly
-prioritise compression speed over ratio, enabled via the `--fast` CLI flag.
+**Level semantics.** `ARK_DEFLATE_LEVEL_DEFAULT` uses lazy matching and
+cost-based block boundary decisions. This is the default level used by the
+`ark` CLI. `ARK_DEFLATE_LEVEL_FAST` uses greedy parsing for users who
+explicitly prioritise compression speed over ratio, enabled via the `--fast`
+CLI flag. Levels use zlib's numbering; other levels are not accepted yet.
+
+**Encoder memory and window.** The encoder memory holds the hash-chain match
+finder: a head table of `1 << window_bits` entries and a chain table of
+`1 << window_bits` entries, 4 bytes each, plus a small header. At
+`window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. Matches never reach
+further back than `1 << window_bits` bytes, so a smaller window (for example
+one negotiated under RFC 7692) is honored exactly. ark uses `window_bits` 15,
+the RFC 1951 maximum; its output is identical to earlier releases.
+
+**Encoder rules.** The memory must stay in place (the encoder points into
+it) and is released by freeing it. One encoder serves any number of
+sequential calls, never two at once; each call starts from an empty match
+finder, so the output depends only on the input and the parameters. After a
+failed call the encoder stays valid. Failures: `ARK_DEFLATE_ERR_USAGE` for
+NULL arguments or `src_len` above `max_input`, `ARK_DEFLATE_ERR_OUTPUT` when
+`dst_cap` is below the bound; `dst_len` is 0 after a failure.
 
 ---
 
@@ -2256,11 +2309,13 @@ incompressible content; the check exists to enforce the API contract
 regardless of caller behaviour.
 
 ```c
-/* Initialise a write context. hash_alg and mode apply to all subsequent
-   operations on this context. Returns 0 on success, -1 on error. */
+/* Initialise a write context. hash_alg and the compression level
+   (ARK_DEFLATE_LEVEL_FAST or ARK_DEFLATE_LEVEL_DEFAULT) apply to all
+   subsequent operations on this context. Returns 0 on success, -1 on
+   error. */
 int ark_write_init(ark_write_ctx_t    *ctx,
                    ark_hash_alg_t      hash_alg,
-                   ark_deflate_mode_t  mode,
+                   int                 level,
                    ark_error_t        *err);
 
 /* Serialise the fixed header into dst. Returns bytes written or -1.
@@ -2285,12 +2340,12 @@ int ark_write_member_begin(ark_write_ctx_t         *ctx,
                            ark_error_t             *err);
 
 /* Record one pre-compressed chunk of member data into dst.
-   src contains already-compressed bytes produced by ark_deflate_compress
+   src contains already-compressed bytes produced by ark_deflate_enc_oneshot
    in a worker thread; this function does NOT perform compression.
    src_len is the compressed byte count. Updates internal hash state for
    the current member over the compressed bytes and records the chunk size.
    Copies compressed bytes to dst for handoff to chevron_write_chunk.
-   Worker threads compress chunks using ark_deflate_compress directly;
+   Worker threads compress chunks using ark_deflate_enc_oneshot directly;
    this function is called only from the I/O thread, in chunk order, after
    the ring buffer has delivered the compressed result for that chunk.
    If dst_cap < src_len, returns -1 with ARK_ERR_IO_ALLOC: the caller
@@ -2569,7 +2624,9 @@ all v1 format invariants. In particular, the following must not change:
   (see §6.2)
 - raw-store fallback semantics for incompressible content (see §6.4, §7.2)
 - determinism scope for identical input on the same binary (see §13.1)
-- public Deflate API contract in `deflate.h` (see §7.4)
+- public Deflate API contract in `deflate.h` (see §7.4); it changes only by
+  an explicit design decision recorded there (the caller-owned encoder of
+  the v1.2 round is one), never as a side effect of an optimisation
 - decompressor/compiler boundary required by recovery amalgamation
   (`deflate.c` decompressor subset remains standalone; see §15.3)
 

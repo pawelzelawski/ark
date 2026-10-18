@@ -91,8 +91,8 @@ ark_read_ctx_t  *ctx;
 ark_error_t      err;
 
 /* Public API functions: ark_ prefix, lowercase with underscores */
-int     ark_write_init(ark_write_ctx_t *, ark_hash_alg_t,
-            ark_deflate_mode_t, ark_error_t *);
+int     ark_write_init(ark_write_ctx_t *, ark_hash_alg_t, int,
+            ark_error_t *);
 int     ark_read_header(ark_read_ctx_t *, const uint8_t *,
             size_t, ark_error_t *);
 ssize_t ark_write_chunk(ark_write_ctx_t *, const uint8_t *,
@@ -602,16 +602,16 @@ call `ark_write_chunk`, do not modify the write or read context, and do not
 touch any shared struct except the ring buffer and the shared error state.
 
 ```c
-/* Correct - worker calls ark_deflate_compress directly */
+/* Correct - worker calls ark_deflate_enc_oneshot on its own encoder */
 static void *
 worker_compress(void *arg)
 {
 	ark_worker_arg_t *w = arg;
-	ssize_t           clen;
+	size_t            clen;
 
-	clen = ark_deflate_compress(w->in, w->in_len, w->out,
-	    w->out_cap, w->mode);
-	ring_buf_write(w->ring, w->seq, w->out, clen);
+	if (ark_deflate_enc_oneshot(w->enc, w->in, w->in_len, w->out,
+	    w->out_cap, &clen) == ARK_DEFLATE_OK)
+		ring_buf_write(w->ring, w->seq, w->out, clen);
 	return NULL;
 }
 
@@ -660,9 +660,8 @@ Required sequence for a worker that encounters a fatal error:
 
 ```c
 /* Correct - abort sentinel written before worker exit */
-clen = ark_deflate_compress(w->in, w->in_len, w->out, w->out_cap,
-    w->mode);
-if (clen < 0) {
+if (ark_deflate_enc_oneshot(w->enc, w->in, w->in_len, w->out, w->out_cap,
+    &clen) != ARK_DEFLATE_OK) {
 	ark_fail(&local_err, ARK_ERR_FMT_DATA, "compress failed", 0);
 	error_store_once(&pool->shared_err, &local_err);  /* step 1 */
 	ring_buf_abort(w->ring, w->seq);                  /* step 2 */
@@ -670,7 +669,8 @@ if (clen < 0) {
 }
 
 /* Wrong - worker exits without writing sentinel; I/O thread deadlocks */
-if (clen < 0)
+if (ark_deflate_enc_oneshot(w->enc, w->in, w->in_len, w->out, w->out_cap,
+    &clen) != ARK_DEFLATE_OK)
 	return NULL;
 ```
 
@@ -714,7 +714,7 @@ The write context must be called in strict sequence. See ARCHITECTURE.md
 
 ```c
 /* Correct - follows state machine sequence */
-ark_write_init(&ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_DEFAULT, &err);
+ark_write_init(&ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT, &err);
 ark_write_header(&ctx, header_buf, sizeof(header_buf), &err);
 ark_write_member_begin(&ctx, &meta, &err);
 ark_write_chunk(&ctx, comp_data, comp_len, out, out_cap, &err);
@@ -806,8 +806,8 @@ self-explanatory.
 /*
  * ark_write_chunk - record one pre-compressed chunk into the write context.
  *
- * src contains compressed bytes produced by ark_deflate_compress in a worker
- * thread. This function does not compress. It updates the per-member hash
+ * src contains compressed bytes produced by ark_deflate_enc_oneshot in a
+ * worker thread. This function does not compress. It updates the per-member hash
  * state over the compressed bytes, records the chunk size, and copies the
  * compressed bytes to dst for handoff to chevron_write_chunk.
  *
@@ -866,7 +866,7 @@ on its own line before the guarded code.
 ```c
 /*
  * SAFETY: ark_write_chunk is called only from the I/O thread and only in
- * chunk sequence order. Worker threads call ark_deflate_compress directly.
+ * chunk sequence order. Worker threads call ark_deflate_enc_oneshot directly.
  * Calling ark_write_chunk from a worker thread is undefined behaviour.
  * See ARCHITECTURE.md §6.3.
  */

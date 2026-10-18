@@ -31,7 +31,7 @@ enum {
 };
 
 int ark_test_create_archive(const char *, const char **, size_t, int,
-                            ark_hash_alg_t, ark_deflate_mode_t, ark_error_t *);
+                            ark_hash_alg_t, int, ark_error_t *);
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
 void ark_test_cli_fault_reset(void);
@@ -174,7 +174,7 @@ static int create_archive(const char *archive, const char *src)
 	fault_reset();
 	ark_test_cli_fault_reset();
 	return ark_test_create_archive(archive, paths, 1U, 1, ARK_HASH_BLAKE3,
-	                               ARK_DEFLATE_DEFAULT, &err);
+	                               ARK_DEFLATE_LEVEL_DEFAULT, &err);
 }
 
 /* expect_create_fault - Inject one create failure and check the error code. */
@@ -204,7 +204,7 @@ static int expect_create_fault(int fault_kind, int fail_on, int use_tree,
 	else
 		fault_inject(fault_kind, fail_on, EIO);
 	rc = ark_test_create_archive(archive, paths, 1U, 1, ARK_HASH_BLAKE3,
-	                             ARK_DEFLATE_DEFAULT, &err);
+	                             ARK_DEFLATE_LEVEL_DEFAULT, &err);
 	fault_reset();
 	ark_test_cli_fault_reset();
 	rm_rf(root);

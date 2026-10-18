@@ -48,7 +48,7 @@ typedef struct {
 struct ark_write_ctx {
 	enum ark_write_state state;
 	ark_hash_alg_t hash_alg;
-	ark_deflate_mode_t mode;
+	int level;
 	ark_member_meta_t *members;
 	uint32_t member_count;
 	uint32_t member_cap;
@@ -774,8 +774,8 @@ static int member_write_index(const ark_member_meta_t *m, uint8_t *dst,
 	return 0;
 }
 
-int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg,
-                   ark_deflate_mode_t mode, ark_error_t *err)
+int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg, int level,
+                   ark_error_t *err)
 {
 	if (ctx == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null write context", 0);
@@ -788,7 +788,7 @@ int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg,
 
 	buf_zero(ctx, sizeof(*ctx));
 	ctx->hash_alg = hash_alg;
-	ctx->mode = mode;
+	ctx->level = level;
 	ctx->state = ARK_WRITE_STATE_READY;
 	return 0;
 }

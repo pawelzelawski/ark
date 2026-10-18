@@ -60,7 +60,7 @@ typedef enum {
 typedef struct {
 	ark_cmd_t cmd;
 	ark_hash_alg_t hash_alg;
-	ark_deflate_mode_t deflate_mode;
+	int deflate_level;
 	int overwrite;
 	int verbose;
 	int human;
@@ -125,7 +125,6 @@ typedef struct {
 	ark_write_ctx_t *write_ctx;
 	chevron_handle_t *chev_handle;
 	ark_pool_t *pool;
-	ark_deflate_mode_t deflate_mode;
 	modified_path_list_t *modified_paths;
 	inode_table_t inodes;
 	uint8_t *input_buf;
@@ -198,7 +197,6 @@ typedef struct {
 	size_t src_len;
 	uint8_t *dst;
 	size_t dst_cap;
-	ark_deflate_mode_t mode;
 } pool_work_t;
 
 typedef struct {
@@ -212,6 +210,8 @@ struct ark_worker_arg {
 	uint8_t *dst;
 	size_t src_cap;
 	size_t dst_cap;
+	void *enc_mem;
+	ark_deflate_enc_t *enc;
 };
 
 struct ring_buf {
@@ -257,9 +257,8 @@ static void error_store_once(ark_shared_err_t *, const ark_error_t *);
 static int shared_err_get(const ark_shared_err_t *, ark_error_t *);
 static size_t pool_input_cap(ark_pool_mode_t);
 static size_t pool_output_cap(ark_pool_mode_t);
-static ark_pool_t *pool_init(int, ark_pool_mode_t, ark_error_t *);
-static int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
-                       ark_deflate_mode_t);
+static ark_pool_t *pool_init(int, ark_pool_mode_t, int, ark_error_t *);
+static int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
 static void pool_shutdown(ark_pool_t *);
 
 static void *worker_compress(void *);
@@ -675,6 +674,8 @@ static size_t pool_output_cap(ark_pool_mode_t mode)
  * mode selects a fixed worker routine for the lifetime of the pool:
  * compress pools run worker_compress, decompress pools run
  * worker_decompress. Mixing modes in one pool is intentionally unsupported.
+ * Compress pools give every worker its own Deflate encoder at level
+ * (window_bits 15, max input ARK_CHUNK_SIZE); decompress pools ignore level.
  *
  * Returns a new pool on success, NULL on failure.
  *
@@ -683,10 +684,12 @@ static size_t pool_output_cap(ark_pool_mode_t mode)
  *
  * See ARCHITECTURE.md section 6.3.
  */
-static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
+static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, int level,
                              ark_error_t *err)
 {
 	ark_pool_t *pool;
+	ark_deflate_params_t enc_params;
+	size_t enc_size;
 	void *(*entry)(void *);
 	int i;
 	int rc;
@@ -695,6 +698,21 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		return NULL;
 	if (mode != ARK_POOL_COMPRESS && mode != ARK_POOL_DECOMPRESS)
 		return NULL;
+	enc_params = (ark_deflate_params_t){
+	    .level = level,
+	    .window_bits = ARK_DEFLATE_MAX_WINDOW_BITS,
+	    .max_input = ARK_CHUNK_SIZE,
+	    .streaming = 0,
+	};
+	enc_size = 0U;
+	if (mode == ARK_POOL_COMPRESS) {
+		enc_size = ark_deflate_enc_size(&enc_params);
+		if (enc_size == 0U) {
+			(void)fail_error(err, ARK_ERR_USAGE,
+			                 "invalid compression level", "", 0);
+			return NULL;
+		}
+	}
 
 	/* OWNERSHIP: pool is released only by pool_shutdown. */
 	pool = (ark_pool_t *)calloc(1U, sizeof(*pool));
@@ -733,14 +751,27 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		pool->worker_args[i].dst_cap = pool_output_cap(mode);
 		pool->worker_args[i].src = malloc(pool->worker_args[i].src_cap);
 		pool->worker_args[i].dst = malloc(pool->worker_args[i].dst_cap);
+		/*
+		 * OWNERSHIP: enc_mem holds the worker's encoder and is released
+		 * with the worker buffers. See ARCHITECTURE.md section 6.3.
+		 */
+		if (enc_size != 0U) {
+			pool->worker_args[i].enc_mem = malloc(enc_size);
+			pool->worker_args[i].enc =
+			    ark_deflate_enc_init(pool->worker_args[i].enc_mem,
+			                         enc_size, &enc_params);
+		}
 		if (pool->worker_args[i].src == NULL ||
-		    pool->worker_args[i].dst == NULL) {
+		    pool->worker_args[i].dst == NULL ||
+		    (enc_size != 0U && pool->worker_args[i].enc == NULL)) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 			while (i > 0) {
 				i--;
 				free(pool->worker_args[i].src);
 				free(pool->worker_args[i].dst);
+				free(pool->worker_args[i].enc_mem);
 			}
 			free(pool->worker_args);
 			free((void *)pool->workers);
@@ -763,6 +794,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->worker_args);
 		free((void *)pool->workers);
@@ -782,6 +814,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			for (i = 0; i < n_workers; i++) {
 				free(pool->worker_args[i].src);
 				free(pool->worker_args[i].dst);
+				free(pool->worker_args[i].enc_mem);
 			}
 			free(pool->worker_args);
 			free((void *)pool->workers);
@@ -807,6 +840,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->worker_args);
 		free((void *)pool->workers);
@@ -827,6 +861,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->worker_args);
 		free((void *)pool->workers);
@@ -848,6 +883,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->worker_args);
 		free((void *)pool->workers);
@@ -870,6 +906,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 		for (i = 0; i < n_workers; i++) {
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->worker_args);
 		free((void *)pool->workers);
@@ -891,6 +928,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 			free(pool->queue_slots[i].src);
 			free(pool->worker_args[i].src);
 			free(pool->worker_args[i].dst);
+			free(pool->worker_args[i].enc_mem);
 		}
 		free(pool->queue_slots);
 		free(pool->worker_args);
@@ -936,6 +974,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
 				free(pool->queue_slots[i].src);
 				free(pool->worker_args[i].src);
 				free(pool->worker_args[i].dst);
+				free(pool->worker_args[i].enc_mem);
 			}
 			free(pool->queue_slots);
 			free(pool->worker_args);
@@ -957,7 +996,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode,
  * occurs on the per-chunk hot path.
  */
 static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
-                       size_t src_len, ark_deflate_mode_t mode)
+                       size_t src_len)
 {
 	pool_queue_slot_t *qslot;
 	int rc;
@@ -999,7 +1038,6 @@ static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 	    .seq = seq,
 	    .src = qslot->src,
 	    .src_len = src_len,
-	    .mode = mode,
 	};
 	pool->q_tail = (pool->q_tail + 1U) % pool->q_cap;
 	pool->q_count++;
@@ -1039,6 +1077,7 @@ static void pool_shutdown(ark_pool_t *pool)
 		free(pool->queue_slots[i].src);
 		free(pool->worker_args[i].src);
 		free(pool->worker_args[i].dst);
+		free(pool->worker_args[i].enc_mem);
 	}
 	free(pool->queue_slots);
 	free(pool->worker_args);
@@ -1049,8 +1088,9 @@ static void pool_shutdown(ark_pool_t *pool)
 /*
  * worker_compress - Worker thread loop for compress-mode pools.
  *
- * Each dequeued input chunk is compressed with ark_deflate_compress and
- * published to the ring buffer slot identified by seq.
+ * Each dequeued input chunk is compressed with ark_deflate_enc_oneshot on
+ * the worker's own encoder and published to the ring buffer slot identified
+ * by seq.
  *
  * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.1.
  */
@@ -1113,7 +1153,7 @@ static void *worker_compress(void *arg)
 
 		size_t out_cap;
 		uint8_t *out;
-		ssize_t out_len;
+		size_t out_len;
 
 		out_cap = ark_deflate_bound(work.src_len);
 		out = work.dst;
@@ -1129,9 +1169,9 @@ static void *worker_compress(void *arg)
 			break;
 		}
 
-		out_len = ark_deflate_compress(work.src, work.src_len, out,
-		                               work.dst_cap, work.mode);
-		if (out_len < 0) {
+		if (ark_deflate_enc_oneshot(warg->enc, work.src, work.src_len,
+		                            out, work.dst_cap,
+		                            &out_len) != ARK_DEFLATE_OK) {
 			/* SAFETY: publish abort before worker exit. See
 			 * ARCHITECTURE.md section 6.3. */
 			(void)ring_buf_abort(pool->ring, work.seq, ARK_OK,
@@ -1139,8 +1179,8 @@ static void *worker_compress(void *arg)
 			break;
 		}
 
-		if (ring_buf_write(pool->ring, work.seq, out, (size_t)out_len,
-		                   ARK_OK, NULL) != 0) {
+		if (ring_buf_write(pool->ring, work.seq, out, out_len, ARK_OK,
+		                   NULL) != 0) {
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
@@ -1267,8 +1307,8 @@ static int cmd_list(const ark_args_t *, ark_error_t *);
 static int cmd_verify(const ark_args_t *, ark_error_t *);
 static int cmd_generate_reader(const ark_args_t *, ark_error_t *);
 static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
-                        ark_pool_t *, ark_deflate_mode_t, uint64_t *,
-                        modified_path_list_t *, ark_error_t *);
+                        ark_pool_t *, uint64_t *, modified_path_list_t *,
+                        ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
                           ark_error_t *);
 static int traverse_directory_abs(traverse_ctx_t *, const char *, const char *,
@@ -1340,8 +1380,7 @@ static void format_mtime_human(uint64_t, char *, size_t);
 
 #ifdef ARK_TEST
 ark_pool_t *pool_test_init(int, int, ark_error_t *);
-int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t,
-                     ark_deflate_mode_t);
+int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
 int pool_test_read(ark_pool_t *, uint64_t, uint8_t **, size_t *, int *,
                    ark_err_t *, ark_error_t *);
 void pool_test_cancel(ark_pool_t *);
@@ -1697,7 +1736,7 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 	        err) != 0)
 		goto cleanup;
 
-	if (ark_write_init(wctx, args->hash_alg, args->deflate_mode, err) != 0)
+	if (ark_write_init(wctx, args->hash_alg, args->deflate_level, err) != 0)
 		goto cleanup;
 
 #ifdef ARK_TEST
@@ -1724,8 +1763,7 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 
 	for (i = 0U; i < args->create_path_count; i++) {
 		if (traverse_dir(args->create_paths[i], wctx, &handle, pool,
-		                 args->deflate_mode, &output_offset, &modified,
-		                 err) != 0)
+		                 &output_offset, &modified, err) != 0)
 			goto cleanup;
 	}
 
@@ -3179,8 +3217,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				        rctx, meta, chunk, comp_buf, csz,
 				        err) != 0)
 					goto cleanup;
-				if (pool_submit(pool, submit_seq, comp_buf, csz,
-				                ARK_DEFLATE_DEFAULT) != 0) {
+				if (pool_submit(pool, submit_seq, comp_buf,
+				                csz) != 0) {
 					if (!shared_err_get(&pool->shared_err,
 					                    err))
 						(void)fail_error(
@@ -3997,8 +4035,8 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			got += (size_t)n;
 		}
 
-		if (pool_submit(ctx->pool, submit_seq, ctx->input_buf, want,
-		                ctx->deflate_mode) != 0) {
+		if (pool_submit(ctx->pool, submit_seq, ctx->input_buf, want) !=
+		    0) {
 			if (!shared_err_get(&ctx->pool->shared_err, err))
 				rc = fail_error(err, ARK_ERR_IO_WRITE,
 				                "create worker submit failed",
@@ -4456,7 +4494,6 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
  */
 static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
                         chevron_handle_t *chev_handle, ark_pool_t *pool,
-                        ark_deflate_mode_t deflate_mode,
                         uint64_t *output_offset,
                         modified_path_list_t *modified_paths, ark_error_t *err)
 {
@@ -4469,7 +4506,6 @@ static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 	ctx.write_ctx = write_ctx;
 	ctx.chev_handle = chev_handle;
 	ctx.pool = pool;
-	ctx.deflate_mode = deflate_mode;
 	ctx.output_offset = output_offset;
 	ctx.modified_paths = modified_paths;
 
@@ -4979,7 +5015,7 @@ static void args_init(ark_args_t *args)
 {
 	*args = (ark_args_t){
 	    .hash_alg = ARK_HASH_BLAKE3,
-	    .deflate_mode = ARK_DEFLATE_DEFAULT,
+	    .deflate_level = ARK_DEFLATE_LEVEL_DEFAULT,
 	    .output_path = ".",
 	    .generate_reader_output = "recovery.c",
 	};
@@ -5113,7 +5149,7 @@ static int parse_args(int argc, char **argv, ark_args_t *args, ark_error_t *err)
 		if (strcmp(argv[i], "--fast") == 0) {
 			if (args->cmd != ARK_CMD_CREATE)
 				goto fail_usage_fast;
-			args->deflate_mode = ARK_DEFLATE_FAST;
+			args->deflate_level = ARK_DEFLATE_LEVEL_FAST;
 			continue;
 		}
 
@@ -5304,14 +5340,14 @@ ark_pool_t *pool_test_init(int n_workers, int decompress, ark_error_t *err)
 	ark_pool_mode_t mode;
 
 	mode = decompress ? ARK_POOL_DECOMPRESS : ARK_POOL_COMPRESS;
-	return pool_init(n_workers, mode, err);
+	return pool_init(n_workers, mode, ARK_DEFLATE_LEVEL_DEFAULT, err);
 }
 
 /* ARK_TEST only: submit one work item into a test pool queue. */
 int pool_test_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
-                     size_t src_len, ark_deflate_mode_t mode)
+                     size_t src_len)
 {
-	return pool_submit(pool, seq, src, src_len, mode);
+	return pool_submit(pool, seq, src, src_len);
 }
 
 /* ARK_TEST only: read one ring slot through pool-owned ring buffer. */
@@ -5360,8 +5396,8 @@ void pool_test_shutdown(ark_pool_t *pool)
  */
 int ark_test_create_archive(const char *archive_path, const char **create_paths,
                             size_t create_path_count, int n_workers,
-                            ark_hash_alg_t hash_alg,
-                            ark_deflate_mode_t deflate_mode, ark_error_t *err)
+                            ark_hash_alg_t hash_alg, int deflate_level,
+                            ark_error_t *err)
 {
 	ark_args_t args;
 	ark_pool_t *pool;
@@ -5375,12 +5411,12 @@ int ark_test_create_archive(const char *archive_path, const char **create_paths,
 	args = (ark_args_t){0};
 	args.cmd = ARK_CMD_CREATE;
 	args.hash_alg = hash_alg;
-	args.deflate_mode = deflate_mode;
+	args.deflate_level = deflate_level;
 	args.archive_path = archive_path;
 	args.create_paths = create_paths;
 	args.create_path_count = create_path_count;
 
-	pool = pool_init(n_workers, ARK_POOL_COMPRESS, err);
+	pool = pool_init(n_workers, ARK_POOL_COMPRESS, deflate_level, err);
 	if (pool == NULL)
 		return -1;
 	return cmd_create(&args, pool, err);
@@ -5495,7 +5531,7 @@ int ark_test_extract_archive(const char *archive_path, const char *output_path,
 		                  "output directory open failed", output_path,
 		                  errno);
 
-	pool = pool_init(n_workers, ARK_POOL_DECOMPRESS, err);
+	pool = pool_init(n_workers, ARK_POOL_DECOMPRESS, 0, err);
 	if (pool == NULL) {
 		(void)ARK_CLOSE(dest_fd);
 		return -1;
@@ -5709,7 +5745,7 @@ int main(int argc, char **argv)
 		    pool_init(default_worker_count(),
 		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
 		                                         : ARK_POOL_DECOMPRESS,
-		              &err);
+		              args.deflate_level, &err);
 		if (io_pool == NULL) {
 			print_error(&err);
 			args_free(&args);
@@ -5762,7 +5798,7 @@ int main(int argc, char **argv)
 		    pool_init(default_worker_count(),
 		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
 		                                         : ARK_POOL_DECOMPRESS,
-		              &err);
+		              args.deflate_level, &err);
 		if (io_pool == NULL) {
 			print_error(&err);
 			args_free(&args);

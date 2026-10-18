@@ -1,10 +1,11 @@
 /*
  * deflate.c - RFC 1951 Deflate component implementation.
  *
- * Implements ark_deflate_bound, ark_deflate_compress, and
+ * Implements ark_deflate_bound, the encoder (ark_deflate_enc_*) and
  * ark_deflate_decompress from deflate.h. This component performs pure
- * in-memory transformation only: no I/O and no component-owned allocation.
- * See ARCHITECTURE.md section 7.
+ * in-memory transformation only: no I/O, no component-owned allocation and
+ * no global or thread-local mutable state; encoder state lives in caller
+ * memory. See ARCHITECTURE.md section 7.
  */
 
 #include <limits.h>
@@ -16,10 +17,8 @@
 
 #define ARK_DEFLATE_MIN_MATCH 3U
 #define ARK_DEFLATE_MAX_MATCH 258U
+/* Largest distance RFC 1951 can encode (window_bits 15). */
 #define ARK_DEFLATE_WINDOW_SIZE 32768U
-#define ARK_DEFLATE_HASH_BITS 15U
-#define ARK_DEFLATE_HASH_SIZE (1U << ARK_DEFLATE_HASH_BITS)
-#define ARK_DEFLATE_HASH_MASK (ARK_DEFLATE_HASH_SIZE - 1U)
 
 /*
  * Two-level Huffman decode tables. A root table indexed by the next
@@ -75,13 +74,30 @@ typedef struct {
 	size_t dist;
 } ark_match_t;
 
+/*
+ * Hash-chain match finder. head has 1 << hash_bits entries (newest position
+ * per hash, -1 for none); prev has window_size entries indexed by
+ * position & (window_size - 1) (previous position with the same hash). Both
+ * arrays live in the encoder's caller memory.
+ */
 typedef struct {
-	int32_t head[ARK_DEFLATE_HASH_SIZE];
-	int32_t prev[ARK_DEFLATE_WINDOW_SIZE];
-	uint32_t head_gen[ARK_DEFLATE_HASH_SIZE];
-	uint32_t prev_gen[ARK_DEFLATE_WINDOW_SIZE];
-	uint32_t generation;
+	int32_t *head;
+	int32_t *prev;
+	unsigned int hash_bits;
+	size_t window_size;
 } ark_match_finder_t;
+
+/*
+ * Encoder state. The struct sits at the start of the caller's memory; tables
+ * holds the match-finder arrays: head (1 << hash_bits entries), then prev
+ * (window_size entries).
+ */
+struct ark_deflate_enc {
+	ark_match_finder_t mf;
+	int level;
+	size_t max_input;
+	int32_t tables[];
+};
 
 typedef struct {
 	uint32_t lit[286];
@@ -141,12 +157,6 @@ static const size_t g_default_block_candidates[] = {
     (size_t)64U * 1024U,
     (size_t)128U * 1024U,
 };
-
-/*
- * Match-finder state is thread-local so worker threads never share mutable
- * compressor state. See ARCHITECTURE.md §6.3.
- */
-static _Thread_local ark_match_finder_t g_match_finder;
 
 /*
  * Shared by the compressor and the decompressor (see ARCHITECTURE.md
@@ -614,77 +624,57 @@ static int emit_code_symbol(ark_bit_writer_t *bw, const ark_codebook_t *book,
 }
 
 /* Deflate hash over three bytes for LZ77 match candidate lookup. */
-static unsigned int hash3(const uint8_t *p)
+static unsigned int hash3(const uint8_t *p, unsigned int hash_bits)
 {
-	unsigned int h;
+	uint32_t h;
 
-	h = ((unsigned int)p[0] << 16) ^ ((unsigned int)p[1] << 8) ^
-	    (unsigned int)p[2];
+	h = ((uint32_t)p[0] << 16) ^ ((uint32_t)p[1] << 8) ^ (uint32_t)p[2];
 	h *= 0x1e35a7bdU;
-	return (h >> (32U - ARK_DEFLATE_HASH_BITS)) & ARK_DEFLATE_HASH_MASK;
+	return (unsigned int)(h >> (32U - hash_bits));
 }
 
-/* Start a fresh parse generation without clearing full hash/chain tables. */
+/*
+ * Start a parse: forget every hash head. prev is not cleared: a chain is
+ * entered only through head, and every prev slot reached from it belongs to
+ * a position inserted during this parse, whose insert wrote that slot.
+ * Stale prev slots from earlier parses are therefore never read, and the
+ * output equals a parse over fully cleared tables.
+ */
 static void match_finder_begin_parse(ark_match_finder_t *mf)
 {
-	uint32_t next;
+	size_t i;
+	size_t n;
 
-	if (mf->generation == UINT32_MAX) {
-		size_t i;
-
-		/*
-		 * SAFETY: on generation wrap, clear all stamps before reusing
-		 * generation values. Reusing wrapped generations without
-		 * clearing would make stale hash/chain slots appear valid for
-		 * the current parse.
-		 */
-		for (i = 0; i < ARK_DEFLATE_HASH_SIZE; i++)
-			mf->head_gen[i] = 0U;
-		for (i = 0; i < ARK_DEFLATE_WINDOW_SIZE; i++)
-			mf->prev_gen[i] = 0U;
-		next = 1U;
-	} else
-		next = mf->generation + 1U;
-	mf->generation = next;
+	n = (size_t)1U << mf->hash_bits;
+	for (i = 0; i < n; i++)
+		mf->head[i] = -1;
 }
 
-/* Return hash-head candidate only if it was written in this parse. */
+/* Return the newest position with hash h, or -1. */
 static int32_t match_finder_head_get(const ark_match_finder_t *mf,
                                      unsigned int h)
 {
-	if (mf->head_gen[h] != mf->generation)
-		return -1;
 	return mf->head[h];
 }
 
-/* Store hash-head candidate for the current parse generation. */
+/* Store the newest position for hash h. */
 static void match_finder_head_set(ark_match_finder_t *mf, unsigned int h,
                                   int32_t pos)
 {
 	mf->head[h] = pos;
-	mf->head_gen[h] = mf->generation;
 }
 
-/* Return chain predecessor only if it was written in this parse. */
+/* Return the chain predecessor recorded for pos. */
 static int32_t match_finder_prev_get(const ark_match_finder_t *mf, size_t pos)
 {
-	size_t slot;
-
-	slot = pos & (ARK_DEFLATE_WINDOW_SIZE - 1U);
-	if (mf->prev_gen[slot] != mf->generation)
-		return -1;
-	return mf->prev[slot];
+	return mf->prev[pos & (mf->window_size - 1U)];
 }
 
-/* Store chain predecessor for the current parse generation. */
+/* Record the chain predecessor for pos. */
 static void match_finder_prev_set(ark_match_finder_t *mf, size_t pos,
                                   int32_t prev)
 {
-	size_t slot;
-
-	slot = pos & (ARK_DEFLATE_WINDOW_SIZE - 1U);
-	mf->prev[slot] = prev;
-	mf->prev_gen[slot] = mf->generation;
+	mf->prev[pos & (mf->window_size - 1U)] = prev;
 }
 
 /* Insert one position into hash chain and return previous head candidate. */
@@ -696,7 +686,7 @@ static int insert_hash(const uint8_t *src, size_t src_len, size_t pos,
 
 	if (pos + 2U >= src_len)
 		return -1;
-	h = hash3(src + pos);
+	h = hash3(src + pos, mf->hash_bits);
 	old = match_finder_head_get(mf, h);
 	match_finder_prev_set(mf, pos, old);
 	match_finder_head_set(mf, h, (int32_t)pos);
@@ -725,9 +715,7 @@ static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
 	max_len = src_len - pos;
 	if (max_len > ARK_DEFLATE_MAX_MATCH)
 		max_len = ARK_DEFLATE_MAX_MATCH;
-	min_pos = (int32_t)(pos > ARK_DEFLATE_WINDOW_SIZE
-	                        ? pos - ARK_DEFLATE_WINDOW_SIZE
-	                        : 0U);
+	min_pos = (int32_t)(pos > mf->window_size ? pos - mf->window_size : 0U);
 
 	tries = 0U;
 	while (candidate >= min_pos && tries < max_chain) {
@@ -964,26 +952,21 @@ static int build_length_limited_lengths(const uint32_t *freq, size_t n_symbols,
 }
 
 /* Parse a block once, optionally collecting frequencies or emitting symbols. */
-static int parse_block(const uint8_t *src, size_t src_len,
-                       ark_deflate_mode_t mode, ark_freq_t *freq,
+static int parse_block(ark_match_finder_t *mf, const uint8_t *src,
+                       size_t src_len, int level, ark_freq_t *freq,
                        ark_bit_writer_t *bw, const ark_codebook_t *lit_book,
                        const ark_codebook_t *dist_book)
 {
-	ark_match_finder_t *mf;
 	unsigned int max_chain;
 	size_t nice_len;
 	size_t pos;
 	size_t i;
 
-	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 128U;
-	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
+	max_chain = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 128U;
+	nice_len =
+	    (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
 
-	/*
-	 * Reset match-finder visibility via generation stamping instead of full
-	 * table clears. This keeps hash-chain lazy matching deterministic while
-	 * reducing reset cost. See ARCHITECTURE.md §7.2 and §13.1.
-	 */
-	mf = &g_match_finder;
+	/* Each parse starts empty, so output is deterministic (§13.1). */
 	match_finder_begin_parse(mf);
 
 	if (freq != NULL) {
@@ -1003,7 +986,7 @@ static int parse_block(const uint8_t *src, size_t src_len,
 		               nice_len);
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
-		    mode == ARK_DEFLATE_DEFAULT) {
+		    level == ARK_DEFLATE_LEVEL_DEFAULT) {
 			ark_match_t m_next;
 
 			m_next.len = 0U;
@@ -1012,7 +995,7 @@ static int parse_block(const uint8_t *src, size_t src_len,
 				unsigned int hnext;
 				int32_t cnext;
 
-				hnext = hash3(src + pos + 1U);
+				hnext = hash3(src + pos + 1U, mf->hash_bits);
 				cnext = match_finder_head_get(mf, hnext);
 				m_next =
 				    find_match(src, src_len, pos + 1U, cnext,
@@ -1129,23 +1112,23 @@ static int emit_match(ark_bit_writer_t *bw, size_t len, size_t dist)
 }
 
 /*
- * Compress with one fixed-Huffman block. Used for fast mode, which matches
- * greedily; the one-step lazy branch below runs only for default mode.
+ * Compress with one fixed-Huffman block. Used for the fast level, which
+ * matches greedily; the one-step lazy branch below runs only for the default
+ * level.
  * See ARCHITECTURE.md section 7.2.
  */
-static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
-                          size_t dst_cap, ark_deflate_mode_t mode)
+static int compress_fixed(ark_match_finder_t *mf, const uint8_t *src,
+                          size_t src_len, uint8_t *dst, size_t dst_cap,
+                          int level)
 {
 	ark_bit_writer_t bw;
-	ark_match_finder_t *mf;
 	unsigned int max_chain;
 	size_t nice_len;
 	size_t pos;
 	size_t i;
 
-	max_chain = (mode == ARK_DEFLATE_FAST) ? 32U : 256U;
-	nice_len = (mode == ARK_DEFLATE_FAST) ? 32U : 128U;
-	mf = &g_match_finder;
+	max_chain = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 256U;
+	nice_len = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 128U;
 	match_finder_begin_parse(mf);
 
 	bw.dst = dst;
@@ -1169,7 +1152,7 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 		               nice_len);
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
-		    mode == ARK_DEFLATE_DEFAULT) {
+		    level == ARK_DEFLATE_LEVEL_DEFAULT) {
 			ark_match_t m_next;
 
 			m_next.len = 0U;
@@ -1180,7 +1163,8 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 					unsigned int hnext;
 					int32_t cnext;
 
-					hnext = hash3(src + pos + 1U);
+					hnext = hash3(src + pos + 1U,
+					              mf->hash_bits);
 					cnext =
 					    match_finder_head_get(mf, hnext);
 					m_next = find_match(
@@ -1199,11 +1183,12 @@ static int compress_fixed(const uint8_t *src, size_t src_len, uint8_t *dst,
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
 			/*
-			 * SAFETY: emit match only with Deflate-legal distance
-			 * and length. A malformed pair would violate RFC 1951
-			 * stream invariants.
+			 * SAFETY: emit match only with a distance inside the
+			 * encoder's window and a Deflate-legal length. A
+			 * malformed pair would violate RFC 1951 stream
+			 * invariants or the negotiated window.
 			 */
-			if (m.dist == 0U || m.dist > ARK_DEFLATE_WINDOW_SIZE ||
+			if (m.dist == 0U || m.dist > mf->window_size ||
 			    m.len < ARK_DEFLATE_MIN_MATCH ||
 			    m.len > ARK_DEFLATE_MAX_MATCH)
 				return -1;
@@ -1399,14 +1384,15 @@ static size_t cl_plan_bits(const ark_cl_plan_t *cp)
  * frequency parse. The plan is reused for selected-block emission to avoid
  * redundant full parse_block passes. See ARCHITECTURE.md §7.2.
  */
-static int build_dynamic_plan(const uint8_t *src, size_t src_len,
-                              ark_dynamic_plan_t *plan, size_t *bits_out)
+static int build_dynamic_plan(ark_match_finder_t *mf, const uint8_t *src,
+                              size_t src_len, ark_dynamic_plan_t *plan,
+                              size_t *bits_out)
 {
 	ark_cl_plan_t cp;
 	size_t i;
 
-	if (parse_block(src, src_len, ARK_DEFLATE_DEFAULT, &plan->freq, NULL,
-	                NULL, NULL) != 0)
+	if (parse_block(mf, src, src_len, ARK_DEFLATE_LEVEL_DEFAULT,
+	                &plan->freq, NULL, NULL, NULL) != 0)
 		return -1;
 	if (build_length_limited_lengths(plan->freq.lit, 286U, plan->lit_len,
 	                                 15U) != 0)
@@ -1435,11 +1421,12 @@ static int build_dynamic_plan(const uint8_t *src, size_t src_len,
 }
 
 /*
- * Select a default-mode block plan from deterministic candidate lengths.
+ * Select a default-level block plan from deterministic candidate lengths.
  * Candidate enumeration order and strict-better replacement preserve stable
  * block boundary selection. See ARCHITECTURE.md §7.2 and §13.1.
  */
-static int choose_default_block_plan(const uint8_t *src, size_t remaining,
+static int choose_default_block_plan(ark_match_finder_t *mf, const uint8_t *src,
+                                     size_t remaining,
                                      ark_dynamic_plan_t *best_plan)
 {
 	ark_dynamic_plan_t best;
@@ -1461,7 +1448,7 @@ static int choose_default_block_plan(const uint8_t *src, size_t remaining,
 		if (len > remaining)
 			len = remaining;
 		cand.len = len;
-		if (build_dynamic_plan(src, len, &cand, &bits) != 0)
+		if (build_dynamic_plan(mf, src, len, &cand, &bits) != 0)
 			continue;
 		score = (bits * 65536U) / (len == 0U ? 1U : len);
 		if (score < best_score) {
@@ -1525,7 +1512,8 @@ static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
 	return 0;
 }
 
-static int emit_dynamic_block(ark_bit_writer_t *bw, const uint8_t *src,
+static int emit_dynamic_block(ark_match_finder_t *mf, ark_bit_writer_t *bw,
+                              const uint8_t *src,
                               const ark_dynamic_plan_t *plan, int final)
 {
 	ark_codebook_t lit_book;
@@ -1539,19 +1527,20 @@ static int emit_dynamic_block(ark_bit_writer_t *bw, const uint8_t *src,
 	                        plan->hlit_count, plan->hdist_count, &lit_book,
 	                        &dist_book) != 0)
 		return -1;
-	if (parse_block(src, plan->len, ARK_DEFLATE_DEFAULT, NULL, bw,
+	if (parse_block(mf, src, plan->len, ARK_DEFLATE_LEVEL_DEFAULT, NULL, bw,
 	                &lit_book, &dist_book) != 0)
 		return -1;
 	return 0;
 }
 
 /*
- * Compress default archival mode using dynamic Huffman blocks.
+ * Compress at the default level using dynamic Huffman blocks.
  * Candidate block sizes are costed before emission so deterministic block
  * boundaries are selected from the local cost model.
  */
-static int compress_dynamic_default(const uint8_t *src, size_t src_len,
-                                    uint8_t *dst, size_t dst_cap)
+static int compress_dynamic_default(ark_match_finder_t *mf, const uint8_t *src,
+                                    size_t src_len, uint8_t *dst,
+                                    size_t dst_cap)
 {
 	ark_bit_writer_t bw;
 	size_t off;
@@ -1571,14 +1560,14 @@ static int compress_dynamic_default(const uint8_t *src, size_t src_len,
 		size_t len;
 		int final;
 
-		if (choose_default_block_plan(src + off, src_len - off,
+		if (choose_default_block_plan(mf, src + off, src_len - off,
 		                              &plan) != 0)
 			return -1;
 		len = plan.len;
 		if (len == 0U || len > src_len - off)
 			return -1;
 		final = off + len == src_len;
-		if (emit_dynamic_block(&bw, src + off, &plan, final) != 0)
+		if (emit_dynamic_block(mf, &bw, src + off, &plan, final) != 0)
 			return -1;
 		off += len;
 	}
@@ -1628,11 +1617,14 @@ static void copy_match(uint8_t *d, size_t dist, size_t len)
 		*d++ = *s++;
 }
 
-/* Decode one Huffman-coded Deflate block until end-of-block marker. */
+/*
+ * Decode one Huffman-coded Deflate block until end-of-block marker. max_dist
+ * is the decoder's window: a back-reference further than that is invalid.
+ */
 static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
                                 unsigned int lit_root, const uint32_t *dist_tab,
-                                unsigned int dist_root, uint8_t *dst,
-                                size_t dst_cap, size_t *dst_pos)
+                                unsigned int dist_root, size_t max_dist,
+                                uint8_t *dst, size_t dst_cap, size_t *dst_pos)
 {
 	size_t out;
 
@@ -1680,11 +1672,12 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 		}
 
 		/*
-		 * SAFETY: match copy must reference already-produced bytes and
-		 * fit in dst. Distances beyond the output so far and lengths
-		 * beyond dst_cap are invalid and must fail hard.
+		 * SAFETY: match copy must reference already-produced bytes
+		 * inside the window and fit in dst. Distances beyond the output
+		 * so far or the window and lengths beyond dst_cap are invalid
+		 * and must fail hard.
 		 */
-		if (dist > out || len > dst_cap - out)
+		if (dist > out || dist > max_dist || len > dst_cap - out)
 			return -1;
 		copy_match(dst + out, dist, len);
 		out += len;
@@ -1693,7 +1686,7 @@ static int decode_huffman_block(ark_bit_reader_t *br, const uint32_t *lit_tab,
 
 /*
  * Build RFC 1951 fixed-Huffman decode tables (section 3.2.6). Called at
- * most once per ark_deflate_decompress call, on the first fixed block;
+ * most once per inflate_window call, on the first fixed block;
  * the tables live in the caller's frame, so no state outlives the call.
  */
 static int build_fixed_decode_tables(uint32_t *lit_tab, uint32_t *dist_tab)
@@ -1725,8 +1718,8 @@ static int build_fixed_decode_tables(uint32_t *lit_tab, uint32_t *dist_tab)
 }
 
 /* Decode one dynamic-Huffman Deflate block. */
-static int decode_dynamic_block(ark_bit_reader_t *br, uint8_t *dst,
-                                size_t dst_cap, size_t *dst_pos)
+static int decode_dynamic_block(ark_bit_reader_t *br, size_t max_dist,
+                                uint8_t *dst, size_t dst_cap, size_t *dst_pos)
 {
 	uint32_t cl_tab[ARK_INFLATE_CL_TABLE];
 	uint32_t lit_tab[ARK_INFLATE_LIT_TABLE];
@@ -1816,8 +1809,8 @@ static int decode_dynamic_block(ark_bit_reader_t *br, uint8_t *dst,
 		return -1;
 
 	return decode_huffman_block(br, lit_tab, ARK_INFLATE_LIT_ROOT, dist_tab,
-	                            ARK_INFLATE_DIST_ROOT, dst, dst_cap,
-	                            dst_pos);
+	                            ARK_INFLATE_DIST_ROOT, max_dist, dst,
+	                            dst_cap, dst_pos);
 }
 
 /*
@@ -1882,38 +1875,105 @@ size_t ark_deflate_bound(size_t src_len)
 	return src_len + overhead;
 }
 
+/* Return 1 when params describe an encoder this build supports. */
+static int enc_params_valid(const ark_deflate_params_t *params)
+{
+	if (params == NULL)
+		return 0;
+	if (params->level != ARK_DEFLATE_LEVEL_FAST &&
+	    params->level != ARK_DEFLATE_LEVEL_DEFAULT)
+		return 0;
+	if (params->window_bits < ARK_DEFLATE_MIN_WINDOW_BITS ||
+	    params->window_bits > ARK_DEFLATE_MAX_WINDOW_BITS)
+		return 0;
+	if (params->max_input == 0U ||
+	    params->max_input > ARK_DEFLATE_MAX_INPUT)
+		return 0;
+	/* Streaming state is added with the streaming calls (§7.4). */
+	if (params->streaming != 0)
+		return 0;
+	return 1;
+}
+
 /*
- * ark_deflate_compress - Compress one chunk into a raw RFC 1951 stream.
- *
- * Default mode uses deterministic hash-chain search with one-step lazy
- * matching and dynamic-Huffman blocks whose lengths are chosen by estimated
- * cost; fast mode uses greedy matching and one fixed-Huffman block. For
- * incompressible input, falls back to stored blocks when that yields
- * smaller output. See ARCHITECTURE.md section 7.2.
- *
- * Returns compressed byte count on success, -1 on error.
+ * Encoder memory size: the struct plus head and prev in its tables member.
+ * The hash size follows the window, so window_bits 15 keeps the 15-bit hash
+ * of earlier releases.
  */
-ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
-                             size_t dst_cap, ark_deflate_mode_t mode)
+static size_t enc_mem_size(const ark_deflate_params_t *params)
+{
+	return sizeof(struct ark_deflate_enc) +
+	       2U * ((size_t)1U << params->window_bits) * sizeof(int32_t);
+}
+
+size_t ark_deflate_enc_size(const ark_deflate_params_t *params)
+{
+	if (!enc_params_valid(params))
+		return 0U;
+	return enc_mem_size(params);
+}
+
+ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
+                                        const ark_deflate_params_t *params)
+{
+	ark_deflate_enc_t *enc;
+	size_t i;
+
+	if (mem == NULL || !enc_params_valid(params))
+		return NULL;
+	if ((uintptr_t)mem % _Alignof(uint64_t) != 0U)
+		return NULL;
+	if (mem_len < enc_mem_size(params))
+		return NULL;
+
+	enc = mem;
+	enc->level = params->level;
+	enc->max_input = params->max_input;
+	enc->mf.hash_bits = params->window_bits;
+	enc->mf.window_size = (size_t)1U << params->window_bits;
+	enc->mf.head = enc->tables;
+	enc->mf.prev = enc->tables + ((size_t)1U << enc->mf.hash_bits);
+	/* prev is never read before written; clearing once keeps it defined. */
+	for (i = 0; i < enc->mf.window_size; i++)
+		enc->mf.prev[i] = -1;
+	match_finder_begin_parse(&enc->mf);
+	return enc;
+}
+
+/*
+ * ark_deflate_enc_oneshot - Compress one buffer into a raw RFC 1951 stream.
+ *
+ * Default level uses deterministic hash-chain search with one-step lazy
+ * matching and dynamic-Huffman blocks whose lengths are chosen by estimated
+ * cost; fast level uses greedy matching and one fixed-Huffman block. For
+ * incompressible input, falls back to stored blocks when that yields
+ * smaller output. See ARCHITECTURE.md sections 7.2 and 7.4.
+ */
+ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
+                                             const uint8_t *src, size_t src_len,
+                                             uint8_t *dst, size_t dst_cap,
+                                             size_t *dst_len)
 {
 	int fixed_len;
 
-	if (dst == NULL)
-		return -1;
-	if (src_len > ARK_DEFLATE_MAX_INPUT)
-		return -1;
+	if (dst_len == NULL)
+		return ARK_DEFLATE_ERR_USAGE;
+	*dst_len = 0U;
+	if (enc == NULL || dst == NULL)
+		return ARK_DEFLATE_ERR_USAGE;
+	if (src_len > enc->max_input)
+		return ARK_DEFLATE_ERR_USAGE;
 	if (src_len != 0U && src == NULL)
-		return -1;
-	if (mode != ARK_DEFLATE_DEFAULT && mode != ARK_DEFLATE_FAST)
-		return -1;
+		return ARK_DEFLATE_ERR_USAGE;
 	if (dst_cap < ark_deflate_bound(src_len))
-		return -1;
+		return ARK_DEFLATE_ERR_OUTPUT;
 
-	if (mode == ARK_DEFLATE_DEFAULT)
-		fixed_len =
-		    compress_dynamic_default(src, src_len, dst, dst_cap);
+	if (enc->level == ARK_DEFLATE_LEVEL_DEFAULT)
+		fixed_len = compress_dynamic_default(&enc->mf, src, src_len,
+		                                     dst, dst_cap);
 	else
-		fixed_len = compress_fixed(src, src_len, dst, dst_cap, mode);
+		fixed_len = compress_fixed(&enc->mf, src, src_len, dst, dst_cap,
+		                           enc->level);
 
 	/*
 	 * ARCHITECTURE.md section 7.2: for incompressible data, emit stored
@@ -1923,23 +1983,24 @@ ssize_t ark_deflate_compress(const uint8_t *src, size_t src_len, uint8_t *dst,
 		int stored_len;
 
 		stored_len = emit_stored_blocks(src, src_len, dst, dst_cap);
-		return stored_len < 0 ? -1 : stored_len;
+		if (stored_len < 0)
+			return ARK_DEFLATE_ERR_OUTPUT;
+		*dst_len = (size_t)stored_len;
+		return ARK_DEFLATE_OK;
 	}
 
-	return fixed_len;
+	*dst_len = (size_t)fixed_len;
+	return ARK_DEFLATE_OK;
 }
 
 /*
- * ark_deflate_decompress - Decompress one raw RFC 1951 Deflate stream.
- *
- * Supports stored blocks (BTYPE 00), fixed-Huffman blocks (BTYPE 01), and
- * dynamic-Huffman blocks (BTYPE 10). Reserved BTYPE 11 and all malformed
- * input are rejected.
- *
- * Returns decompressed byte count on success, -1 on error.
+ * Decode one raw RFC 1951 stream whose back-references stay within max_dist
+ * bytes. Supports stored blocks (BTYPE 00), fixed-Huffman blocks (BTYPE 01),
+ * and dynamic-Huffman blocks (BTYPE 10). Reserved BTYPE 11 and all malformed
+ * input are rejected. Returns decompressed byte count, -1 on error.
  */
-ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
-                               size_t dst_cap)
+static ssize_t inflate_window(const uint8_t *src, size_t src_len, uint8_t *dst,
+                              size_t dst_cap, size_t max_dist)
 {
 	ark_bit_reader_t br;
 	uint32_t fixed_lit_tab[1U << ARK_INFLATE_FIXED_LIT_ROOT];
@@ -1983,11 +2044,11 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 			if (decode_huffman_block(
 			        &br, fixed_lit_tab, ARK_INFLATE_FIXED_LIT_ROOT,
 			        fixed_dist_tab, ARK_INFLATE_FIXED_DIST_ROOT,
-			        dst, dst_cap, &out_pos) != 0)
+			        max_dist, dst, dst_cap, &out_pos) != 0)
 				return -1;
 		} else if (btype == 2U) {
-			if (decode_dynamic_block(&br, dst, dst_cap, &out_pos) !=
-			    0)
+			if (decode_dynamic_block(&br, max_dist, dst, dst_cap,
+			                         &out_pos) != 0)
 				return -1;
 		} else {
 			return -1;
@@ -2000,11 +2061,41 @@ ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
 	return (ssize_t)out_pos;
 }
 
+/*
+ * ark_deflate_decompress - Decompress one raw RFC 1951 Deflate stream with
+ * the full 32 KiB window.
+ *
+ * Returns decompressed byte count on success, -1 on error.
+ */
+ssize_t ark_deflate_decompress(const uint8_t *src, size_t src_len, uint8_t *dst,
+                               size_t dst_cap)
+{
+	return inflate_window(src, src_len, dst, dst_cap,
+	                      ARK_DEFLATE_WINDOW_SIZE);
+}
+
 #ifdef ARK_DEFLATE_TEST
 /*
- * ARK_DEFLATE_TEST-only accessors for encoder internals. They keep no state and
- * are compiled out of production builds; tests declare them locally.
+ * ARK_DEFLATE_TEST-only accessors for encoder internals and a window-limited
+ * decoder. They keep no state and are compiled out of production builds;
+ * tests declare them locally.
  */
+
+/*
+ * ARK_DEFLATE_TEST only: decode like ark_deflate_decompress but reject any
+ * back-reference further than 1 << window_bits bytes (strict window check
+ * for encoder tests). Returns -1 for window_bits outside 8..15.
+ */
+ssize_t ark_deflate_test_decompress_window(const uint8_t *src, size_t src_len,
+                                           uint8_t *dst, size_t dst_cap,
+                                           unsigned int window_bits)
+{
+	if (window_bits < ARK_DEFLATE_MIN_WINDOW_BITS ||
+	    window_bits > ARK_DEFLATE_MAX_WINDOW_BITS)
+		return -1;
+	return inflate_window(src, src_len, dst, dst_cap,
+	                      (size_t)1U << window_bits);
+}
 
 /* ARK_DEFLATE_TEST only: match length to length symbol + extra bits. */
 int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,

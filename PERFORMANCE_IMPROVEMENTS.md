@@ -121,3 +121,26 @@ vs new. The `tN` archives hold N empty files in nested directories.
 | `ark extract --member` one file, 40,000 members | 19.092 | 0.112 |
 | `ark extract` over an existing tree (40,002 conflicts reported), 40,000 members | 20.888 | 0.399 |
 | `ark verify`, `/usr/include` archive (7,962 members; decoder change included) | 4.144 | 0.393 |
+
+---
+
+## v1.2 Round (2026-10)
+
+Platform: Linux, Intel i7-7500U (2 cores / 4 threads, 256 KiB L2 per core),
+clang `-O2`, one thread pinned to one CPU (`taskset`), 1 MiB chunks. Old and
+new codec built from the same tree state except for the change measured.
+Wall times on this machine vary by up to 20 % with other load, so changes
+are judged by best-of-5 interleaved runs and by `perf stat` user-space
+counters.
+
+Dataset: the first 32 MiB of the mixed corpus above.
+
+**Caller-owned encoder memory** (match-finder generation stamps removed: the
+encoder clears its 128 KiB hash-head table per parse instead of keeping
+`head_gen`/`prev_gen`; encoder memory 512 KiB -> 256 KiB). Compressed output
+byte-identical.
+
+| Level | Best of 5 compress (s), old -> new | Cycles (G), old -> new | L1 data load misses (G), old -> new |
+|---|---|---|---|
+| Default | 8.77 -> 7.42 | 31.85 -> 27.16 (-14.7 %) | 1.48 -> 0.75 |
+| Fast | 1.08 -> 1.03 | 4.33 -> 4.19 (-3.3 %) | 0.21 -> 0.11 |
