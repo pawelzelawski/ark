@@ -227,8 +227,8 @@ components are self-contained and have no dependencies beyond libc.
 
 **2.1 - SHA-256 implementation** ✓ DONE
 - [x] Define `ark_sha256_ctx_t` struct in `sha256.h`: internal state fields
-  per FIPS 180-4 (eight 32-bit state words, message schedule buffer, byte
-  count)
+  per FIPS 180-4 (eight 32-bit state words, 64-byte block buffer, byte
+  count; the message schedule is local to the block function)
 - [x] Implement `ark_sha256_init`, `ark_sha256_update`, `ark_sha256_final`
   in `sha256.c` per FIPS 180-4; no platform intrinsics, pure portable C
 - [x] Implement `ark_sha256` single-shot wrapper

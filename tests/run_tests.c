@@ -93,6 +93,8 @@ int test_blake3_output_fixed_32(void);
 int test_blake3_single_shot_matches_streaming(void);
 int test_blake3_independent_contexts(void);
 int test_blake3_incremental_updates(void);
+int test_blake3_vectors_random_splits(void);
+int test_blake3_random_splits(void);
 int test_deflate_round_trip_text(void);
 int test_deflate_round_trip_binary(void);
 int test_deflate_round_trip_empty(void);
@@ -234,6 +236,8 @@ int test_create_deterministic_multi_worker_matches_single(void);
 int test_sha256_empty(void);
 int test_sha256_abc(void);
 int test_sha256_448_bits(void);
+int test_sha256_896_bits(void);
+int test_sha256_million_a(void);
 int test_sha256_one_block(void);
 int test_sha256_exact_block(void);
 int test_sha256_block_boundary(void);
@@ -242,11 +246,14 @@ int test_sha256_multiblock(void);
 int test_sha256_single_shot_matches_streaming(void);
 int test_sha256_output_length(void);
 int test_sha256_independent_contexts(void);
+int test_sha256_random_splits(void);
 
 static const test_case_t g_tests[] = {
     {"test_sha256_empty", test_sha256_empty},
     {"test_sha256_abc", test_sha256_abc},
     {"test_sha256_448_bits", test_sha256_448_bits},
+    {"test_sha256_896_bits", test_sha256_896_bits},
+    {"test_sha256_million_a", test_sha256_million_a},
     {"test_sha256_one_block", test_sha256_one_block},
     {"test_sha256_exact_block", test_sha256_exact_block},
     {"test_sha256_block_boundary", test_sha256_block_boundary},
@@ -256,6 +263,7 @@ static const test_case_t g_tests[] = {
      test_sha256_single_shot_matches_streaming},
     {"test_sha256_output_length", test_sha256_output_length},
     {"test_sha256_independent_contexts", test_sha256_independent_contexts},
+    {"test_sha256_random_splits", test_sha256_random_splits},
     {"test_blake3_vectors_all", test_blake3_vectors_all},
     {"test_blake3_empty", test_blake3_empty},
     {"test_blake3_single_chunk", test_blake3_single_chunk},
@@ -266,6 +274,8 @@ static const test_case_t g_tests[] = {
      test_blake3_single_shot_matches_streaming},
     {"test_blake3_independent_contexts", test_blake3_independent_contexts},
     {"test_blake3_incremental_updates", test_blake3_incremental_updates},
+    {"test_blake3_vectors_random_splits", test_blake3_vectors_random_splits},
+    {"test_blake3_random_splits", test_blake3_random_splits},
     {"test_deflate_round_trip_text", test_deflate_round_trip_text},
     {"test_deflate_round_trip_binary", test_deflate_round_trip_binary},
     {"test_deflate_round_trip_empty", test_deflate_round_trip_empty},

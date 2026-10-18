@@ -21,7 +21,6 @@
 
 typedef struct ark_sha256_ctx {
 	uint32_t state[8];
-	uint32_t schedule[64];
 	uint8_t block[64];
 	uint64_t byte_count;
 	size_t block_len;
@@ -64,6 +63,9 @@ void ark_sha256_update(ark_sha256_ctx_t *ctx, const uint8_t *data, size_t len);
  * Failure contract: does not fail.
  * Preconditions: ctx and digest must be non-NULL; ctx must be initialized by
  * ark_sha256_init().
+ * Postconditions: ctx is consumed. Further ark_sha256_update() or
+ * ark_sha256_final() calls on it are invalid until ark_sha256_init()
+ * initializes it again.
  */
 void ark_sha256_final(ark_sha256_ctx_t *ctx, uint8_t digest[32]);
 

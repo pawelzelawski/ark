@@ -13,6 +13,46 @@ static void fill_sequential(uint8_t *buf, size_t len)
 		buf[i] = (uint8_t)i;
 }
 
+/* Deterministic xorshift32 generator; a fixed seed keeps runs reproducible. */
+static uint32_t next_random(uint32_t *state)
+{
+	uint32_t x;
+
+	x = *state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+/*
+ * Feed msg into ctx in pieces of random size, empty pieces included. Most
+ * pieces are short so that every offset inside a block is hit; one in four
+ * may take any part of the remaining input.
+ */
+static void update_random_splits(ark_sha256_ctx_t *ctx, const uint8_t *msg,
+                                 size_t len, uint32_t *rng)
+{
+	size_t off;
+
+	off = 0;
+	while (off < len) {
+		size_t n;
+		uint32_t r;
+
+		r = next_random(rng);
+		if ((r & 3U) == 0)
+			n = (size_t)(r >> 2) % (len - off + 1);
+		else
+			n = (size_t)(r >> 2) % 130U;
+		if (n > len - off)
+			n = len - off;
+		ark_sha256_update(ctx, msg + off, n);
+		off += n;
+	}
+}
+
 /* Compare two SHA-256 digests byte-for-byte. */
 static int digest_matches(const uint8_t actual[32], const uint8_t expected[32])
 {
@@ -61,6 +101,47 @@ int test_sha256_448_bits(void)
 	};
 
 	ark_sha256(msg, sizeof(msg) - 1, digest);
+	return digest_matches(digest, expected) ? 0 : 1;
+}
+
+/* NIST SHA-256 vector for the standard 896-bit two-block message. */
+int test_sha256_896_bits(void)
+{
+	const uint8_t msg[] =
+	    "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+	    "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+	uint8_t digest[32];
+	static const uint8_t expected[32] = {
+	    0xcf, 0x5b, 0x16, 0xa7, 0x78, 0xaf, 0x83, 0x80, 0x03, 0x6c, 0xe5,
+	    0x9e, 0x7b, 0x04, 0x92, 0x37, 0x0b, 0x24, 0x9b, 0x11, 0xe8, 0xf0,
+	    0x7a, 0x51, 0xaf, 0xac, 0x45, 0x03, 0x7a, 0xfe, 0xe9, 0xd1,
+	};
+
+	ark_sha256(msg, sizeof(msg) - 1, digest);
+	return digest_matches(digest, expected) ? 0 : 1;
+}
+
+/*
+ * NIST SHA-256 vector for one million 'a' bytes, fed as 1000-byte updates
+ * that do not align with the 64-byte block.
+ */
+int test_sha256_million_a(void)
+{
+	ark_sha256_ctx_t ctx;
+	uint8_t piece[1000];
+	uint8_t digest[32];
+	size_t i;
+	static const uint8_t expected[32] = {
+	    0xcd, 0xc7, 0x6e, 0x5c, 0x99, 0x14, 0xfb, 0x92, 0x81, 0xa1, 0xc7,
+	    0xe2, 0x84, 0xd7, 0x3e, 0x67, 0xf1, 0x80, 0x9a, 0x48, 0xa4, 0x97,
+	    0x20, 0x0e, 0x04, 0x6d, 0x39, 0xcc, 0xc7, 0x11, 0x2c, 0xd0,
+	};
+
+	memset(piece, 'a', sizeof(piece));
+	ark_sha256_init(&ctx);
+	for (i = 0; i < 1000; i++)
+		ark_sha256_update(&ctx, piece, sizeof(piece));
+	ark_sha256_final(&ctx, digest);
 	return digest_matches(digest, expected) ? 0 : 1;
 }
 
@@ -214,4 +295,36 @@ int test_sha256_independent_contexts(void)
 	ark_sha256_final(&ctx_b, digest_b);
 
 	return memcmp(digest_a, digest_b, 32) != 0 ? 0 : 1;
+}
+
+/*
+ * Random inputs of random length, hashed once in one update and once in
+ * randomly sized pieces, must give the same digest (fixed seed).
+ */
+int test_sha256_random_splits(void)
+{
+	ark_sha256_ctx_t ctx;
+	uint8_t msg[2048];
+	uint8_t digest_split[32];
+	uint8_t digest_single[32];
+	uint32_t rng;
+	size_t i;
+
+	rng = 0x5eed2560U;
+	for (i = 0; i < sizeof(msg); i++)
+		msg[i] = (uint8_t)next_random(&rng);
+
+	for (i = 0; i < 200; i++) {
+		size_t len;
+
+		len = (size_t)next_random(&rng) % (sizeof(msg) + 1);
+		ark_sha256(msg, len, digest_single);
+
+		ark_sha256_init(&ctx);
+		update_random_splits(&ctx, msg, len, &rng);
+		ark_sha256_final(&ctx, digest_split);
+		if (!digest_matches(digest_split, digest_single))
+			return 1;
+	}
+	return 0;
 }

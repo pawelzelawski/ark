@@ -162,9 +162,12 @@ All vectors must pass before the component is accepted.
 | `test_sha256_multiblock` | 1KB input; multi-block correctness |
 | `test_sha256_abc` | NIST vector: input "abc" |
 | `test_sha256_448_bits` | NIST vector: 448-bit message |
+| `test_sha256_896_bits` | NIST vector: 896-bit two-block message |
+| `test_sha256_million_a` | NIST vector: one million `a` bytes, fed as 1000-byte updates not aligned to the block |
 | `test_sha256_single_shot_matches_streaming` | Single-shot and streaming produce identical digest for same input |
 | `test_sha256_output_length` | Output is exactly 32 bytes |
 | `test_sha256_independent_contexts` | Two contexts fed different data produce different digests |
+| `test_sha256_random_splits` | 200 random inputs of random length (0-2048 bytes): randomly sized updates, empty ones included, give the single-update digest (fixed seed) |
 
 ### 3.2 BLAKE3 (`test_blake3.c`)
 
@@ -183,6 +186,8 @@ published in the reference repository. The test vectors cover input lengths
 | `test_blake3_single_shot_matches_streaming` | Identical digest from both API paths |
 | `test_blake3_independent_contexts` | Two contexts produce different digests for different inputs |
 | `test_blake3_incremental_updates` | 1-byte updates produce same digest as single update |
+| `test_blake3_vectors_random_splits` | Every official vector fed in randomly sized updates, empty ones included, matches its official digest (fixed seed) |
+| `test_blake3_random_splits` | 100 random inputs of random length (0-8 chunks): randomly sized updates give the single-update digest (fixed seed) |
 
 ### 3.3 Deflate (`test_deflate.c`)
 

@@ -941,6 +941,12 @@ void ark_blake3(const uint8_t *data, size_t len,
                 uint8_t digest[32]);
 ```
 
+**Context lifetime.** `final` consumes the context: it pads (SHA-256) or
+merges the chaining-value stack (BLAKE3) in place. Calling `update` or `final`
+again on a finished context is invalid; `init` makes it usable again. The
+SHA-256 message schedule is a local array of the block function, so the
+context holds only the running state, the partial block and the counters.
+
 **Output length.** Both APIs produce exactly 32 bytes of output, matching the
 hash field size in the index entry. BLAKE3 natively supports variable-length
 output; that capability is intentionally not exposed. ark has no use for output

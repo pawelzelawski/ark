@@ -67,6 +67,9 @@ void ark_blake3_update(ark_blake3_ctx_t *ctx, const uint8_t *data, size_t len);
  * Failure contract: does not fail.
  * Preconditions: ctx and digest must be non-NULL; ctx must be initialized by
  * ark_blake3_init().
+ * Postconditions: ctx is consumed. Further ark_blake3_update() or
+ * ark_blake3_final() calls on it are invalid until ark_blake3_init()
+ * initializes it again.
  */
 void ark_blake3_final(ark_blake3_ctx_t *ctx, uint8_t digest[32]);
 

@@ -250,6 +250,46 @@ static int find_vector(size_t input_len, const uint8_t **digest)
 	return 1;
 }
 
+/* Deterministic xorshift32 generator; a fixed seed keeps runs reproducible. */
+static uint32_t next_random(uint32_t *state)
+{
+	uint32_t x;
+
+	x = *state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+/*
+ * Feed input into ctx in pieces of random size, empty pieces included. Most
+ * pieces are short so that block and chunk boundaries fall inside them; one
+ * in four may take any part of the remaining input.
+ */
+static void update_random_splits(ark_blake3_ctx_t *ctx, const uint8_t *input,
+                                 size_t len, uint32_t *rng)
+{
+	size_t off;
+
+	off = 0;
+	while (off < len) {
+		size_t n;
+		uint32_t r;
+
+		r = next_random(rng);
+		if ((r & 3U) == 0)
+			n = (size_t)(r >> 2) % (len - off + 1);
+		else
+			n = (size_t)(r >> 2) % 1100U;
+		if (n > len - off)
+			n = len - off;
+		ark_blake3_update(ctx, input + off, n);
+		off += n;
+	}
+}
+
 /* Compare two fixed-size BLAKE3 digests byte-for-byte. */
 static int digest_matches(const uint8_t actual[32], const uint8_t expected[32])
 {
@@ -396,4 +436,59 @@ int test_blake3_incremental_updates(void)
 
 	ark_blake3(input, sizeof(input), digest_single);
 	return digest_matches(digest_inc, digest_single) ? 0 : 1;
+}
+
+/* Every official vector, fed in randomly sized pieces (fixed seed). */
+int test_blake3_vectors_random_splits(void)
+{
+	ark_blake3_ctx_t ctx;
+	uint8_t input[102400];
+	uint8_t digest[32];
+	uint32_t rng;
+	size_t i;
+
+	rng = 0xb1a4e301U;
+	for (i = 0; i < sizeof(g_blake3_vectors) / sizeof(g_blake3_vectors[0]);
+	     i++) {
+		fill_vector_input(input, g_blake3_vectors[i].input_len);
+		ark_blake3_init(&ctx);
+		update_random_splits(&ctx, input, g_blake3_vectors[i].input_len,
+		                     &rng);
+		ark_blake3_final(&ctx, digest);
+		if (!digest_matches(digest, g_blake3_vectors[i].digest))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Random inputs of random length (up to eight chunks), hashed once in one
+ * update and once in randomly sized pieces, must give the same digest.
+ */
+int test_blake3_random_splits(void)
+{
+	ark_blake3_ctx_t ctx;
+	uint8_t input[8 * 1024 + 1];
+	uint8_t digest_split[32];
+	uint8_t digest_single[32];
+	uint32_t rng;
+	size_t i;
+
+	rng = 0xb1a4e302U;
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)next_random(&rng);
+
+	for (i = 0; i < 100; i++) {
+		size_t len;
+
+		len = (size_t)next_random(&rng) % (sizeof(input) + 1);
+		ark_blake3(input, len, digest_single);
+
+		ark_blake3_init(&ctx);
+		update_random_splits(&ctx, input, len, &rng);
+		ark_blake3_final(&ctx, digest_split);
+		if (!digest_matches(digest_split, digest_single))
+			return 1;
+	}
+	return 0;
 }

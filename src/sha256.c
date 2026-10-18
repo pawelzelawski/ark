@@ -72,6 +72,7 @@ static void copy_bytes(uint8_t *dst, const uint8_t *src, size_t len)
 /* Compress one 512-bit block into the running SHA-256 state. */
 static void sha256_compress(ark_sha256_ctx_t *ctx, const uint8_t block[64])
 {
+	uint32_t w[64];
 	uint32_t a;
 	uint32_t b;
 	uint32_t c;
@@ -83,20 +84,17 @@ static void sha256_compress(ark_sha256_ctx_t *ctx, const uint8_t block[64])
 	uint32_t i;
 
 	for (i = 0; i < 16; i++)
-		ctx->schedule[i] = load_be32(block + (size_t)i * 4);
+		w[i] = load_be32(block + (size_t)i * 4);
 	/* Expand the 16 input words into the 64-word message schedule. */
 	for (; i < 64; i++) {
 		uint32_t w0;
 		uint32_t w1;
 
-		w0 = rotr32(ctx->schedule[i - 15], 7) ^
-		     rotr32(ctx->schedule[i - 15], 18) ^
-		     (ctx->schedule[i - 15] >> 3);
-		w1 = rotr32(ctx->schedule[i - 2], 17) ^
-		     rotr32(ctx->schedule[i - 2], 19) ^
-		     (ctx->schedule[i - 2] >> 10);
-		ctx->schedule[i] =
-		    ctx->schedule[i - 16] + w0 + ctx->schedule[i - 7] + w1;
+		w0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^
+		     (w[i - 15] >> 3);
+		w1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^
+		     (w[i - 2] >> 10);
+		w[i] = w[i - 16] + w0 + w[i - 7] + w1;
 	}
 
 	a = ctx->state[0];
@@ -118,7 +116,7 @@ static void sha256_compress(ark_sha256_ctx_t *ctx, const uint8_t block[64])
 
 		s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
 		ch = (e & f) ^ ((~e) & g);
-		t1 = h + s1 + ch + sha256_k[i] + ctx->schedule[i];
+		t1 = h + s1 + ch + sha256_k[i] + w[i];
 		s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
 		maj = (a & b) ^ (a & c) ^ (b & c);
 		t2 = s0 + maj;
@@ -146,8 +144,6 @@ static void sha256_compress(ark_sha256_ctx_t *ctx, const uint8_t block[64])
 /* cppcheck-suppress staticFunction */
 void ark_sha256_init(ark_sha256_ctx_t *ctx)
 {
-	size_t i;
-
 	ctx->state[0] = 0x6a09e667U;
 	ctx->state[1] = 0xbb67ae85U;
 	ctx->state[2] = 0x3c6ef372U;
@@ -159,8 +155,6 @@ void ark_sha256_init(ark_sha256_ctx_t *ctx)
 	ctx->byte_count = 0;
 	ctx->block_len = 0;
 	zero_bytes(ctx->block, sizeof(ctx->block));
-	for (i = 0; i < 64; i++)
-		ctx->schedule[i] = 0;
 }
 
 /* cppcheck-suppress staticFunction */
