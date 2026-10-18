@@ -394,8 +394,8 @@ Clang availability and fails with a clear message when built with GCC.
 **Purpose**: Static analysis.
 
 **Installation**: included with Clang on Linux distributions; on OpenBSD
-from the `llvm` package (`pkg_add llvm%21`), which installs
-`/usr/local/bin/clang-tidy`.
+from the `clang-tools-extra` package (`pkg_add clang-tools-extra`, LLVM 21
+on OpenBSD 7.9), which installs `/usr/local/bin/clang-tidy`.
 
 ```sh
 make lint
@@ -403,7 +403,7 @@ make lint
 
 CI runs `make lint` with current tool versions, so CI and the development
 machines report the same findings: on Linux in a `fedora:44` container, on
-OpenBSD 7.9 (amd64 and arm64) with `llvm%21` and `cppcheck`.
+OpenBSD 7.9 (amd64 and arm64) with `clang-tools-extra` and `cppcheck`.
 
 ### 7.5 cppcheck
 

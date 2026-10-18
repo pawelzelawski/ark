@@ -107,9 +107,9 @@ jobs:
           release: "7.9"
           usesh: true
           # Same lint tools as the development OpenBSD machine (7.9):
-          # clang-tidy from llvm 21, cppcheck 2.18.
+          # clang-tidy from clang-tools-extra (LLVM 21), cppcheck 2.18.
           prepare: |
-            pkg_add -I llvm%21 cppcheck
+            pkg_add -I clang-tools-extra cppcheck
           run: |
             set -e
             make dev
@@ -138,6 +138,8 @@ jobs:
               fi
               exit 1
             }
+            clang-tidy --version | grep -i version
+            cppcheck --version
             make lint
 
   build-and-test-openbsd-arm64:
@@ -154,9 +156,9 @@ jobs:
           usesh: true
           arch: aarch64
           # Same lint tools as the development OpenBSD machine (7.9):
-          # clang-tidy from llvm 21, cppcheck 2.18.
+          # clang-tidy from clang-tools-extra (LLVM 21), cppcheck 2.18.
           prepare: |
-            pkg_add -I llvm%21 cppcheck
+            pkg_add -I clang-tools-extra cppcheck
           run: |
             set -e
             make dev
@@ -185,5 +187,7 @@ jobs:
               fi
               exit 1
             }
+            clang-tidy --version | grep -i version
+            cppcheck --version
             make lint
 
