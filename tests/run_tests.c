@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef int (*test_fn_t)(void);
 
@@ -285,6 +286,9 @@ int test_sha256_single_shot_matches_streaming(void);
 int test_sha256_output_length(void);
 int test_sha256_independent_contexts(void);
 int test_sha256_random_splits(void);
+int test_sha256_backend_vectors(void);
+int test_sha256_backend_differential(void);
+int test_sha256_backend_selection(void);
 
 static const test_case_t g_tests[] = {
     {"test_sha256_empty", test_sha256_empty},
@@ -302,6 +306,9 @@ static const test_case_t g_tests[] = {
     {"test_sha256_output_length", test_sha256_output_length},
     {"test_sha256_independent_contexts", test_sha256_independent_contexts},
     {"test_sha256_random_splits", test_sha256_random_splits},
+    {"test_sha256_backend_vectors", test_sha256_backend_vectors},
+    {"test_sha256_backend_differential", test_sha256_backend_differential},
+    {"test_sha256_backend_selection", test_sha256_backend_selection},
     {"test_blake3_vectors_all", test_blake3_vectors_all},
     {"test_blake3_empty", test_blake3_empty},
     {"test_blake3_single_chunk", test_blake3_single_chunk},
@@ -659,15 +666,24 @@ static const test_case_t g_tests[] = {
     {"test_integration_large_archive", test_integration_large_archive},
 };
 
-int main(void)
+/*
+ * Run every test, or with one argument only the tests whose name starts
+ * with it (make test-qemu runs "test_sha256" under an emulated CPU).
+ */
+int main(int argc, char **argv)
 {
+	const char *prefix;
 	size_t i;
 	size_t passed;
 	size_t total;
 
+	prefix = argc > 1 ? argv[1] : "";
 	passed = 0;
-	total = sizeof(g_tests) / sizeof(g_tests[0]);
-	for (i = 0; i < total; i++) {
+	total = 0;
+	for (i = 0; i < sizeof(g_tests) / sizeof(g_tests[0]); i++) {
+		if (strncmp(g_tests[i].name, prefix, strlen(prefix)) != 0)
+			continue;
+		total++;
 		if (g_tests[i].fn() == 0) {
 			passed++;
 			continue;

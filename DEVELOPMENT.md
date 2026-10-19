@@ -231,6 +231,8 @@ components are self-contained and have no dependencies beyond libc.
   count; the message schedule is local to the block function)
 - [x] Implement `ark_sha256_init`, `ark_sha256_update`, `ark_sha256_final`
   in `sha256.c` per FIPS 180-4; no platform intrinsics, pure portable C
+  (v1.2 adds optional hardware block functions in separate files,
+  `sha256_x86.c` / `sha256_arm.c`; `sha256.c` stays portable C11)
 - [x] Implement `ark_sha256` single-shot wrapper
 - [x] Verify `sha256.h` is self-contained:
   `cc -std=c11 -fsyntax-only src/sha256.h`

@@ -136,6 +136,8 @@ self-contained.
 
 ```
 sha256.c / sha256.h       SHA-256 hash - pure algorithm, no I/O, no allocation
+sha256_x86.c, _arm.c      SHA-256 hardware block functions (optional, per architecture)
+sha256_cpu.c / .h         SHA-256 backend detection - the only OS-dependent hash code
 blake3.c / blake3.h       BLAKE3 hash - pure algorithm, no I/O, no allocation
 deflate.c / deflate.h     Deflate compress + decompress - pure algorithm, no I/O
 zwrap.c / zwrap.h         zlib format + Adler-32 over deflate - library API, not used by ark

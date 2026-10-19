@@ -141,6 +141,32 @@ static void sha256_compress(ark_sha256_ctx_t *ctx, const uint8_t block[64])
 	ctx->state[7] += h;
 }
 
+/*
+ * Compress nblocks consecutive blocks with the context's backend. The
+ * hardware functions exist only in builds that define their macro.
+ */
+static void sha256_blocks(ark_sha256_ctx_t *ctx, const uint8_t *data,
+                          size_t nblocks)
+{
+#ifdef ARK_SHA256_X86
+	if (ctx->backend == ARK_SHA256_BACKEND_X86_SHANI) {
+		ark_sha256_x86_blocks(ctx->state, data, nblocks);
+		return;
+	}
+#endif
+#ifdef ARK_SHA256_ARM
+	if (ctx->backend == ARK_SHA256_BACKEND_ARMV8) {
+		ark_sha256_arm_blocks(ctx->state, data, nblocks);
+		return;
+	}
+#endif
+	while (nblocks > 0U) {
+		sha256_compress(ctx, data);
+		data += 64;
+		nblocks--;
+	}
+}
+
 /* cppcheck-suppress staticFunction */
 void ark_sha256_init(ark_sha256_ctx_t *ctx)
 {
@@ -154,7 +180,30 @@ void ark_sha256_init(ark_sha256_ctx_t *ctx)
 	ctx->state[7] = 0x5be0cd19U;
 	ctx->byte_count = 0;
 	ctx->block_len = 0;
+	ctx->backend = ARK_SHA256_BACKEND_PORTABLE;
 	zero_bytes(ctx->block, sizeof(ctx->block));
+}
+
+/* cppcheck-suppress staticFunction */
+int ark_sha256_init_backend(ark_sha256_ctx_t *ctx, ark_sha256_backend_t backend)
+{
+	ark_sha256_init(ctx);
+	switch (backend) {
+	case ARK_SHA256_BACKEND_PORTABLE:
+		return 0;
+#ifdef ARK_SHA256_X86
+	case ARK_SHA256_BACKEND_X86_SHANI:
+		ctx->backend = backend;
+		return 0;
+#endif
+#ifdef ARK_SHA256_ARM
+	case ARK_SHA256_BACKEND_ARMV8:
+		ctx->backend = backend;
+		return 0;
+#endif
+	default:
+		return -1;
+	}
 }
 
 /* cppcheck-suppress staticFunction */
@@ -173,15 +222,18 @@ void ark_sha256_update(ark_sha256_ctx_t *ctx, const uint8_t *data, size_t len)
 		data += n;
 		len -= n;
 		if (ctx->block_len == sizeof(ctx->block)) {
-			sha256_compress(ctx, ctx->block);
+			sha256_blocks(ctx, ctx->block, 1U);
 			ctx->block_len = 0;
 		}
 	}
 
-	while (len >= sizeof(ctx->block)) {
-		sha256_compress(ctx, data);
-		data += sizeof(ctx->block);
-		len -= sizeof(ctx->block);
+	if (len >= sizeof(ctx->block)) {
+		size_t nblocks;
+
+		nblocks = len / sizeof(ctx->block);
+		sha256_blocks(ctx, data, nblocks);
+		data += nblocks * sizeof(ctx->block);
+		len -= nblocks * sizeof(ctx->block);
 	}
 
 	if (len != 0) {

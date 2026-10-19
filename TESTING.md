@@ -153,7 +153,11 @@ depend on ark's `ARK_TEST`.
 ### 3.1 SHA-256 (`test_sha256.c`)
 
 Tests validate the implementation against NIST FIPS 180-4 test vectors.
-All vectors must pass before the component is accepted.
+All vectors must pass before the component is accepted. The backend tests
+cover the hardware block functions on CPUs that have them (run-time
+check, no platform-conditional test code); `make test-qemu` runs the
+SHA-256 tests on an emulated x86 CPU with SHA-NI, and CI's arm64 runners
+run the ARMv8 path natively.
 
 | Test case | What is verified |
 |---|---|
@@ -171,6 +175,9 @@ All vectors must pass before the component is accepted.
 | `test_sha256_output_length` | Output is exactly 32 bytes |
 | `test_sha256_independent_contexts` | Two contexts fed different data produce different digests |
 | `test_sha256_random_splits` | 200 random inputs of random length (0-2048 bytes): randomly sized updates, empty ones included, give the single-update digest (fixed seed) |
+| `test_sha256_backend_vectors` | The NIST vectors (empty, "abc", 448 and 896 bits, one million `a` in 1000-byte updates) through every backend the CPU supports (`ark_sha256_cpu_supports`); prints `sha256 backends tested: [...]` |
+| `test_sha256_backend_differential` | Each supported hardware backend equals the portable one on 300 random lengths up to 10,000 bytes in random splits and on 1 MiB in one update |
+| `test_sha256_backend_selection` | Unknown and not-built backends: `init_backend` returns -1 and the context works as portable; `cpu_supports` only reports backends `init_backend` accepts; `cpu_best` is supported |
 
 ### 3.2 BLAKE3 (`test_blake3.c`)
 
@@ -668,6 +675,7 @@ of Linux 5.13.
 | Memory errors, leaks | Valgrind | Linux | After each phase; before release |
 | Memory errors, undefined behaviour | ASan/UBSan | Linux | Every `make test` (dev build) |
 | Data races | TSan | Linux (Clang only) | At thread phase boundary; before release |
+| SHA-256 hardware backends | `make test-qemu` (qemu-x86_64 -cpu max); CI runners natively | Linux x86-64; CI arm64 | When the SHA-256 files change; before release |
 | Static analysis | clang-tidy | Linux, OpenBSD | Before release |
 | Static analysis | cppcheck | Linux, OpenBSD | Before release |
 | Code formatting | clang-format | Both | Before every commit |

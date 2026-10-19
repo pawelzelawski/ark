@@ -48,9 +48,12 @@ src/
 │                       # Types:
 │                       #   ark_sha256_ctx_t   - streaming context (struct
 │                       #     defined in the header; stack-allocatable)
+│                       #   ark_sha256_backend_t - block function
+│                       #     (portable, x86 SHA-NI, ARMv8 SHA2)
 │                       #
 │                       # Functions:
 │                       #   ark_sha256_init()   - initialise context
+│                       #   ark_sha256_init_backend() - with a backend
 │                       #   ark_sha256_update() - feed data
 │                       #   ark_sha256_final()  - produce 32-byte digest
 │                       #   ark_sha256()        - single-shot convenience
@@ -61,7 +64,22 @@ src/
 │
 ├── sha256.c            # SHA-256 implementation per FIPS 180-4.
 │                       # Validated against NIST test vectors.
-│                       # No dependencies beyond sha256.h and libc.
+│                       # No dependencies beyond sha256.h and libc;
+│                       #   calls a hardware block function only under
+│                       #   ARK_SHA256_X86 / ARK_SHA256_ARM.
+│
+├── sha256_x86.c        # SHA-256 blocks with the x86 SHA extensions
+│                       #   (intrinsics, target attribute). Built on
+│                       #   x86-64 only, with ARK_SHA256_X86.
+│
+├── sha256_arm.c        # SHA-256 blocks with the ARMv8 SHA2 instructions
+│                       #   (intrinsics, target attribute). Built on
+│                       #   arm64 only, with ARK_SHA256_ARM.
+│
+├── sha256_cpu.h        # Which SHA-256 backend the CPU supports:
+│                       #   ark_sha256_cpu_supports(), ark_sha256_cpu_best().
+├── sha256_cpu.c        # The only SHA-256 file that asks the CPU or OS
+│                       #   (cpuid; getauxval / elf_aux_info AT_HWCAP).
 │
 ├── blake3.h            # BLAKE3 public API.
 │                       #
@@ -489,13 +507,17 @@ make release      # optimised binary (build/ark)
 make test         # compile and run tests (dev flags, -DARK_TEST)
 make test-tsan    # TSan build and test run (Linux/Clang only)
 make valgrind     # run tests under Valgrind (Linux only, no sanitisers)
+make test-qemu    # SHA-256 tests under qemu-x86_64 -cpu max (SHA-NI)
 make lint         # clang-tidy on the src/ components, cppcheck on src/ and tests/
 make format       # clang-format -i on all source and test files
 make clean        # remove build artefacts
 make install      # install ark binary and man page to PREFIX
 ```
 
-Platform detected via `OS != uname -s`. `-DARK_TEST` is defined in
+Platform detected via `OS != uname -s`; the SHA-256 hardware file and its
+macro (`SHA256_HW_SRCS`, `SHA256_HW_DEFS`) via `uname -m`.
+`build/tests/run_tests [prefix]` runs only the tests whose names start with
+`prefix`. `-DARK_TEST` is defined in
 `make test`, `make dev`, `make valgrind`, and `make test-tsan` so that
 fault injection stubs are always active during development. The same
 targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
@@ -564,6 +586,11 @@ Checks: >
 | `ark_sha256_update` | `src/sha256.c` | Public |
 | `ark_sha256_final` | `src/sha256.c` | Public |
 | `ark_sha256` | `src/sha256.c` | Public; single-shot wrapper |
+| `ark_sha256_init_backend` | `src/sha256.c` | Public; init with a block function (`hash_init` in `archive.c`) |
+| `ark_sha256_x86_blocks` | `src/sha256_x86.c` | Public; SHA-NI block function, called by `sha256.c` |
+| `ark_sha256_arm_blocks` | `src/sha256_arm.c` | Public; ARMv8 SHA2 block function, called by `sha256.c` |
+| `ark_sha256_cpu_supports` | `src/sha256_cpu.c` | Public; backend built in and supported by the CPU |
+| `ark_sha256_cpu_best` | `src/sha256_cpu.c` | Public; fastest supported backend (`ark_write_init`, `ark_read_header`) |
 | `ark_blake3_init` | `src/blake3.c` | Public |
 | `ark_blake3_update` | `src/blake3.c` | Public |
 | `ark_blake3_final` | `src/blake3.c` | Public |

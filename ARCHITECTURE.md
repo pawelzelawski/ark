@@ -1258,6 +1258,44 @@ chunk end) instead of copying them into the context first. Both compilers
 then reach about 600 MB/s on one core of the reference machine
 (PERFORMANCE_IMPROVEMENTS.md); the code stays plain C11 with no intrinsics.
 
+**SHA-256 backends.** `ark_sha256_init_backend(ctx, backend)` initializes a
+context with a block function; `ark_sha256_init` uses the portable one, and
+every backend gives the same digests.
+
+```c
+typedef enum {
+    ARK_SHA256_BACKEND_PORTABLE = 0,   /* plain C, always available */
+    ARK_SHA256_BACKEND_X86_SHANI,      /* x86 SHA extensions + SSE4.1 */
+    ARK_SHA256_BACKEND_ARMV8           /* ARMv8 SHA2 instructions */
+} ark_sha256_backend_t;
+int ark_sha256_init_backend(ark_sha256_ctx_t *ctx,
+                            ark_sha256_backend_t backend); /* 0, or -1 */
+
+/* sha256_cpu.h */
+int ark_sha256_cpu_supports(ark_sha256_backend_t backend);
+ark_sha256_backend_t ark_sha256_cpu_best(void);
+```
+
+The hardware block functions live in their own files, so a project copies
+only what it needs: `sha256.c` / `sha256.h` alone are the portable,
+OS-independent SHA-256 of earlier releases; `sha256_x86.c` and
+`sha256_arm.c` hold the intrinsics (compiled only on their architecture,
+pure computation); `sha256_cpu.c` / `sha256_cpu.h` are the only SHA-256
+code that asks the CPU or OS (x86: the `cpuid` instruction for SHA, SSSE3
+and SSE4.1; arm64: `HWCAP_SHA2` from `getauxval(AT_HWCAP)` on Linux and
+`elf_aux_info(AT_HWCAP)` on OpenBSD 7.6 and later). `sha256.c` refers to a
+hardware function only when its macro (`ARK_SHA256_X86`, `ARK_SHA256_ARM`)
+is defined; without it, `init_backend` returns -1 for that backend and the
+context falls back to the portable one. Selecting a backend the CPU lacks
+faults on the first block, so callers ask `sha256_cpu.h` first. ark builds
+the file for its architecture and chooses the backend once per archive
+context with `ark_sha256_cpu_best()` (`archive.c`); `ark_sha256` (the
+single-shot call) stays portable. The recovery reader keeps its own
+portable SHA-256 (section 15). The hardware functions are proven on
+emulated CPUs (`qemu-x86_64 -cpu max`, `qemu-aarch64 -cpu max`) and natively
+in CI where the runners have the instructions; this development machine
+has neither.
+
 **Output length.** Both APIs produce exactly 32 bytes of output, matching the
 hash field size in the index entry. BLAKE3 natively supports variable-length
 output; that capability is intentionally not exposed. ark has no use for output

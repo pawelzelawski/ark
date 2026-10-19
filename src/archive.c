@@ -16,6 +16,7 @@
 #include "blake3.h"
 #include "deflate.h"
 #include "sha256.h"
+#include "sha256_cpu.h"
 
 #include "ark_internal.h"
 
@@ -57,6 +58,7 @@ struct ark_write_ctx {
 	uint8_t index_hash[32];
 	int index_hash_valid;
 	ark_hash_state_t member_hash;
+	ark_sha256_backend_t sha256_backend;
 };
 
 struct ark_read_ctx {
@@ -77,6 +79,7 @@ struct ark_read_ctx {
 	ark_member_meta_t *members;
 	struct ark_path_ref *by_path;
 	ark_hash_state_t verify_hash;
+	ark_sha256_backend_t sha256_backend;
 	const ark_member_meta_t *verify_meta;
 	uint32_t verify_next_chunk;
 	int verify_active;
@@ -559,7 +562,13 @@ static int member_has_zero_data(const ark_member_meta_t *m)
 	return m->size_original == 0U ? 1 : 0;
 }
 
-static int hash_init(ark_hash_state_t *st, ark_hash_alg_t alg, ark_error_t *err)
+/*
+ * Start a hash of alg. SHA-256 uses the block function chosen once per
+ * context (sha256_backend, from ark_sha256_cpu_best()); the digest is the
+ * same with every backend.
+ */
+static int hash_init(ark_hash_state_t *st, ark_hash_alg_t alg,
+                     ark_sha256_backend_t sha256_backend, ark_error_t *err)
 {
 	st->alg = alg;
 	if (alg == ARK_HASH_BLAKE3) {
@@ -567,7 +576,8 @@ static int hash_init(ark_hash_state_t *st, ark_hash_alg_t alg, ark_error_t *err)
 		return 0;
 	}
 	if (alg == ARK_HASH_SHA256) {
-		ark_sha256_init(&st->u.sha256);
+		/* A backend the CPU reported is built in, so this succeeds. */
+		(void)ark_sha256_init_backend(&st->u.sha256, sha256_backend);
 		return 0;
 	}
 	return ark_fail(err, ARK_ERR_USAGE, "unknown hash algorithm", 0);
@@ -788,6 +798,9 @@ int ark_write_init(ark_write_ctx_t *ctx, ark_hash_alg_t hash_alg, int level,
 
 	buf_zero(ctx, sizeof(*ctx));
 	ctx->hash_alg = hash_alg;
+	ctx->sha256_backend = hash_alg == ARK_HASH_SHA256
+	                          ? ark_sha256_cpu_best()
+	                          : ARK_SHA256_BACKEND_PORTABLE;
 	ctx->level = level;
 	ctx->state = ARK_WRITE_STATE_READY;
 	return 0;
@@ -886,7 +899,8 @@ int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
 		ctx->current.chunk_count = 0U;
 	}
 
-	if (hash_init(&ctx->member_hash, ctx->hash_alg, err) != 0)
+	if (hash_init(&ctx->member_hash, ctx->hash_alg, ctx->sha256_backend,
+	              err) != 0)
 		return -1;
 
 	ctx->state = ARK_WRITE_STATE_MEMBER;
@@ -1013,7 +1027,7 @@ ssize_t ark_write_index(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
 		return ark_fail(err, ARK_ERR_IO_ALLOC,
 		                "index destination too small", 0);
 
-	if (hash_init(&idx_hash, ctx->hash_alg, err) != 0)
+	if (hash_init(&idx_hash, ctx->hash_alg, ctx->sha256_backend, err) != 0)
 		return -1;
 
 	total = 0U;
@@ -1115,6 +1129,9 @@ int ark_read_header(ark_read_ctx_t *ctx, const uint8_t *header_buf,
 
 	ctx->comp_alg = header_buf[8];
 	ctx->hash_alg = (ark_hash_alg_t)header_buf[9];
+	ctx->sha256_backend = ctx->hash_alg == ARK_HASH_SHA256
+	                          ? ark_sha256_cpu_best()
+	                          : ARK_SHA256_BACKEND_PORTABLE;
 	ctx->ver_major = header_buf[5];
 	ctx->ver_minor = header_buf[6];
 	ctx->state = ARK_READ_STATE_HEADER_DONE;
@@ -1187,7 +1204,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 
 	/* ARCHITECTURE.md section 8.3 check 2: verify index hash before parse.
 	 */
-	if (hash_init(&idx_hash, ctx->hash_alg, err) != 0)
+	if (hash_init(&idx_hash, ctx->hash_alg, ctx->sha256_backend, err) != 0)
 		return -1;
 	hash_update(&idx_hash, index_buf, index_len);
 	hash_final(&idx_hash, empty_hash);
@@ -1487,7 +1504,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 
 	/* ARCHITECTURE.md section 8.3 check 16 empty-input hash on zero-data.
 	 */
-	if (hash_init(&idx_hash, ctx->hash_alg, err) != 0)
+	if (hash_init(&idx_hash, ctx->hash_alg, ctx->sha256_backend, err) != 0)
 		goto fail;
 	hash_final(&idx_hash, empty_hash);
 	for (i = 0U; i < ctx->member_count; i++) {
@@ -1622,7 +1639,8 @@ int ark_read_verify_member_begin(ark_read_ctx_t *ctx,
 	if (ctx->state != ARK_READ_STATE_INDEX_DONE)
 		return ark_fail(err, ARK_ERR_USAGE,
 		                "verify begin out of sequence", 0);
-	if (hash_init(&ctx->verify_hash, ctx->hash_alg, err) != 0)
+	if (hash_init(&ctx->verify_hash, ctx->hash_alg, ctx->sha256_backend,
+	              err) != 0)
 		return -1;
 	ctx->verify_meta = meta;
 	ctx->verify_next_chunk = 0U;

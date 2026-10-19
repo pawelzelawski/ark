@@ -1,8 +1,10 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "sha256.h"
+#include "sha256_cpu.h"
 
 /* Fill a buffer with deterministic byte values 0..255 repeating. */
 static void fill_sequential(uint8_t *buf, size_t len)
@@ -327,4 +329,209 @@ int test_sha256_random_splits(void)
 			return 1;
 	}
 	return 0;
+}
+
+/* Every backend, in enum order, with the name the tests print. */
+static const struct {
+	ark_sha256_backend_t backend;
+	const char *name;
+} g_sha256_backends[] = {
+    {ARK_SHA256_BACKEND_PORTABLE, "portable"},
+    {ARK_SHA256_BACKEND_X86_SHANI, "x86 SHA-NI"},
+    {ARK_SHA256_BACKEND_ARMV8, "ARMv8 SHA2"},
+};
+
+/* Parse 64 hex digits into a digest. */
+static void hex_digest(const char *hex, uint8_t out[32])
+{
+	size_t i;
+
+	for (i = 0; i < 32; i++) {
+		unsigned int v;
+		size_t k;
+
+		v = 0;
+		for (k = 0; k < 2; k++) {
+			char c;
+
+			c = hex[i * 2 + k];
+			v = v * 16U +
+			    (unsigned int)(c <= '9' ? c - '0' : c - 'a' + 10);
+		}
+		out[i] = (uint8_t)v;
+	}
+}
+
+/* Hash msg[0..len) repeated reps times with backend b, in one context. */
+static int backend_digest(ark_sha256_backend_t b, const uint8_t *msg,
+                          size_t len, size_t reps, uint8_t digest[32])
+{
+	ark_sha256_ctx_t ctx;
+	size_t i;
+
+	if (ark_sha256_init_backend(&ctx, b) != 0)
+		return -1;
+	for (i = 0; i < reps; i++)
+		ark_sha256_update(&ctx, msg, len);
+	ark_sha256_final(&ctx, digest);
+	return 0;
+}
+
+/*
+ * The NIST vectors (empty, "abc", 448 and 896 bits, one million 'a' as
+ * 1000 updates of 1000 bytes) through every backend the CPU supports;
+ * prints which backends ran. A supported backend must be accepted by
+ * ark_sha256_init_backend().
+ */
+int test_sha256_backend_vectors(void)
+{
+	static const struct {
+		const char *msg;
+		size_t reps;
+		const char *hex;
+	} v[] = {
+	    {"", 1,
+	     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85"
+	     "5"},
+	    {"abc", 1,
+	     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a"
+	     "d"},
+	    {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 1,
+	     "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c"
+	     "1"},
+	    {"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmn"
+	     "oijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+	     1,
+	     "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d"
+	     "1"},
+	};
+	uint8_t thousand_a[1000];
+	uint8_t expected[32];
+	uint8_t digest[32];
+	size_t b;
+	size_t i;
+	int rc;
+
+	rc = 0;
+	memset(thousand_a, 'a', sizeof(thousand_a));
+	printf("sha256 backends tested:");
+	for (b = 0;
+	     b < sizeof(g_sha256_backends) / sizeof(g_sha256_backends[0]);
+	     b++) {
+		ark_sha256_backend_t be;
+
+		be = g_sha256_backends[b].backend;
+		if (!ark_sha256_cpu_supports(be))
+			continue;
+		printf(" [%s]", g_sha256_backends[b].name);
+		for (i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+			hex_digest(v[i].hex, expected);
+			if (backend_digest(be, (const uint8_t *)v[i].msg,
+			                   strlen(v[i].msg), v[i].reps,
+			                   digest) != 0 ||
+			    !digest_matches(digest, expected))
+				rc = 1;
+		}
+		hex_digest("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046"
+		           "d39ccc7112cd0",
+		           expected);
+		if (backend_digest(be, thousand_a, sizeof(thousand_a), 1000,
+		                   digest) != 0 ||
+		    !digest_matches(digest, expected))
+			rc = 1;
+	}
+	printf("\n");
+	return rc;
+}
+
+/*
+ * Each supported hardware backend agrees with the portable one on 300
+ * random lengths up to 10,000 bytes fed in random splits, and on 1 MiB
+ * hashed in one update (many consecutive blocks per call).
+ */
+int test_sha256_backend_differential(void)
+{
+	static uint8_t msg[1048576];
+	uint32_t rng;
+	size_t b;
+	size_t i;
+	int rc;
+
+	rc = 0;
+	rng = 0xb4c4e9d1U;
+	for (i = 0; i < sizeof(msg); i++)
+		msg[i] = (uint8_t)next_random(&rng);
+	for (b = 1;
+	     b < sizeof(g_sha256_backends) / sizeof(g_sha256_backends[0]);
+	     b++) {
+		ark_sha256_backend_t be;
+		uint8_t want[32];
+		uint8_t got[32];
+
+		be = g_sha256_backends[b].backend;
+		if (!ark_sha256_cpu_supports(be))
+			continue;
+		for (i = 0; i < 300; i++) {
+			ark_sha256_ctx_t ctx;
+			size_t len;
+
+			len = (size_t)next_random(&rng) % 10001U;
+			ark_sha256(msg, len, want);
+			if (ark_sha256_init_backend(&ctx, be) != 0)
+				rc = 1;
+			update_random_splits(&ctx, msg, len, &rng);
+			ark_sha256_final(&ctx, got);
+			if (!digest_matches(got, want))
+				rc = 1;
+		}
+		ark_sha256(msg, sizeof(msg), want);
+		if (backend_digest(be, msg, sizeof(msg), 1, got) != 0 ||
+		    !digest_matches(got, want))
+			rc = 1;
+	}
+	return rc;
+}
+
+/*
+ * An unknown backend, and a hardware backend this build does not have,
+ * make ark_sha256_init_backend() return -1 and leave a working portable
+ * context; ark_sha256_cpu_supports() reports only what init accepts, and
+ * ark_sha256_cpu_best() returns a supported backend.
+ */
+int test_sha256_backend_selection(void)
+{
+	static const uint8_t abc_digest[32] = {
+	    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
+	    0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
+	    0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+	};
+	ark_sha256_ctx_t ctx;
+	uint8_t digest[32];
+	size_t b;
+	int rc;
+
+	rc = 0;
+	if (ark_sha256_init_backend(&ctx, (ark_sha256_backend_t)99) != -1 ||
+	    ctx.backend != ARK_SHA256_BACKEND_PORTABLE)
+		rc = 1;
+	ark_sha256_update(&ctx, (const uint8_t *)"abc", 3);
+	ark_sha256_final(&ctx, digest);
+	if (!digest_matches(digest, abc_digest) ||
+	    ark_sha256_cpu_supports((ark_sha256_backend_t)99) != 0 ||
+	    !ark_sha256_cpu_supports(ark_sha256_cpu_best()))
+		rc = 1;
+	for (b = 0;
+	     b < sizeof(g_sha256_backends) / sizeof(g_sha256_backends[0]);
+	     b++) {
+		ark_sha256_backend_t be;
+		int built;
+
+		be = g_sha256_backends[b].backend;
+		built = ark_sha256_init_backend(&ctx, be) == 0;
+		if (ark_sha256_cpu_supports(be) && !built)
+			rc = 1;
+		if (!built && ctx.backend != ARK_SHA256_BACKEND_PORTABLE)
+			rc = 1;
+	}
+	return rc;
 }

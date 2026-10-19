@@ -259,3 +259,10 @@ Short inputs (ns per one-shot hash, clang / gcc): 64 B 251 -> 198 /
 16,261 -> 6,875. Unrolling alone (without the direct-input path) gave
 clang ~597 and gcc ~493 MB/s; a local copy of the message words changed
 nothing.
+
+**SHA-256 hardware block functions** (x86 SHA extensions, ARMv8 SHA2;
+`--hash sha256` archives and library users such as arv). Not measured yet:
+this machine (i7-7500U) has no SHA extensions, and the emulators that test
+the code (qemu-user) say nothing about speed. The portable code stays at
+about 175 MB/s here; published figures for these instructions are several
+times that. Numbers to be added from a machine that has them.

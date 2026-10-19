@@ -255,6 +255,7 @@ make release      # optimised binary
 make test         # run test suite (dev build)
 make test-tsan    # TSan build and test run (Linux/Clang only)
 make valgrind     # Valgrind run (Linux only, no sanitisers)
+make test-qemu    # SHA-256 tests on an emulated SHA-NI CPU (x86-64 Linux, qemu-user)
 make lint         # clang-tidy + cppcheck
 make format       # clang-format -i on all source files
 make clean        # remove build artefacts
@@ -466,10 +467,16 @@ in active use will satisfy both requirements.
 | x86_64 | First-class |
 | ARM64 | First-class |
 
-No architecture-specific code exists in ark. The codebase is pure POSIX C
-with no inline assembly, no SIMD, and no architecture-specific intrinsics.
-The sha256, blake3, deflate and zwrap implementations are portable C with no
-platform-specific acceleration paths.
+The codebase is POSIX C with no inline assembly. The only
+architecture-specific code is SHA-256's optional hardware block functions:
+`src/sha256_x86.c` (x86 SHA extensions) and `src/sha256_arm.c` (ARMv8 SHA2),
+written with compiler intrinsics and a `target` attribute (gcc and clang
+only). The Makefile compiles the one matching `uname -m` and defines
+`ARK_SHA256_X86` or `ARK_SHA256_ARM`; `src/sha256_cpu.c` tells at run time
+whether the CPU has the instructions, and the portable C code is used
+otherwise. `sha256.c` itself, blake3, deflate and zwrap stay portable ISO
+C11 with no extensions, so they also build with compilers that have no
+intrinsics. See ARCHITECTURE.md section 8.4.
 
 ### 8.3 Platform-Specific Behaviour Summary
 
