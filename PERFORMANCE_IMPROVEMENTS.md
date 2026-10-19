@@ -261,8 +261,19 @@ clang ~597 and gcc ~493 MB/s; a local copy of the message words changed
 nothing.
 
 **SHA-256 hardware block functions** (x86 SHA extensions, ARMv8 SHA2;
-`--hash sha256` archives and library users such as arv). Not measured yet:
-this machine (i7-7500U) has no SHA extensions, and the emulators that test
-the code (qemu-user) say nothing about speed. The portable code stays at
-about 175 MB/s here; published figures for these instructions are several
-times that. Numbers to be added from a machine that has them.
+`--hash sha256` archives and library users such as arv). The reference
+machine (i7-7500U) has no SHA extensions, so the x86 path was measured on an
+AMD Ryzen 7 4800H (Zen 2, Fedora 44, on battery, `performance` governor,
+boost on), where the test suite also ran the SHA-NI backend natively
+(`sha256 backends tested: [portable] [x86 SHA-NI]`, 279/279). 128 MiB
+one-shot, best of 5, pinned, three rounds, digests equal in every run:
+
+| Ryzen 7 4800H | clang 22 | gcc 16 |
+|---|---|---|
+| SHA-256 portable | 303-304 MB/s | 302-303 MB/s |
+| SHA-256 x86 SHA-NI | 2,056-2,069 MB/s | 2,062-2,074 MB/s |
+| BLAKE3 (portable) | 743-749 MB/s | 707-708 MB/s |
+
+SHA-NI is 6.8 times the portable code there and 2.8 times BLAKE3's portable
+speed. The same run on the i7-7500U: SHA-256 portable 214-216 MB/s, BLAKE3
+604-610 MB/s (clang). The ARMv8 path is not measured yet.

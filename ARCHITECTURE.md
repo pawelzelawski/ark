@@ -1292,9 +1292,10 @@ the file for its architecture and chooses the backend once per archive
 context with `ark_sha256_cpu_best()` (`archive.c`); `ark_sha256` (the
 single-shot call) stays portable. The recovery reader keeps its own
 portable SHA-256 (section 15). The hardware functions are proven on
-emulated CPUs (`qemu-x86_64 -cpu max`, `qemu-aarch64 -cpu max`) and natively
-in CI where the runners have the instructions; this development machine
-has neither.
+emulated CPUs (`qemu-x86_64 -cpu max`, `qemu-aarch64 -cpu max`), natively
+in CI where the runners have the instructions, and the x86 path on an AMD
+Ryzen 7 4800H, where SHA-NI hashes at about 2 GB/s per core, 6.8 times
+the portable code (PERFORMANCE_IMPROVEMENTS.md).
 
 **Output length.** Both APIs produce exactly 32 bytes of output, matching the
 hash field size in the index entry. BLAKE3 natively supports variable-length
