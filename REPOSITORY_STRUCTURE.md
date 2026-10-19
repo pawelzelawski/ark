@@ -126,6 +126,32 @@ src/
 │                       # Decompressor is a strict RFC 1951 implementation.
 │                       # No dependencies beyond deflate.h and libc.
 │
+├── zwrap.h             # zlib format (RFC 1950) and Adler-32 public API,
+│                       #   on the deflate.h encoders and decoders.
+│                       #
+│                       # Types:
+│                       #   ark_zlib_enc_t / ark_zlib_dec_t - streaming
+│                       #     header/trailer state around a caller-owned
+│                       #     Deflate encoder/decoder (structs defined in
+│                       #     the header)
+│                       #
+│                       # Functions:
+│                       #   ark_adler32()            - running Adler-32
+│                       #   ark_zlib_bound()         - output size bound
+│                       #   ark_zlib_enc/dec_oneshot() - one complete
+│                       #     stream; the decoder reports bytes used
+│                       #   ark_zlib_enc/dec_begin/set_dict/stream()
+│                       #     - streaming, preset dictionary
+│                       #
+│                       # Library API for zlib-format users (Git objects,
+│                       #   HTTP deflate); ark does not use it, and the
+│                       #   ark binary does not link it. See
+│                       #   ARCHITECTURE.md §7.5.
+│
+├── zwrap.c             # zlib wrapper and Adler-32 implementation.
+│                       # No dependencies beyond zwrap.h, deflate.h and
+│                       #   libc. Compiled into the test binaries.
+│
 │   - Archive format component -
 │
 ├── archive.h           # Archive read and write public API.
@@ -346,6 +372,12 @@ tests/
 │                           # Length mismatch: ARK_ERR_FMT_DATA.
 │                           # See TESTING.md §3.3.
 │
+├── test_zwrap.c            # zlib format and Adler-32 tests: known
+│                           #   values, zlib- and Git-made streams,
+│                           #   one-shot and streaming round trips,
+│                           #   preset dictionary, malformed streams.
+│                           # See TESTING.md §3.6.
+│
 ├── test_archive.c          # archive.h API unit tests.
 │                           # Write path: state machine valid transitions,
 │                           #   all invalid transitions return ARK_ERR_USAGE,
@@ -457,7 +489,7 @@ make release      # optimised binary (build/ark)
 make test         # compile and run tests (dev flags, -DARK_TEST)
 make test-tsan    # TSan build and test run (Linux/Clang only)
 make valgrind     # run tests under Valgrind (Linux only, no sanitisers)
-make lint         # clang-tidy + cppcheck on src/
+make lint         # clang-tidy on the src/ components, cppcheck on src/ and tests/
 make format       # clang-format -i on all source and test files
 make clean        # remove build artefacts
 make install      # install ark binary and man page to PREFIX
@@ -549,6 +581,18 @@ Checks: >
 | `ark_deflate_dec_reset` | `src/deflate.c` | Public; start a new stream, optionally keeping history (library API) |
 | `ark_deflate_dec_set_dict` | `src/deflate.c` | Public; preset dictionary as history (library API) |
 | `ark_deflate_bound` | `src/deflate.c` | Public; output buffer sizing |
+| `ark_deflate_enc_params` | `src/deflate.c` | Public; an encoder's parameters (zlib header; library API) |
+| `ark_deflate_dec_window_bits` | `src/deflate.c` | Public; a streaming decoder's window bits (library API) |
+| `ark_adler32` | `src/zwrap.c` | Public; running Adler-32 (library API, unused by ark) |
+| `ark_zlib_bound` | `src/zwrap.c` | Public; zlib output size bound (library API) |
+| `ark_zlib_enc_oneshot` | `src/zwrap.c` | Public; one complete zlib stream (library API) |
+| `ark_zlib_dec_oneshot` | `src/zwrap.c` | Public; decode one zlib stream, report the bytes used (library API) |
+| `ark_zlib_enc_begin` | `src/zwrap.c` | Public; start a streaming zlib stream on a streaming encoder (library API) |
+| `ark_zlib_enc_set_dict` | `src/zwrap.c` | Public; preset dictionary (FDICT, dictionary id) (library API) |
+| `ark_zlib_enc_stream` | `src/zwrap.c` | Public; compress the next piece (library API) |
+| `ark_zlib_dec_begin` | `src/zwrap.c` | Public; start decoding a zlib stream (library API) |
+| `ark_zlib_dec_set_dict` | `src/zwrap.c` | Public; dictionary a stream may ask for (library API) |
+| `ark_zlib_dec_stream` | `src/zwrap.c` | Public; decode the next piece (library API) |
 | `ark_write_init` | `src/archive.c` | Public |
 | `ark_write_header` | `src/archive.c` | Public |
 | `ark_write_member_begin` | `src/archive.c` | Public |

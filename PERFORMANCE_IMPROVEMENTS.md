@@ -233,3 +233,9 @@ before (5.252 -> 5.256 G). The tools' one-shot build still measures about
 4 % slower (3.21 -> 3.40 G cycles) but equal with both builds aligned the
 same way (3.34-3.39 vs 3.36-3.39 G), so the difference is code placement;
 `ark verify` of the `/usr/include` archive is 0.401 -> 0.383 s (best of 5).
+
+**Adler-32** (`ark_adler32`, new, for the zlib format; ark does not use
+it). Portable C with the modulo once per 5552 bytes: 64 MiB, best of 5,
+pinned: 2,231 MB/s with clang, 1,665 MB/s with gcc (zlib-ng's SIMD version:
+13,817 MB/s). That is several times the Deflate decoder's speed, so the
+trailer check does not limit zlib-format decoding.

@@ -44,7 +44,10 @@ access required.
 into the `ark` binary. Each is a self-contained two-file component (`.h` +
 `.c`) with a clean public API and no dependencies beyond libc. They are
 independently portable: copying `blake3.h` and `blake3.c` to another project
-produces a fully functional standalone component.
+produces a fully functional standalone component. **zwrap** (`zwrap.h` +
+`zwrap.c`, the zlib format and Adler-32 over deflate) is a library API for
+other projects: it depends only on deflate and libc, is built and tested
+with ark, and is not linked into the `ark` binary.
 
 ---
 
@@ -277,7 +280,7 @@ build/tests/run_tests - test binary
 
 The `ark` binary is the only artefact. There is no static library output.
 The internal components (sha256, blake3, deflate, archive) are compiled
-directly into the binary. They are not exposed as installable library
+directly into the binary (zwrap only into the test binaries). They are not exposed as installable library
 artefacts.
 
 ### 5.3 Install Target
@@ -327,6 +330,7 @@ tests/
 ├── test_sha256.c         # SHA-256 implementation against NIST test vectors
 ├── test_blake3.c         # BLAKE3 implementation against official test vectors
 ├── test_deflate.c        # Deflate compress/decompress round-trip and edge cases
+├── test_zwrap.c          # zlib format and Adler-32: zlib/Git interop, round trips
 ├── test_archive.c        # archive.h API unit tests: write path, read path, error model
 ├── test_thread.c         # thread pool: cancellation, worker error propagation,
 │                         #   ring buffer abort sentinel, quiescence sequence
@@ -464,7 +468,7 @@ in active use will satisfy both requirements.
 
 No architecture-specific code exists in ark. The codebase is pure POSIX C
 with no inline assembly, no SIMD, and no architecture-specific intrinsics.
-The sha256, blake3, and deflate implementations are portable C with no
+The sha256, blake3, deflate and zwrap implementations are portable C with no
 platform-specific acceleration paths.
 
 ### 8.3 Platform-Specific Behaviour Summary

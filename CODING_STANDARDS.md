@@ -164,7 +164,7 @@ static int parse_index_entry(const uint8_t *buf, size_t len,
 ### 1.2 File Organisation
 
 **Component public headers** (`src/sha256.h`, `src/blake3.h`,
-`src/deflate.h`, `src/archive.h`):
+`src/deflate.h`, `src/zwrap.h`, `src/archive.h`):
 
 Each component header exposes only the public API for that component.
 Internal types and implementation details are never declared here. Each

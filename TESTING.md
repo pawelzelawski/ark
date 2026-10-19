@@ -36,6 +36,7 @@ tests/
 ├── test_sha256.c         # SHA-256 implementation against NIST test vectors
 ├── test_blake3.c         # BLAKE3 implementation against official test vectors
 ├── test_deflate.c        # Deflate compress/decompress correctness and bounds
+├── test_zwrap.c          # zlib format (RFC 1950) and Adler-32
 ├── test_archive.c        # archive.h API: write path, read path, error model
 ├── test_thread.c         # thread pool, ring buffer, cancellation, error propagation
 ├── test_extract.c        # extraction correctness, metadata, cleanup, --overwrite
@@ -370,6 +371,22 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_read_index_many_members` | 20,000 members in reverse name order parse; lookups return the right positions |
 | `test_read_index_many_members_duplicate` | 20,000 members plus one duplicate path; `ARK_ERR_FMT_INDEX` |
 
+### 3.6 zlib Format (`test_zwrap.c`)
+
+The zlib layer (`src/zwrap.c`, ARCHITECTURE.md §7.5) is a library API that
+ark does not use; it is tested here with the other components. Its tests
+use no `ARK_TEST` or `ARK_DEFLATE_TEST` hooks.
+
+| Test | What it verifies |
+|---|---|
+| `test_zwrap_adler32_known` | Adler-32 of empty input (1), "a", "abc", "Wikipedia", 5552 and 5553 bytes of 0xff (the reduction boundary) and 1 MiB of 0xff equal Python's `zlib.adler32`; random update splits of 200 KB give the one-shot value |
+| `test_zwrap_decodes_zlib_and_git` | `zlib.compress(b"hello world")` and the loose object Git writes for the blob "hello\n" decode one-shot, with junk bytes after them: exact output, `src_used` the stream size |
+| `test_zwrap_oneshot_round_trip` | Levels 0, 1, 6, 9 at window bits 8, 12, 15: CMF from the window bits, FLG as zlib writes it at window 15 (`78 01` / `78 9C` / `78 DA`), valid check bits; three streams (50,000, 0 and 7 bytes) plus junk written back to back decode one after another by `src_used` |
+| `test_zwrap_oneshot_errors` | Method 7 and CINFO 8 (each with valid check bits), bad check bits, FDICT, a wrong Adler-32 and every truncation are `ERR_DATA`; one output byte short is `ERR_OUTPUT`; NULL arguments are `ERR_USAGE`; the encoder rejects input above `max_input` (`ERR_USAGE`) and `dst_cap` below `ark_zlib_bound` (`ERR_OUTPUT`); `ark_zlib_bound(SIZE_MAX)` is 0 |
+| `test_zwrap_stream_round_trip` | Streaming zlib at window 15 and 10, levels 6 and 1, random `SYNC` flushes: one output byte per call gives the same bytes (header and trailer split); the result decodes one-shot, and streaming whole, one input byte per call and in random pieces with junk after it: `END`, `in_used` exactly the stream size |
+| `test_zwrap_stream_dictionary` | FDICT and the dictionary's Adler-32 in the header; one-shot refuses it; streaming decodes it with the dictionary, refuses it without one, with another, and with one differing only outside the window (dictionary id); a stream without FDICT decodes although a dictionary was given and cannot refer into it; a Python `zdict` stream decodes |
+| `test_zwrap_stream_errors` | A header asking for a larger window than the decoder (also for data needing none), FDICT with id 0 and no dictionary, and a wrong trailer are `ERR_DATA`, sticky until begin; truncation is `NEED_INPUT`; `END` repeats consuming nothing; begin without an encoder or on a one-shot encoder, NULL arguments, unknown flush, input after `END` and `set_dict` after the header started are `ERR_USAGE` |
+
 ---
 
 ## 4. Thread Test Catalogue (`test_thread.c`)
@@ -678,6 +695,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | `test_sha256.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_blake3.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_deflate.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_zwrap.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_archive.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_thread.c` | ✓ | ✓ | ✓ (TSan) | ✓ |
 | `test_extract.c` | ✓ | ✓ | ✓ | ✓ |
@@ -692,6 +710,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | SHA-256 NIST vectors all pass | `test_sha256.c` | ARCHITECTURE.md §8.4 |
 | BLAKE3 official vectors all pass | `test_blake3.c` | ARCHITECTURE.md §8.4 |
 | Deflate round-trip: byte-for-byte identity | `test_deflate.c` | ARCHITECTURE.md §7 |
+| zlib format: streams made by zlib and Git decode; back-to-back streams by bytes used | `test_zwrap.c` | ARCHITECTURE.md §7.5 |
 | All sixteen §8.3 checks individually reject crafted malformed archive | `test_archive.c` | ARCHITECTURE.md §8.3 |
 | member_count pre-allocation bound enforced before allocation | `test_archive.c` | ARCHITECTURE.md §5.1 |
 | Write state machine: all invalid transitions return ARK_ERR_USAGE | `test_archive.c` | ARCHITECTURE.md §16.3 |

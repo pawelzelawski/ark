@@ -156,6 +156,13 @@ int test_deflate_enc_stream_sync_flush(void);
 int test_deflate_enc_stream_window_limit(void);
 int test_deflate_enc_stream_status(void);
 int test_deflate_stream_dictionary(void);
+int test_zwrap_adler32_known(void);
+int test_zwrap_decodes_zlib_and_git(void);
+int test_zwrap_oneshot_round_trip(void);
+int test_zwrap_oneshot_errors(void);
+int test_zwrap_stream_round_trip(void);
+int test_zwrap_stream_dictionary(void);
+int test_zwrap_stream_errors(void);
 int test_edge_empty_archive(void);
 int test_edge_single_member(void);
 int test_edge_max_path_length(void);
@@ -396,6 +403,13 @@ static const test_case_t g_tests[] = {
      test_deflate_enc_stream_window_limit},
     {"test_deflate_enc_stream_status", test_deflate_enc_stream_status},
     {"test_deflate_stream_dictionary", test_deflate_stream_dictionary},
+    {"test_zwrap_adler32_known", test_zwrap_adler32_known},
+    {"test_zwrap_decodes_zlib_and_git", test_zwrap_decodes_zlib_and_git},
+    {"test_zwrap_oneshot_round_trip", test_zwrap_oneshot_round_trip},
+    {"test_zwrap_oneshot_errors", test_zwrap_oneshot_errors},
+    {"test_zwrap_stream_round_trip", test_zwrap_stream_round_trip},
+    {"test_zwrap_stream_dictionary", test_zwrap_stream_dictionary},
+    {"test_zwrap_stream_errors", test_zwrap_stream_errors},
     {"test_write_valid_sequence_zero_members",
      test_write_valid_sequence_zero_members},
     {"test_write_valid_sequence_one_member",

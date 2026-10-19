@@ -2085,6 +2085,17 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 	return ARK_DEFLATE_OK;
 }
 
+void ark_deflate_enc_params(const ark_deflate_enc_t *enc,
+                            ark_deflate_params_t *params)
+{
+	if (enc == NULL || params == NULL)
+		return;
+	params->level = enc->level;
+	params->window_bits = enc->mf.hash_bits;
+	params->max_input = enc->max_input;
+	params->streaming = enc->streaming;
+}
+
 /* Bit writer over the stream's staging buffer, continuing its bits. */
 static void stream_bw_load(const ark_enc_stream_t *s, ark_bit_writer_t *bw)
 {
@@ -3091,6 +3102,18 @@ ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
 	*in_used = io.ip;
 	*out_used = io.op;
 	return st;
+}
+
+unsigned int ark_deflate_dec_window_bits(const ark_deflate_dec_t *dec)
+{
+	unsigned int bits;
+
+	if (dec == NULL)
+		return 0U;
+	bits = 0U;
+	while (((size_t)1U << bits) < dec->window_size)
+		bits++;
+	return bits;
 }
 
 ark_deflate_status_t ark_deflate_dec_set_dict(ark_deflate_dec_t *dec,

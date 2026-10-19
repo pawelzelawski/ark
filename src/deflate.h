@@ -133,6 +133,14 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
                                              size_t *dst_len);
 
 /*
+ * ark_deflate_enc_params - Copy the parameters enc was initialized with
+ * into *params (for format wrappers such as the zlib header). NULL
+ * arguments are ignored.
+ */
+void ark_deflate_enc_params(const ark_deflate_enc_t *enc,
+                            ark_deflate_params_t *params);
+
+/*
  * ark_deflate_flush_t - What ark_deflate_enc_stream() does once all of its
  * input is taken.
  *
@@ -332,6 +340,12 @@ ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
  * is ignored.
  */
 void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history);
+
+/*
+ * ark_deflate_dec_window_bits - Return the window bits dec was initialized
+ * with, or 0 for a NULL dec.
+ */
+unsigned int ark_deflate_dec_window_bits(const ark_deflate_dec_t *dec);
 
 /*
  * ark_deflate_dec_set_dict - Use dict as the history window (zlib's

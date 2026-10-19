@@ -974,6 +974,92 @@ after a failure. The streaming call's staging buffer is sized so that it
 cannot overflow; should it ever (a defect), the call returns
 `ARK_DEFLATE_ERR_OUTPUT` until reset.
 
+**Format wrappers.** `ark_deflate_enc_params` returns an encoder's
+parameters and `ark_deflate_dec_window_bits` a streaming decoder's window
+bits, for wrappers that describe them in a header (section 7.5).
+
+### 7.5 zlib Format
+
+Implemented in `zwrap.c` / `zwrap.h` on top of `deflate.h`, for library
+users that need the zlib format (RFC 1950): Git loose objects and pack
+entries (arv), HTTP `Content-Encoding: deflate`. ark does not use it, and the
+`ark` binary does not link it; it is built and tested with ark. Same rules
+as the Deflate component: no I/O, no allocation, no global or thread-local
+mutable state.
+
+A zlib stream is a 2-byte header, an optional 4-byte dictionary id, a raw
+RFC 1951 stream and the Adler-32 of the uncompressed data, big-endian. The
+header's CMF byte holds method 8 and CINFO = window bits - 8; FLG holds
+FLEVEL (written as zlib maps levels: 0-1 fastest, 2-5 fast, 6 default, 7-9
+maximum), the FDICT flag and check bits that make the 16-bit header a
+multiple of 31.
+
+```c
+#define ARK_ADLER32_INIT 1U
+uint32_t ark_adler32(uint32_t adler, const uint8_t *data, size_t len);
+size_t   ark_zlib_bound(size_t src_len);  /* deflate bound + 6; 0: overflow */
+
+/* One complete stream; any encoder; no dictionary. */
+ark_deflate_status_t ark_zlib_enc_oneshot(ark_deflate_enc_t *enc,
+                                          const uint8_t *src, size_t src_len,
+                                          uint8_t *dst, size_t dst_cap,
+                                          size_t *dst_len);
+/* src_used: header + Deflate data + trailer; later bytes unread. */
+ark_deflate_status_t ark_zlib_dec_oneshot(const uint8_t *src, size_t src_len,
+                                          size_t *src_used, uint8_t *dst,
+                                          size_t dst_cap, size_t *dst_len);
+
+/* Streaming: small caller-owned structs (defined in the header) around a
+   caller-owned Deflate encoder (streaming = 1) or streaming decoder. */
+void ark_zlib_enc_begin(ark_zlib_enc_t *z, ark_deflate_enc_t *enc);
+ark_deflate_status_t ark_zlib_enc_set_dict(ark_zlib_enc_t *z,
+                                           const uint8_t *dict, size_t len);
+ark_deflate_status_t ark_zlib_enc_stream(ark_zlib_enc_t *z, /* as enc_stream */
+                                         const uint8_t *in, size_t in_len,
+                                         size_t *in_used, uint8_t *out,
+                                         size_t out_cap, size_t *out_used,
+                                         ark_deflate_flush_t flush);
+void ark_zlib_dec_begin(ark_zlib_dec_t *z, ark_deflate_dec_t *dec);
+ark_deflate_status_t ark_zlib_dec_set_dict(ark_zlib_dec_t *z,
+                                           const uint8_t *dict, size_t len);
+ark_deflate_status_t ark_zlib_dec_stream(ark_zlib_dec_t *z, /* as dec_stream */
+                                         const uint8_t *in, size_t in_len,
+                                         size_t *in_used, uint8_t *out,
+                                         size_t out_cap, size_t *out_used);
+```
+
+**Adler-32.** Two running sums modulo 65521 (`a` = 1 + the bytes, `b` =
+the sum of the `a` values); the modulo is taken once per 5552 bytes, the
+most that cannot overflow 32 bits.
+
+**One-shot calls.** The encoder writes the header for its window bits and
+level, the Deflate stream and the trailer; `dst_cap` must be at least
+`ark_zlib_bound(src_len)`. The decoder checks the header (method 8, CINFO at
+most 7, check bits; FDICT is refused because the one-shot decoder has no
+dictionary), decodes the Deflate stream and compares the trailer;
+`src_used` counts header, Deflate data and trailer, so back-to-back streams
+(Git pack entries, which store no compressed length) decode one after
+another. Errors: `ERR_DATA` for a malformed header, Deflate data or
+trailer, or a wrong Adler-32; `ERR_OUTPUT` and `ERR_USAGE` as for the
+Deflate calls. Distances are limited by the Deflate decoder (32 KiB), not by
+the header's window size, as zlib does.
+
+**Streaming calls.** `begin` resets the Deflate encoder or decoder (a zlib
+stream never refers into an earlier one) and the wrapper's state. The
+encoder hands out the staged header first, then the Deflate encoder's
+output while the Adler-32 follows the input it takes, then after `FINISH`
+the trailer; statuses are those of `ark_deflate_enc_stream`, and `END` means
+the trailer is written. The decoder reads header, dictionary id and
+trailer byte by byte across calls; a header asking for a larger window than
+the decoder's window bits, FDICT without a matching dictionary (its id is
+the Adler-32 of the whole dictionary) and a wrong Adler-32 are `ERR_DATA`,
+sticky until `begin`; `END` comes after the trailer with `in_used` ending
+there. `set_dict` is valid only right after `begin`: the encoder then
+writes FDICT and the dictionary id and loads it with
+`ark_deflate_enc_set_dict`; the decoder loads it with
+`ark_deflate_dec_set_dict` and drops it again when the stream turns out to
+have no FDICT.
+
 ---
 
 ## 8. Integrity

@@ -62,20 +62,21 @@ APP_SRCS = src/archive.c src/blake3.c src/deflate.c src/main.c \
 	src/sha256.c vendor/libchevron/src/chevron.c
 
 CORE_SRCS = src/archive.c src/blake3.c src/deflate.c src/main.c src/sha256.c \
-	vendor/libchevron/src/chevron.c
+	src/zwrap.c vendor/libchevron/src/chevron.c
 
 TEST_SRCS = tests/run_tests.c tests/ark_stubs.c tests/test_archive.c \
 	tests/test_blake3.c tests/test_deflate.c tests/test_edge.c \
 	tests/test_extract.c tests/test_fault.c tests/test_integration.c \
-	tests/test_sha256.c tests/test_thread.c
+	tests/test_sha256.c tests/test_thread.c tests/test_zwrap.c
 
 FORMAT_SRCS = src/archive.c src/archive.h src/ark_internal.h src/blake3.c \
 	src/blake3.h src/deflate.c src/deflate.h src/main.c \
-	src/recovery_template.c src/sha256.c src/sha256.h \
+	src/recovery_template.c src/sha256.c src/sha256.h src/zwrap.c \
+	src/zwrap.h \
 	tests/ark_stubs.c tests/run_tests.c tests/test_archive.c \
 	tests/test_blake3.c tests/test_deflate.c tests/test_edge.c \
 	tests/test_extract.c tests/test_fault.c tests/test_integration.c \
-	tests/test_sha256.c tests/test_thread.c
+	tests/test_sha256.c tests/test_thread.c tests/test_zwrap.c
 
 .PHONY: all dev release test test-tsan valgrind lint format clean install
 
@@ -116,6 +117,7 @@ valgrind: $(ARK_BIN) $(TEST_BIN_VG)
 
 lint:
 	clang-tidy src/archive.c src/blake3.c src/deflate.c src/main.c src/sha256.c \
+		src/zwrap.c \
 		-- $(CFLAGS_RELEASE) $(INCLUDES)
 	@if command -v cppcheck >/dev/null 2>&1; then \
 		cppcheck --enable=all --error-exitcode=1 \
