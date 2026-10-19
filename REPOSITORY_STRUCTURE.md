@@ -101,6 +101,9 @@ src/
 │                       #   ark_deflate_enc_oneshot()- compress one chunk
 │                       #   ark_deflate_dec_oneshot()- decompress one chunk
 │                       #     and report the input bytes used
+│                       #   ark_deflate_dec_size/init/stream/reset()
+│                       #     - streaming decoder in caller memory
+│                       #     (library API; ark does not call it)
 │                       #   ark_deflate_bound()      - maximum compressed
 │                       #     output size for a given input size; used by
 │                       #     main.c to size output buffers
@@ -532,6 +535,10 @@ Checks: >
 | `ark_deflate_enc_init` | `src/deflate.c` | Public; encoder in caller memory (`pool_init`) |
 | `ark_deflate_enc_oneshot` | `src/deflate.c` | Public; called by worker threads |
 | `ark_deflate_dec_oneshot` | `src/deflate.c` | Public; called by worker threads and `ark_read_chunk` |
+| `ark_deflate_dec_size` | `src/deflate.c` | Public; streaming decoder memory size (library API, unused by ark) |
+| `ark_deflate_dec_init` | `src/deflate.c` | Public; streaming decoder in caller memory (library API) |
+| `ark_deflate_dec_stream` | `src/deflate.c` | Public; decode the next piece of a stream (library API) |
+| `ark_deflate_dec_reset` | `src/deflate.c` | Public; start a new stream, optionally keeping history (library API) |
 | `ark_deflate_bound` | `src/deflate.c` | Public; output buffer sizing |
 | `ark_write_init` | `src/archive.c` | Public |
 | `ark_write_header` | `src/archive.c` | Public |

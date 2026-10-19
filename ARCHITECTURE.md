@@ -814,6 +814,18 @@ ark_deflate_status_t ark_deflate_dec_oneshot(const uint8_t *src,
                                              size_t src_len, size_t *src_used,
                                              uint8_t *dst, size_t dst_cap,
                                              size_t *dst_len);
+
+/* Streaming decoder in caller memory (not used by ark itself). */
+typedef struct ark_deflate_dec ark_deflate_dec_t;
+size_t ark_deflate_dec_size(unsigned int window_bits);   /* 0 if not 8..15 */
+ark_deflate_dec_t *ark_deflate_dec_init(void *mem, size_t mem_len,
+                                        unsigned int window_bits);
+/* END, NEED_INPUT, NEED_OUTPUT, ERR_DATA (sticky) or ERR_USAGE. */
+ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
+                                            const uint8_t *in, size_t in_len,
+                                            size_t *in_used, uint8_t *out,
+                                            size_t out_cap, size_t *out_used);
+void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history);
 ```
 
 **Decoder strictness.** The decoder follows RFC 1951 strictly: invalid or
@@ -825,6 +837,32 @@ before v1.1.0 wrote it as 284 + 31, so archives from v1.0.0 that contain
 its recovery reader do not). The decoder uses no workspace: its Huffman
 tables live on the stack, sized for the worst-case code (about 28 KiB in a
 dynamic block).
+
+**Streaming decoder.** For callers whose compressed data arrives in pieces
+or whose output must be delivered in pieces (RFC 7692 messages in libgate,
+large Git objects in arv), `ark_deflate_dec_stream` decodes one stream
+across any number of calls. Its state lives in caller memory
+(`ark_deflate_dec_size`: about 30 KiB of decode tables plus a history
+window of `1 << window_bits` bytes, 62 KiB in total at 15). It applies the
+same strictness rules as the one-shot decoder, and in addition rejects a
+distance beyond its window bits or beyond the output so far, including
+output returned by earlier calls. Each call stops when the stream ends
+(`END`; bytes after the final block are not consumed, so `in_used` is
+exact as for `src_used`), when the input runs out (`NEED_INPUT`; a message
+that ends in a sync flush without a final block stops here, between
+blocks), or when `out_cap` is reached (`NEED_OUTPUT`; a literal or match
+that did not fit is kept and written by the next call). It never writes
+past `out_cap`, so the caller bounds the total output against
+decompression bombs. Malformed input is `ERR_DATA` for this and every
+later call until `ark_deflate_dec_reset`, which starts a new stream and
+either keeps the history (context takeover between messages) or empties
+it. The decoder reads input bits only as far as the current symbol needs
+them, so fewer than 8 bits are ever held back between items; while at
+least 8 input bytes and 258 bytes of output space remain it decodes with
+the one-shot decoder's 64-bit bit reader and returns any whole bytes it
+read ahead before stopping. Its throughput matches the one-shot decoder
+(PERFORMANCE_IMPROVEMENTS.md). ark's archive code uses only the one-shot
+calls.
 
 **Level semantics.** Levels use zlib's numbering, 0..9. Level 0 writes
 stored blocks only. Levels 1..9 share one encoder (section 7.2: one parse,

@@ -145,6 +145,12 @@ int test_deflate_equal_low_bytes(void);
 int test_deflate_default_matches_across_blocks(void);
 int test_deflate_default_token_buffer_full(void);
 int test_deflate_levels_round_trip(void);
+int test_deflate_dec_stream_splits(void);
+int test_deflate_dec_stream_sync_flush(void);
+int test_deflate_dec_stream_window_limit(void);
+int test_deflate_dec_stream_concatenated(void);
+int test_deflate_dec_stream_errors(void);
+int test_deflate_dec_stream_fuzz(void);
 int test_edge_empty_archive(void);
 int test_edge_single_member(void);
 int test_edge_max_path_length(void);
@@ -371,6 +377,14 @@ static const test_case_t g_tests[] = {
     {"test_deflate_default_token_buffer_full",
      test_deflate_default_token_buffer_full},
     {"test_deflate_levels_round_trip", test_deflate_levels_round_trip},
+    {"test_deflate_dec_stream_splits", test_deflate_dec_stream_splits},
+    {"test_deflate_dec_stream_sync_flush", test_deflate_dec_stream_sync_flush},
+    {"test_deflate_dec_stream_window_limit",
+     test_deflate_dec_stream_window_limit},
+    {"test_deflate_dec_stream_concatenated",
+     test_deflate_dec_stream_concatenated},
+    {"test_deflate_dec_stream_errors", test_deflate_dec_stream_errors},
+    {"test_deflate_dec_stream_fuzz", test_deflate_dec_stream_fuzz},
     {"test_write_valid_sequence_zero_members",
      test_write_valid_sequence_zero_members},
     {"test_write_valid_sequence_one_member",

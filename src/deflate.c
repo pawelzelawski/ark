@@ -2111,6 +2111,614 @@ ark_deflate_status_t ark_deflate_dec_oneshot(const uint8_t *src, size_t src_len,
 	return ARK_DEFLATE_OK;
 }
 
+/*
+ * Streaming decoder state machine (ark_deflate_dec_stream). Each state names
+ * the next item to read; every state can stop for input or output space and
+ * resume in a later call.
+ */
+typedef enum {
+	ARK_SD_HEADER = 0, /* BFINAL and BTYPE */
+	ARK_SD_STORED_LEN, /* LEN and NLEN of a stored block */
+	ARK_SD_STORED_COPY,
+	ARK_SD_TABLE,  /* HLIT, HDIST, HCLEN */
+	ARK_SD_CLENS,  /* code-length code lengths */
+	ARK_SD_LENS,   /* lit/len and distance code lengths */
+	ARK_SD_CODES,  /* next lit/len symbol */
+	ARK_SD_LIT,    /* decoded literal waiting for output space */
+	ARK_SD_LENEXT, /* length extra bits */
+	ARK_SD_DIST,   /* distance symbol */
+	ARK_SD_DISTEXT,
+	ARK_SD_COPY, /* match bytes waiting for output space */
+	ARK_SD_DONE,
+	ARK_SD_ERROR,
+} ark_sd_mode_t;
+
+/*
+ * Streaming decoder state. The struct sits at the start of the caller's
+ * memory; window holds the last window_size output bytes (a circular
+ * buffer: whave valid bytes, next write at wnext), so matches can reach
+ * output returned by earlier calls. The bit buffer only ever holds bits
+ * pulled for the current item, so fewer than 8 remain after each item and
+ * in_used is exact at the end of the stream.
+ */
+struct ark_deflate_dec {
+	uint64_t bits;
+	unsigned int nbits;
+	ark_sd_mode_t mode;
+	int last;
+	const uint32_t *lit_tab;
+	const uint32_t *dist_tab;
+	unsigned int lit_root;
+	unsigned int dist_root;
+	size_t window_size;
+	size_t whave;
+	size_t wnext;
+	size_t length;
+	size_t dist;
+	size_t index;
+	size_t hlit;
+	size_t hdist;
+	size_t hclen;
+	unsigned int len_index;
+	uint8_t literal;
+	uint8_t cl_len[19];
+	uint8_t lens[288 + 32];
+	uint32_t cl_tab[ARK_INFLATE_CL_TABLE];
+	uint32_t dyn_lit_tab[ARK_INFLATE_LIT_TABLE];
+	uint32_t dyn_dist_tab[ARK_INFLATE_DIST_TABLE];
+	uint32_t fixed_lit_tab[1U << ARK_INFLATE_FIXED_LIT_ROOT];
+	uint32_t fixed_dist_tab[1U << ARK_INFLATE_FIXED_DIST_ROOT];
+	uint8_t window[];
+};
+
+/* Input and output of one ark_deflate_dec_stream call. */
+typedef struct {
+	const uint8_t *in;
+	size_t in_len;
+	size_t ip;
+	uint8_t *out;
+	size_t out_cap;
+	size_t op;
+} ark_sd_io_t;
+
+/* Pull input bytes until n (<= 32) bits are buffered; 0 when input ends. */
+static int sd_need(ark_deflate_dec_t *d, ark_sd_io_t *io, unsigned int n)
+{
+	while (d->nbits < n) {
+		if (io->ip == io->in_len)
+			return 0;
+		d->bits |= (uint64_t)io->in[io->ip++] << d->nbits;
+		d->nbits += 8U;
+	}
+	return 1;
+}
+
+/* Take n buffered bits (n <= nbits, n <= 16). */
+static unsigned int sd_take(ark_deflate_dec_t *d, unsigned int n)
+{
+	unsigned int v;
+
+	v = (unsigned int)(d->bits & (((uint64_t)1U << n) - 1U));
+	d->bits >>= n;
+	d->nbits -= n;
+	return v;
+}
+
+/*
+ * Look up the next code of tab without consuming it. The bits above nbits
+ * are zero, and a table entry is replicated for every value of the bits
+ * after its code, so an entry whose length fits in nbits is the right one.
+ * Returns 1 with *sym and *len set, 0 when more bits are needed, -1 for a
+ * code the table does not contain.
+ */
+static int sd_peek(const ark_deflate_dec_t *d, const uint32_t *tab,
+                   unsigned int root, unsigned int *sym, unsigned int *len)
+{
+	uint32_t e;
+	unsigned int n;
+
+	e = tab[d->bits & (((uint64_t)1U << root) - 1U)];
+	if ((e & ARK_INFLATE_LINK) != 0U) {
+		unsigned int sub_bits;
+
+		if (d->nbits < root)
+			return 0;
+		sub_bits = (e >> 8) & 0xfU;
+		e = tab[(e >> 16) + ((d->bits >> root) &
+		                     (((uint64_t)1U << sub_bits) - 1U))];
+		n = e & 0xffU;
+		if (n == 0U)
+			return d->nbits >= root + sub_bits ? -1 : 0;
+		n += root;
+	} else {
+		n = e & 0xffU;
+		if (n == 0U)
+			return d->nbits >= root ? -1 : 0;
+	}
+	if (n > d->nbits)
+		return 0;
+	*sym = e >> 16;
+	*len = n;
+	return 1;
+}
+
+/*
+ * Decode the next symbol of tab, pulling input as needed. Returns 1 with
+ * *sym set, 0 at the end of the input (nothing consumed), -1 for an invalid
+ * code.
+ */
+static int sd_symbol(ark_deflate_dec_t *d, ark_sd_io_t *io, const uint32_t *tab,
+                     unsigned int root, unsigned int *sym)
+{
+	for (;;) {
+		unsigned int len;
+		int r;
+
+		r = sd_peek(d, tab, root, sym, &len);
+		if (r < 0)
+			return -1;
+		if (r > 0) {
+			(void)sd_take(d, len);
+			return 1;
+		}
+		if (!sd_need(d, io, d->nbits + 8U))
+			return 0;
+	}
+}
+
+/*
+ * Output byte dist bytes back from the next output position: from this
+ * call's output when it is there, otherwise from the history window.
+ */
+static uint8_t sd_back_byte(const ark_deflate_dec_t *d, const ark_sd_io_t *io,
+                            size_t dist)
+{
+	if (dist <= io->op)
+		return io->out[io->op - dist];
+	return d->window[(d->wnext + d->window_size - (dist - io->op)) &
+	                 (d->window_size - 1U)];
+}
+
+/* Append this call's output to the history window. */
+static void sd_update_window(ark_deflate_dec_t *d, const uint8_t *out, size_t n)
+{
+	size_t i;
+
+	if (out == NULL || n == 0U)
+		return;
+	if (n >= d->window_size) {
+		for (i = 0; i < d->window_size; i++)
+			d->window[i] = out[n - d->window_size + i];
+		d->wnext = 0U;
+		d->whave = d->window_size;
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		d->window[d->wnext] = out[i];
+		d->wnext = (d->wnext + 1U) & (d->window_size - 1U);
+	}
+	d->whave =
+	    d->whave + n > d->window_size ? d->window_size : d->whave + n;
+}
+
+/* Finish a block: the stream ends after the final one. */
+static ark_sd_mode_t sd_block_end(const ark_deflate_dec_t *d)
+{
+	return d->last ? ARK_SD_DONE : ARK_SD_HEADER;
+}
+
+/* Read the code lengths of a dynamic block and build its tables. */
+static ark_deflate_status_t sd_read_lengths(ark_deflate_dec_t *d,
+                                            ark_sd_io_t *io)
+{
+	while (d->index < d->hlit + d->hdist) {
+		unsigned int sym;
+		unsigned int len;
+		unsigned int extra;
+		size_t rep;
+		uint8_t fill;
+		int r;
+
+		r = sd_peek(d, d->cl_tab, ARK_INFLATE_CL_ROOT, &sym, &len);
+		if (r < 0)
+			return ARK_DEFLATE_ERR_DATA;
+		if (r == 0) {
+			if (!sd_need(d, io, d->nbits + 8U))
+				return ARK_DEFLATE_NEED_INPUT;
+			continue;
+		}
+		if (sym <= 15U) {
+			(void)sd_take(d, len);
+			d->lens[d->index++] = (uint8_t)sym;
+			continue;
+		}
+		/* A repeat code and its extra bits are taken together. */
+		extra = g_cl_extra[sym];
+		if (!sd_need(d, io, len + extra))
+			return ARK_DEFLATE_NEED_INPUT;
+		(void)sd_take(d, len);
+		rep = sd_take(d, extra);
+		if (sym == 16U) {
+			if (d->index == 0U)
+				return ARK_DEFLATE_ERR_DATA;
+			fill = d->lens[d->index - 1U];
+			rep += 3U;
+		} else {
+			fill = 0U;
+			rep += sym == 17U ? 3U : 11U;
+		}
+		if (rep > d->hlit + d->hdist - d->index)
+			return ARK_DEFLATE_ERR_DATA;
+		while (rep-- > 0U)
+			d->lens[d->index++] = fill;
+	}
+
+	/* RFC 1951 section 3.2.7: every block must be able to end. */
+	if (d->lens[256] == 0U)
+		return ARK_DEFLATE_ERR_DATA;
+	if (inflate_table_build(d->dyn_lit_tab, ARK_INFLATE_LIT_TABLE, d->lens,
+	                        d->hlit, ARK_INFLATE_LIT_ROOT,
+	                        ARK_TREE_LITLEN) != 0 ||
+	    inflate_table_build(d->dyn_dist_tab, ARK_INFLATE_DIST_TABLE,
+	                        d->lens + d->hlit, d->hdist,
+	                        ARK_INFLATE_DIST_ROOT, ARK_TREE_DIST) != 0)
+		return ARK_DEFLATE_ERR_DATA;
+	d->lit_tab = d->dyn_lit_tab;
+	d->dist_tab = d->dyn_dist_tab;
+	d->lit_root = ARK_INFLATE_LIT_ROOT;
+	d->dist_root = ARK_INFLATE_DIST_ROOT;
+	return ARK_DEFLATE_OK;
+}
+
+/*
+ * Take n (<= 16) bits that br already holds. Only for sd_fast, which
+ * refills once per item; the one-shot decoder keeps br_get_bits, so its
+ * inlining there is not affected.
+ */
+static unsigned int sd_fast_take(ark_bit_reader_t *br, unsigned int n)
+{
+	unsigned int v;
+
+	v = (unsigned int)(br->bits & (((uint64_t)1U << n) - 1U));
+	br->bits >>= n;
+	br->nbits -= n;
+	return v;
+}
+
+/*
+ * Fast path for ARK_SD_CODES while at least 8 input bytes and
+ * ARK_DEFLATE_MAX_MATCH bytes of output space remain: one literal or match
+ * per iteration with the one-shot decoder's 64-bit bit reader: one refill
+ * gives at least 56 bits and an iteration reads at most 48. On exit the whole
+ * bytes still in the bit buffer were read ahead in this call and are given
+ * back, so fewer than 8 bits stay buffered, as after every slow-path item.
+ * Returns ARK_DEFLATE_OK with d->mode set to continue, or ARK_DEFLATE_ERR_DATA.
+ */
+static ark_deflate_status_t sd_fast(ark_deflate_dec_t *d, ark_sd_io_t *io)
+{
+	ark_deflate_status_t st;
+	ark_bit_reader_t br;
+
+	br.src = io->in;
+	br.len = io->in_len;
+	br.pos = io->ip;
+	br.bits = d->bits;
+	br.nbits = d->nbits;
+	st = ARK_DEFLATE_OK;
+	while (br.len - br.pos >= 8U &&
+	       io->out_cap - io->op >= ARK_DEFLATE_MAX_MATCH) {
+		unsigned int sym;
+		unsigned int li;
+		size_t len;
+		size_t dist;
+
+		br_refill(&br);
+		if (inflate_decode_sym(&br, d->lit_tab, d->lit_root, &sym) !=
+		        0 ||
+		    sym > 285U) {
+			st = ARK_DEFLATE_ERR_DATA;
+			break;
+		}
+		if (sym < 256U) {
+			io->out[io->op++] = (uint8_t)sym;
+			continue;
+		}
+		if (sym == 256U) {
+			d->mode = sd_block_end(d);
+			break;
+		}
+		li = sym - 257U;
+		len =
+		    (size_t)g_len_base[li] + sd_fast_take(&br, g_len_extra[li]);
+		if (li == 27U && len == 258U) {
+			st = ARK_DEFLATE_ERR_DATA;
+			break;
+		}
+		if (inflate_decode_sym(&br, d->dist_tab, d->dist_root, &sym) !=
+		        0 ||
+		    sym > 29U) {
+			st = ARK_DEFLATE_ERR_DATA;
+			break;
+		}
+		dist = (size_t)g_dist_base[sym] +
+		       sd_fast_take(&br, g_dist_extra[sym]);
+		/* SAFETY: as in ARK_SD_DISTEXT. */
+		if (dist > d->window_size || dist > d->whave + io->op) {
+			st = ARK_DEFLATE_ERR_DATA;
+			break;
+		}
+		if (dist <= io->op) {
+			copy_match(io->out + io->op, dist, len);
+			io->op += len;
+		} else {
+			while (len-- > 0U) {
+				io->out[io->op] = sd_back_byte(d, io, dist);
+				io->op++;
+			}
+		}
+	}
+	io->ip = br.pos - (br.nbits >> 3);
+	d->nbits = br.nbits & 7U;
+	d->bits = br.bits & (((uint64_t)1U << d->nbits) - 1U);
+	return st;
+}
+
+/*
+ * Run the state machine until the stream ends, the input runs out, the
+ * output is full or the input is malformed.
+ */
+static ark_deflate_status_t sd_run(ark_deflate_dec_t *d, ark_sd_io_t *io)
+{
+	for (;;) {
+		unsigned int v;
+		unsigned int sym;
+		int r;
+
+		switch (d->mode) {
+		case ARK_SD_HEADER:
+			if (!sd_need(d, io, 3U))
+				return ARK_DEFLATE_NEED_INPUT;
+			d->last = (int)sd_take(d, 1U);
+			v = sd_take(d, 2U);
+			if (v == 0U) {
+				/* Stored data starts at the next byte; fewer
+				 * than 8 bits are buffered. */
+				(void)sd_take(d, d->nbits);
+				d->mode = ARK_SD_STORED_LEN;
+			} else if (v == 1U) {
+				d->lit_tab = d->fixed_lit_tab;
+				d->dist_tab = d->fixed_dist_tab;
+				d->lit_root = ARK_INFLATE_FIXED_LIT_ROOT;
+				d->dist_root = ARK_INFLATE_FIXED_DIST_ROOT;
+				d->mode = ARK_SD_CODES;
+			} else if (v == 2U) {
+				d->mode = ARK_SD_TABLE;
+			} else {
+				return ARK_DEFLATE_ERR_DATA;
+			}
+			break;
+		case ARK_SD_STORED_LEN:
+			if (!sd_need(d, io, 32U))
+				return ARK_DEFLATE_NEED_INPUT;
+			d->length = sd_take(d, 16U);
+			if ((sd_take(d, 16U) ^ 0xffffU) != d->length)
+				return ARK_DEFLATE_ERR_DATA;
+			d->mode = ARK_SD_STORED_COPY;
+			break;
+		case ARK_SD_STORED_COPY:
+			while (d->length > 0U) {
+				if (io->op == io->out_cap)
+					return ARK_DEFLATE_NEED_OUTPUT;
+				if (io->ip == io->in_len)
+					return ARK_DEFLATE_NEED_INPUT;
+				io->out[io->op++] = io->in[io->ip++];
+				d->length--;
+			}
+			d->mode = sd_block_end(d);
+			break;
+		case ARK_SD_TABLE:
+			if (!sd_need(d, io, 14U))
+				return ARK_DEFLATE_NEED_INPUT;
+			d->hlit = (size_t)sd_take(d, 5U) + 257U;
+			d->hdist = (size_t)sd_take(d, 5U) + 1U;
+			d->hclen = (size_t)sd_take(d, 4U) + 4U;
+			if (d->hlit > 286U)
+				return ARK_DEFLATE_ERR_DATA;
+			for (v = 0; v < 19U; v++)
+				d->cl_len[v] = 0U;
+			d->index = 0U;
+			d->mode = ARK_SD_CLENS;
+			break;
+		case ARK_SD_CLENS:
+			while (d->index < d->hclen) {
+				if (!sd_need(d, io, 3U))
+					return ARK_DEFLATE_NEED_INPUT;
+				d->cl_len[g_cl_order[d->index++]] =
+				    (uint8_t)sd_take(d, 3U);
+			}
+			if (inflate_table_build(
+			        d->cl_tab, ARK_INFLATE_CL_TABLE, d->cl_len, 19U,
+			        ARK_INFLATE_CL_ROOT, ARK_TREE_CODELEN) != 0)
+				return ARK_DEFLATE_ERR_DATA;
+			d->index = 0U;
+			d->mode = ARK_SD_LENS;
+			break;
+		case ARK_SD_LENS: {
+			ark_deflate_status_t st;
+
+			st = sd_read_lengths(d, io);
+			if (st != ARK_DEFLATE_OK)
+				return st;
+			d->mode = ARK_SD_CODES;
+			break;
+		}
+		case ARK_SD_CODES:
+			if (io->in_len - io->ip >= 8U &&
+			    io->out_cap - io->op >= ARK_DEFLATE_MAX_MATCH) {
+				if (sd_fast(d, io) != ARK_DEFLATE_OK)
+					return ARK_DEFLATE_ERR_DATA;
+				break;
+			}
+			r = sd_symbol(d, io, d->lit_tab, d->lit_root, &sym);
+			if (r == 0)
+				return ARK_DEFLATE_NEED_INPUT;
+			if (r < 0 || sym > 285U)
+				return ARK_DEFLATE_ERR_DATA;
+			if (sym < 256U) {
+				d->literal = (uint8_t)sym;
+				d->mode = ARK_SD_LIT;
+			} else if (sym == 256U) {
+				d->mode = sd_block_end(d);
+			} else {
+				d->len_index = sym - 257U;
+				d->mode = ARK_SD_LENEXT;
+			}
+			break;
+		case ARK_SD_LIT:
+			if (io->op == io->out_cap)
+				return ARK_DEFLATE_NEED_OUTPUT;
+			io->out[io->op++] = d->literal;
+			d->mode = ARK_SD_CODES;
+			break;
+		case ARK_SD_LENEXT:
+			if (!sd_need(d, io, g_len_extra[d->len_index]))
+				return ARK_DEFLATE_NEED_INPUT;
+			d->length = (size_t)g_len_base[d->len_index] +
+			            sd_take(d, g_len_extra[d->len_index]);
+			/* RFC 1951 section 3.2.5: 258 is code 285 only. */
+			if (d->len_index == 27U && d->length == 258U)
+				return ARK_DEFLATE_ERR_DATA;
+			d->mode = ARK_SD_DIST;
+			break;
+		case ARK_SD_DIST:
+			r = sd_symbol(d, io, d->dist_tab, d->dist_root, &sym);
+			if (r == 0)
+				return ARK_DEFLATE_NEED_INPUT;
+			if (r < 0 || sym > 29U)
+				return ARK_DEFLATE_ERR_DATA;
+			d->len_index = sym;
+			d->mode = ARK_SD_DISTEXT;
+			break;
+		case ARK_SD_DISTEXT:
+			if (!sd_need(d, io, g_dist_extra[d->len_index]))
+				return ARK_DEFLATE_NEED_INPUT;
+			d->dist = (size_t)g_dist_base[d->len_index] +
+			          sd_take(d, g_dist_extra[d->len_index]);
+			/*
+			 * SAFETY: a match must reference bytes already
+			 * produced (this call's output or the history) and
+			 * inside the window; anything else is malformed.
+			 */
+			if (d->dist > d->window_size ||
+			    d->dist > d->whave + io->op)
+				return ARK_DEFLATE_ERR_DATA;
+			d->mode = ARK_SD_COPY;
+			break;
+		case ARK_SD_COPY:
+			while (d->length > 0U) {
+				if (io->op == io->out_cap)
+					return ARK_DEFLATE_NEED_OUTPUT;
+				io->out[io->op] = sd_back_byte(d, io, d->dist);
+				io->op++;
+				d->length--;
+			}
+			d->mode = ARK_SD_CODES;
+			break;
+		case ARK_SD_DONE:
+			/* Padding bits of the last byte belong to the stream.
+			 */
+			(void)sd_take(d, d->nbits);
+			return ARK_DEFLATE_END;
+		case ARK_SD_ERROR:
+		default:
+			return ARK_DEFLATE_ERR_DATA;
+		}
+	}
+}
+
+size_t ark_deflate_dec_size(unsigned int window_bits)
+{
+	if (window_bits < ARK_DEFLATE_MIN_WINDOW_BITS ||
+	    window_bits > ARK_DEFLATE_MAX_WINDOW_BITS)
+		return 0U;
+	return sizeof(struct ark_deflate_dec) + ((size_t)1U << window_bits);
+}
+
+ark_deflate_dec_t *ark_deflate_dec_init(void *mem, size_t mem_len,
+                                        unsigned int window_bits)
+{
+	ark_deflate_dec_t *d;
+	size_t size;
+
+	size = ark_deflate_dec_size(window_bits);
+	if (mem == NULL || size == 0U || mem_len < size)
+		return NULL;
+	if ((uintptr_t)mem % _Alignof(uint64_t) != 0U)
+		return NULL;
+
+	d = mem;
+	d->window_size = (size_t)1U << window_bits;
+	if (build_fixed_decode_tables(d->fixed_lit_tab, d->fixed_dist_tab) != 0)
+		return NULL;
+	ark_deflate_dec_reset(d, 0);
+	return d;
+}
+
+void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history)
+{
+	if (dec == NULL)
+		return;
+	dec->bits = 0U;
+	dec->nbits = 0U;
+	dec->mode = ARK_SD_HEADER;
+	dec->last = 0;
+	dec->lit_tab = dec->fixed_lit_tab;
+	dec->dist_tab = dec->fixed_dist_tab;
+	dec->lit_root = ARK_INFLATE_FIXED_LIT_ROOT;
+	dec->dist_root = ARK_INFLATE_FIXED_DIST_ROOT;
+	dec->length = 0U;
+	dec->dist = 0U;
+	if (!keep_history) {
+		dec->whave = 0U;
+		dec->wnext = 0U;
+	}
+}
+
+/*
+ * ark_deflate_dec_stream - Decode the next piece of a raw RFC 1951 stream.
+ * See ARCHITECTURE.md section 7.4.
+ */
+ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
+                                            const uint8_t *in, size_t in_len,
+                                            size_t *in_used, uint8_t *out,
+                                            size_t out_cap, size_t *out_used)
+{
+	ark_sd_io_t io;
+	ark_deflate_status_t st;
+
+	if (in_used == NULL || out_used == NULL)
+		return ARK_DEFLATE_ERR_USAGE;
+	*in_used = 0U;
+	*out_used = 0U;
+	if (dec == NULL || (in == NULL && in_len != 0U) ||
+	    (out == NULL && out_cap != 0U))
+		return ARK_DEFLATE_ERR_USAGE;
+
+	io.in = in;
+	io.in_len = in_len;
+	io.ip = 0U;
+	io.out = out;
+	io.out_cap = out_cap;
+	io.op = 0U;
+	st = sd_run(dec, &io);
+	if (st == ARK_DEFLATE_ERR_DATA)
+		dec->mode = ARK_SD_ERROR;
+	sd_update_window(dec, out, io.op);
+	*in_used = io.ip;
+	*out_used = io.op;
+	return st;
+}
+
 #ifdef ARK_DEFLATE_TEST
 /*
  * ARK_DEFLATE_TEST-only accessors for encoder internals and a window-limited

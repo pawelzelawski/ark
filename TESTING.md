@@ -252,6 +252,12 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_default_matches_across_blocks` | 1 MiB of one repeated 16 KiB random piece: the single parse lets each block match into the previous one, so the output stays below 32 KiB (140,305 bytes before, 23,854 now); round-trip identity |
 | `test_deflate_levels_round_trip` | 300,000 bytes of word text round-trip at every level 0..9; level 0 is stored blocks only (exactly the bound minus its padding byte); sizes shrink from stored to levels 1, 3 and 6, and level 9 is not larger than level 6 |
 | `test_deflate_default_token_buffer_full` | Input of exactly `max_input` mostly literal bytes fills the token buffer of an exactly sized encoder (ASan catches an overrun); the reused encoder then matches a fresh one |
+| `test_deflate_dec_stream_splits` | Stored, fixed, dynamic and level-1 streams plus junk bytes decode with `ark_deflate_dec_stream` whole, one input byte per call, one output byte per call and in random pieces: `END`, `in_used` exactly the stream size, original bytes |
+| `test_deflate_dec_stream_sync_flush` | Hand-built RFC 7692 messages without a final block end in a sync flush: `NEED_INPUT` with all input used; the second message copies from the first (history), also one output byte per call; history kept by `reset(.., 1)`, invalid after `reset(.., 0)`; the error stays until reset |
+| `test_deflate_dec_stream_window_limit` | A decoder rejects distances beyond its window bits: a window-15 stream with ~32 KiB distances fails at 14; far matches mid-stream fail whole (fast path) and one output byte per call, and a far match in the last input bytes fails (slow path); a window-9 stream decodes at 9 in random pieces |
+| `test_deflate_dec_stream_concatenated` | Back-to-back streams: each `END` at its exact size, later calls return `END` consuming nothing, `reset` starts the next |
+| `test_deflate_dec_stream_errors` | Size query and init checks (window bits 7/16, short and misaligned memory); usage errors consume nothing; truncation is `NEED_INPUT` and the rest completes the stream; reserved block type, stored LEN/NLEN mismatch and 284 + 31 are `ERR_DATA`; 284 + 30 decodes |
+| `test_deflate_dec_stream_fuzz` | 400 mutated default- and fast-level streams (fixed seed): streaming agrees with the one-shot decoder (same bytes and `in_used` on success, `ERR_DATA` or `NEED_INPUT` where it reports malformed input, `NEED_OUTPUT` on overflow) and random pieces give the same result as whole input |
 
 ### 3.4 Archive Write Path (`test_archive.c`)
 

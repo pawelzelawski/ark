@@ -213,3 +213,23 @@ levels 3 and 5; zlib's row gave 31.630 % at 0.64 s, larger than level 3):
 |---|---|---|---|---|---|---|---|---|---|---|
 | Compress (s) | 0.00 | 0.50 | 0.55 | 0.71 | 0.78 | 0.88 | 1.32 | 1.43 | 1.60 | 1.72 |
 | Ratio (%) | 100.008 | 33.844 | 32.577 | 31.458 | 30.895 | 30.759 | 30.368 | 30.332 | 30.320 | 30.318 |
+
+**Streaming decoder** (`ark_deflate_dec_stream`, new; ark itself keeps the
+one-shot decoder). A fast loop with the 64-bit bit reader runs while at
+least 8 input bytes and 258 bytes of output space remain; without it the
+byte-at-a-time state machine decoded the `/usr/include` streams at 187 MB/s
+against 357 MB/s one-shot. Best of 3, pinned, three rounds, whole buffers:
+
+| Data | One-shot | Streaming |
+|---|---|---|
+| `/usr/include` per file, 7,661 streams | 351-356 MB/s | 343-350 MB/s |
+| 32 MiB corpus slice, 32 streams of 1 MiB | 244-246 MB/s | 267-270 MB/s |
+
+The one-shot decoder's code is unchanged. A first version of the fast loop
+shared `br_get_bits` with it, which made the compiler stop inlining that
+helper into the one-shot loop (+8 % instructions); the fast loop now takes
+its bits with its own helper and the one-shot instruction count is back to
+before (5.252 -> 5.256 G). The tools' one-shot build still measures about
+4 % slower (3.21 -> 3.40 G cycles) but equal with both builds aligned the
+same way (3.34-3.39 vs 3.36-3.39 G), so the difference is code placement;
+`ark verify` of the `/usr/include` archive is 0.401 -> 0.383 s (best of 5).
