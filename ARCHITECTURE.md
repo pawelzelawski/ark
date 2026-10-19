@@ -1248,6 +1248,16 @@ again on a finished context is invalid; `init` makes it usable again. The
 SHA-256 message schedule is a local array of the block function, so the
 context holds only the running state, the partial block and the counters.
 
+**Portable speed (BLAKE3).** The compression function writes its G
+operation and round as macros and its seven rounds out in full, so every
+state index is a constant and compilers keep the state in registers; as
+functions, gcc did not inline the G calls and ran at about half of clang's
+speed. `update` compresses whole blocks straight from the caller's input
+(except a chunk's last block, which `final` may still need to mark as the
+chunk end) instead of copying them into the context first. Both compilers
+then reach about 600 MB/s on one core of the reference machine
+(PERFORMANCE_IMPROVEMENTS.md); the code stays plain C11 with no intrinsics.
+
 **Output length.** Both APIs produce exactly 32 bytes of output, matching the
 hash field size in the index entry. BLAKE3 natively supports variable-length
 output; that capability is intentionally not exposed. ark has no use for output

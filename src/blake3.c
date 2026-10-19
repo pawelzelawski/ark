@@ -86,33 +86,38 @@ static size_t chunk_len(const ark_blake3_ctx_t *ctx)
 	       ctx->block_len;
 }
 
-/* One BLAKE3 G mixing operation over four state words and two message words. */
-static void g_mix(uint32_t state[16], size_t a, size_t b, size_t c, size_t d,
-                  uint32_t mx, uint32_t my)
-{
-	state[a] = state[a] + state[b] + mx;
-	state[d] = rotr32(state[d] ^ state[a], 16);
-	state[c] += state[d];
-	state[b] = rotr32(state[b] ^ state[c], 12);
-	state[a] = state[a] + state[b] + my;
-	state[d] = rotr32(state[d] ^ state[a], 8);
-	state[c] += state[d];
-	state[b] = rotr32(state[b] ^ state[c], 7);
-}
+/*
+ * One BLAKE3 G mixing operation over four state words and two message
+ * words. G and the round are macros, and the seven rounds are written out,
+ * so every state index is a constant: compilers then keep the state in
+ * registers. As functions, gcc does not inline the 56 G calls per block and
+ * runs at about half of clang's speed (ARCHITECTURE.md §8.4).
+ */
+#define BLAKE3_G(s, a, b, c, d, mx, my)                                        \
+	do {                                                                   \
+		(s)[(a)] = (s)[(a)] + (s)[(b)] + (mx);                         \
+		(s)[(d)] = rotr32((s)[(d)] ^ (s)[(a)], 16);                    \
+		(s)[(c)] += (s)[(d)];                                          \
+		(s)[(b)] = rotr32((s)[(b)] ^ (s)[(c)], 12);                    \
+		(s)[(a)] = (s)[(a)] + (s)[(b)] + (my);                         \
+		(s)[(d)] = rotr32((s)[(d)] ^ (s)[(a)], 8);                     \
+		(s)[(c)] += (s)[(d)];                                          \
+		(s)[(b)] = rotr32((s)[(b)] ^ (s)[(c)], 7);                     \
+	} while (0)
 
-/* Execute one BLAKE3 round with the provided message permutation. */
-static void round_fn(uint32_t state[16], const uint32_t m[16],
-                     const uint8_t sched[16])
-{
-	g_mix(state, 0, 4, 8, 12, m[sched[0]], m[sched[1]]);
-	g_mix(state, 1, 5, 9, 13, m[sched[2]], m[sched[3]]);
-	g_mix(state, 2, 6, 10, 14, m[sched[4]], m[sched[5]]);
-	g_mix(state, 3, 7, 11, 15, m[sched[6]], m[sched[7]]);
-	g_mix(state, 0, 5, 10, 15, m[sched[8]], m[sched[9]]);
-	g_mix(state, 1, 6, 11, 12, m[sched[10]], m[sched[11]]);
-	g_mix(state, 2, 7, 8, 13, m[sched[12]], m[sched[13]]);
-	g_mix(state, 3, 4, 9, 14, m[sched[14]], m[sched[15]]);
-}
+/* One BLAKE3 round with message permutation r of blake3_msg_schedule. */
+#define BLAKE3_ROUND(s, m, r)                                                  \
+	do {                                                                   \
+		const uint8_t *sc_ = blake3_msg_schedule[(r)];                 \
+		BLAKE3_G((s), 0, 4, 8, 12, (m)[sc_[0]], (m)[sc_[1]]);          \
+		BLAKE3_G((s), 1, 5, 9, 13, (m)[sc_[2]], (m)[sc_[3]]);          \
+		BLAKE3_G((s), 2, 6, 10, 14, (m)[sc_[4]], (m)[sc_[5]]);         \
+		BLAKE3_G((s), 3, 7, 11, 15, (m)[sc_[6]], (m)[sc_[7]]);         \
+		BLAKE3_G((s), 0, 5, 10, 15, (m)[sc_[8]], (m)[sc_[9]]);         \
+		BLAKE3_G((s), 1, 6, 11, 12, (m)[sc_[10]], (m)[sc_[11]]);       \
+		BLAKE3_G((s), 2, 7, 8, 13, (m)[sc_[12]], (m)[sc_[13]]);        \
+		BLAKE3_G((s), 3, 4, 9, 14, (m)[sc_[14]], (m)[sc_[15]]);        \
+	} while (0)
 
 /* Compress one BLAKE3 block and return the 16-word output state. */
 static void blake3_compress(const uint32_t cv[8], const uint32_t block[16],
@@ -131,8 +136,13 @@ static void blake3_compress(const uint32_t cv[8], const uint32_t block[16],
 	state[14] = block_len;
 	state[15] = flags;
 
-	for (i = 0; i < 7; i++)
-		round_fn(state, block, blake3_msg_schedule[i]);
+	BLAKE3_ROUND(state, block, 0);
+	BLAKE3_ROUND(state, block, 1);
+	BLAKE3_ROUND(state, block, 2);
+	BLAKE3_ROUND(state, block, 3);
+	BLAKE3_ROUND(state, block, 4);
+	BLAKE3_ROUND(state, block, 5);
+	BLAKE3_ROUND(state, block, 6);
 
 	for (i = 0; i < 8; i++) {
 		out[i] = state[i] ^ state[i + 8];
@@ -297,6 +307,32 @@ void ark_blake3_update(ark_blake3_ctx_t *ctx, const uint8_t *data, size_t len)
 			ctx->blocks_compressed++;
 			ctx->block_len = 0;
 			zero_bytes(ctx->block, sizeof(ctx->block));
+		}
+
+		/*
+		 * Whole blocks that are not their chunk's last block are
+		 * compressed straight from the input, without the copy into
+		 * ctx->block, when more input follows them.
+		 */
+		while (ctx->block_len == 0U && len > BLAKE3_BLOCK_LEN &&
+		       ctx->blocks_compressed + 1U <
+		           BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN) {
+			uint32_t block_words[16];
+			uint32_t out_words[16];
+			size_t i;
+
+			block_to_words(data, block_words);
+			blake3_compress(ctx->cv, block_words,
+			                ctx->chunk_counter, BLAKE3_BLOCK_LEN,
+			                ctx->blocks_compressed == 0
+			                    ? BLAKE3_FLAG_CHUNK_START
+			                    : 0U,
+			                out_words);
+			for (i = 0; i < 8; i++)
+				ctx->cv[i] = out_words[i];
+			ctx->blocks_compressed++;
+			data += BLAKE3_BLOCK_LEN;
+			len -= BLAKE3_BLOCK_LEN;
 		}
 
 		n = BLAKE3_BLOCK_LEN - ctx->block_len;

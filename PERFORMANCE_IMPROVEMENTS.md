@@ -239,3 +239,23 @@ it). Portable C with the modulo once per 5552 bytes: 64 MiB, best of 5,
 pinned: 2,231 MB/s with clang, 1,665 MB/s with gcc (zlib-ng's SIMD version:
 13,817 MB/s). That is several times the Deflate decoder's speed, so the
 trailer check does not limit zlib-format decoding.
+
+**BLAKE3 portable speed** (ark's default hash; it hashes the compressed
+bytes of every chunk on the I/O thread). gcc did not inline the 56 G calls
+per block (its heuristics called them cold), so the state lived in memory
+and gcc ran at about half of clang's speed. G and the round became macros
+with the seven rounds written out (constant state indices), and `update`
+compresses whole blocks straight from the input instead of copying and
+zeroing a 64-byte buffer per block. Plain C11, digests unchanged. 128 MiB
+one-shot, best of 5, pinned, three rounds:
+
+| Compiler | Before | After |
+|---|---|---|
+| clang 22 | 469-471 MB/s | 606-615 MB/s |
+| gcc 16 | 252-257 MB/s | 588-592 MB/s |
+
+Short inputs (ns per one-shot hash, clang / gcc): 64 B 251 -> 198 /
+452 -> 228; 1 KiB 2,126 -> 1,639 / 3,955 -> 1,728; 4 KiB 8,577 -> 6,654 /
+16,261 -> 6,875. Unrolling alone (without the direct-input path) gave
+clang ~597 and gcc ~493 MB/s; a local copy of the message words changed
+nothing.
