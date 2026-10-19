@@ -546,8 +546,8 @@ output buffers and its own Deflate encoder, with no shared state.
 `pool_init` allocates, per compress worker, an input buffer of
 `ARK_CHUNK_SIZE`, an output buffer of `ark_deflate_bound(ARK_CHUNK_SIZE)` and
 the encoder memory reported by `ark_deflate_enc_size` (level from the CLI,
-`window_bits` 15, `max_input` `ARK_CHUNK_SIZE`: about 4.25 MiB at the default
-level, about 256 KiB with `--fast`; see section 7.4). The pool is
+`window_bits` 15, `max_input` `ARK_CHUNK_SIZE`: about 4.25 MiB, with or
+without `--fast`; see section 7.4). The pool is
 created once per command, so no memory is allocated per chunk. The Deflate
 component itself keeps no global or thread-local state. Compressed results
 are placed into
@@ -697,18 +697,19 @@ stored block instead. This is essential for already-compressed content
 (JPEG, video, existing archives). The chunk size entry in the index
 records the stored block size; the reader handles both cases transparently.
 
-**Lazy matching for archival mode.** The default level parses each input
-once, into a token buffer of literals and matches, and cuts blocks from
-that token stream afterwards. Because the hash chains span the whole input,
+**Lazy matching for archival mode.** Every compressing level parses each
+input once, into a token buffer of literals and matches, and cuts blocks
+from that token stream afterwards. Because the hash chains span the whole input,
 matches reach back across block boundaries within the window. At each
-position the parser searches the hash chain for the longest match (up to
-128 candidates, stopping at a 258-byte match) and defers a match by one
-position, emitting a literal instead, when the next position offers a
-longer match (lazy evaluation as in zlib's default levels; after a match
-of 32 bytes or more the look-ahead searches a quarter of the chain). It
-does not compute an optimal parse; an optimal parser remains an allowed
-improvement under §17. Archival mode is the default; `--fast` uses greedy
-parsing with a shorter search and no token buffer.
+position the parser searches the hash chain for the longest match. At the
+default level it tries up to 128 candidates, stops at a 258-byte match and
+defers a match by one position, emitting a literal instead, when the next
+position offers a longer match (lazy evaluation as in zlib's default
+levels; after a match of 32 bytes or more the look-ahead searches a quarter
+of the chain). The other levels change only these search limits (section
+7.4). It does not compute an optimal parse; an optimal parser remains an
+allowed improvement under §17. Archival mode is the default; `--fast`
+(level 1) matches greedily with a short search.
 
 **Aggressive block boundary decisions.** Deflate divides compressed data
 into blocks, each with its own Huffman table. Choosing block boundaries
@@ -754,8 +755,11 @@ later on the same types.
    archive.h (section 6.2), is checked against it at compile time. */
 #define ARK_DEFLATE_MAX_INPUT 1048576U
 
-#define ARK_DEFLATE_LEVEL_FAST    1   /* greedy parsing, one fixed block (--fast) */
-#define ARK_DEFLATE_LEVEL_DEFAULT 6   /* single lazy parse + cost-chosen blocks */
+/* Levels 0..9, zlib numbering. */
+#define ARK_DEFLATE_LEVEL_NONE    0   /* stored blocks only */
+#define ARK_DEFLATE_LEVEL_FAST    1   /* greedy, short search (--fast) */
+#define ARK_DEFLATE_LEVEL_DEFAULT 6   /* lazy matching (ark's default) */
+#define ARK_DEFLATE_LEVEL_BEST    9   /* lazy matching, longest search */
 #define ARK_DEFLATE_MIN_WINDOW_BITS 8U
 #define ARK_DEFLATE_MAX_WINDOW_BITS 15U
 
@@ -768,7 +772,7 @@ typedef enum {
 } ark_deflate_status_t;
 
 typedef struct {
-    int          level;        /* ARK_DEFLATE_LEVEL_FAST or _DEFAULT */
+    int          level;        /* ARK_DEFLATE_LEVEL_NONE..ARK_DEFLATE_LEVEL_BEST */
     unsigned int window_bits;  /* 8..15: no distance exceeds 1 << window_bits */
     size_t       max_input;    /* 1..ARK_DEFLATE_MAX_INPUT */
     int          streaming;    /* must be 0 for now */
@@ -822,25 +826,46 @@ its recovery reader do not). The decoder uses no workspace: its Huffman
 tables live on the stack, sized for the worst-case code (about 28 KiB in a
 dynamic block).
 
-**Level semantics.** `ARK_DEFLATE_LEVEL_DEFAULT` uses one lazy-matching
-parse and cost-based block boundary and block type decisions (section 7.2).
-This is the default level used by the
-`ark` CLI. `ARK_DEFLATE_LEVEL_FAST` uses greedy parsing for users who
-explicitly prioritise compression speed over ratio, enabled via the `--fast`
-CLI flag. Levels use zlib's numbering; other levels are not accepted yet.
+**Level semantics.** Levels use zlib's numbering, 0..9. Level 0 writes
+stored blocks only. Levels 1..9 share one encoder (section 7.2: one parse,
+cost-based block boundaries and block types) and differ only in the match
+search, set by a table adapted from zlib's: hash-chain candidates per search
+(`max_chain`), the match length that ends a search (`nice`), the length
+below which a match is checked against the next position (`lazy`; 0 means
+greedy) and the length after which that look-ahead searches a quarter of
+the chain (`good`):
+
+| Level | max_chain | nice | lazy | good |
+|---|---|---|---|---|
+| 1 (`ARK_DEFLATE_LEVEL_FAST`, `--fast`) | 4 | 8 | greedy | - |
+| 2 | 8 | 16 | greedy | - |
+| 3 | 32 | 32 | greedy | - |
+| 4 | 32 | 32 | 8 | 4 |
+| 5 | 32 | 32 | 16 | 8 |
+| 6 (`ARK_DEFLATE_LEVEL_DEFAULT`, ark's default) | 128 | 258 | 258 | 32 |
+| 7 | 256 | 258 | 258 | 32 |
+| 8 | 1024 | 258 | 258 | 32 |
+| 9 (`ARK_DEFLATE_LEVEL_BEST`) | 4096 | 258 | 258 | 32 |
+
+Level 6 is the search of v1.2's single-pass compressor and must not change,
+so ark's default output stays the same; level 4 uses a longer search than
+zlib's level 4 so that it is smaller than level 3. On the first 32 MiB of
+the mixed corpus (one thread) levels 1, 3, 6 and 9 compress at about 67,
+47, 25 and 19 MB/s to 33.8, 31.5, 30.4 and 30.3 %
+(PERFORMANCE_IMPROVEMENTS.md). The `ark` CLI uses level 6, or level 1 with
+`--fast`; other levels are available to library users only.
 
 **Encoder memory and window.** The encoder memory holds the hash-chain match
 finder: a head table of `1 << window_bits` entries and a chain table of
 `1 << window_bits` entries, 4 bytes each, plus a small header. At
-`window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. The default level
-adds a token buffer of 4 bytes per `max_input` byte (4 MiB at 1 MiB, 256 KiB
-at 64 KiB); the fast level needs none. Matches never reach further back than
+`window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. A token buffer of
+4 bytes per `max_input` byte follows (4 MiB at 1 MiB, 256 KiB at 64 KiB).
+Level 0 needs only the small header. Matches never reach further back than
 `1 << window_bits` bytes, so a smaller window (for example one negotiated
 under RFC 7692) is honored exactly. ark uses `window_bits` 15, the RFC 1951
-maximum. Its fast-level output is identical to earlier releases; the
-default level's output changed in v1.2 with the single parse (smaller, and
-still one valid RFC 1951 stream per chunk; section 13.1 scopes determinism to
-one binary).
+maximum. ark's output changed in v1.2 at both of its levels (single parse;
+smaller, and still one valid RFC 1951 stream per chunk; section 13.1 scopes
+determinism to one binary).
 
 **Encoder rules.** The memory must stay in place (the encoder points into
 it) and is released by freeing it. One encoder serves any number of
@@ -1532,7 +1557,8 @@ ark generate-reader [output.c]
 
 **create flags:**
 - `--hash blake3|sha256` - select hash algorithm; default BLAKE3
-- `--fast` - greedy Deflate parsing; faster compression, lower ratio
+- `--fast` - Deflate level 1 (greedy parsing, short search); faster
+  compression, lower ratio
 - `--verbose` - print each member path as it is added
 - `path` - source file or directory; single file or full directory tree
 
@@ -2348,7 +2374,7 @@ regardless of caller behaviour.
 
 ```c
 /* Initialise a write context. hash_alg and the compression level
-   (ARK_DEFLATE_LEVEL_FAST or ARK_DEFLATE_LEVEL_DEFAULT) apply to all
+   (ark uses ARK_DEFLATE_LEVEL_FAST or ARK_DEFLATE_LEVEL_DEFAULT) apply to all
    subsequent operations on this context. Returns 0 on success, -1 on
    error. */
 int ark_write_init(ark_write_ctx_t    *ctx,

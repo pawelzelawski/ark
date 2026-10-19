@@ -82,11 +82,6 @@ typedef enum {
 	ARK_TREE_DIST,
 } ark_tree_kind_t;
 
-typedef struct {
-	size_t len;
-	size_t dist;
-} ark_match_t;
-
 /*
  * Hash-chain match finder. head has 1 << hash_bits entries (newest position
  * per hash, -1 for none); prev has window_size entries indexed by
@@ -103,19 +98,35 @@ typedef struct {
 /*
  * Encoder state. The struct sits at the start of the caller's memory; tables
  * holds the match-finder arrays: head (1 << hash_bits entries), then prev
- * (window_size entries), then at the default level the token buffer
- * (max_input entries; NULL tokens at the fast level).
+ * (window_size entries), then the token buffer (max_input entries). Level 0
+ * has no tables (head, prev and tokens are NULL).
  */
+/*
+ * Match-search parameters of one compression level (zlib's
+ * configuration table, adapted). max_chain: hash-chain candidates tried
+ * per search; nice_len: a match this long ends the search; max_lazy:
+ * matches shorter than this are checked against the next position's match
+ * (0 means greedy: every match found is taken); good_len: after a match of
+ * at least this length, the look-ahead tries max_chain / 4 candidates.
+ */
+typedef struct {
+	uint16_t max_chain;
+	uint16_t nice_len;
+	uint16_t max_lazy;
+	uint16_t good_len;
+} ark_level_params_t;
+
 struct ark_deflate_enc {
 	ark_match_finder_t mf;
 	uint32_t *tokens;
+	ark_level_params_t lp;
 	int level;
 	size_t max_input;
 	int32_t tables[];
 };
 
 /*
- * Default-level tokens, one uint32_t per literal or match. A literal is its
+ * Encoder tokens, one uint32_t per literal or match. A literal is its
  * byte value. A match sets ARK_TOKEN_MATCH and holds length - 3 in bits
  * 15..22 and distance - 1 in bits 0..14 (distances never exceed 32768).
  */
@@ -124,13 +135,23 @@ struct ark_deflate_enc {
 #define ARK_TOKEN_DIST_MASK 0x7fffU
 
 /*
- * Default-level match search (the zlib level 6 values): at most 128 chain
- * candidates, a quarter of that for the lazy look-ahead after a match of 32
- * or more, and no early stop before the longest possible match.
+ * Search parameters per level 1..9 (level 0 stores without searching).
+ * Levels 1-3 match greedily, 4-9 lazily. Level 6 (the default) is the
+ * search of v1.2's single-pass compressor and must not change, so that
+ * default-level output stays byte-identical.
  */
-#define ARK_DEFAULT_MAX_CHAIN 128U
-#define ARK_DEFAULT_GOOD_LEN 32U
-#define ARK_DEFAULT_NICE_LEN ARK_DEFLATE_MAX_MATCH
+static const ark_level_params_t g_level_params[10] = {
+    {0U, 0U, 0U, 0U},         /* 0: stored blocks only */
+    {4U, 8U, 0U, 0U},         /* 1: fast */
+    {8U, 16U, 0U, 0U},        /* 2 */
+    {32U, 32U, 0U, 0U},       /* 3 */
+    {32U, 32U, 8U, 4U},       /* 4 */
+    {32U, 32U, 16U, 8U},      /* 5 */
+    {128U, 258U, 258U, 32U},  /* 6: default */
+    {256U, 258U, 258U, 32U},  /* 7 */
+    {1024U, 258U, 258U, 32U}, /* 8 */
+    {4096U, 258U, 258U, 32U}, /* 9 */
+};
 
 typedef struct {
 	uint32_t lit[286];
@@ -607,97 +628,6 @@ static int emit_stored_blocks(const uint8_t *src, size_t src_len, uint8_t *dst,
 	return (int)bw.pos;
 }
 
-/* RFC 1951 fixed literal/length code descriptor. */
-static void fixed_lit_code(unsigned int sym, uint16_t *code,
-                           unsigned int *nbits)
-{
-	if (sym <= 143U) {
-		*nbits = 8U;
-		*code = bit_reverse((uint16_t)(0x30U + sym), *nbits);
-		return;
-	}
-	if (sym <= 255U) {
-		*nbits = 9U;
-		*code = bit_reverse((uint16_t)(0x190U + (sym - 144U)), *nbits);
-		return;
-	}
-	if (sym <= 279U) {
-		*nbits = 7U;
-		*code = bit_reverse((uint16_t)(sym - 256U), *nbits);
-		return;
-	}
-	*nbits = 8U;
-	*code = bit_reverse((uint16_t)(0xc0U + (sym - 280U)), *nbits);
-}
-
-/* RFC 1951 fixed distance code descriptor. */
-static void fixed_dist_code(unsigned int sym, uint16_t *code,
-                            unsigned int *nbits)
-{
-	*nbits = 5U;
-	*code = bit_reverse((uint16_t)sym, *nbits);
-}
-
-/* Map match length [3..258] to Deflate length symbol + extra bits. */
-static int length_symbol(size_t len, unsigned int *sym, unsigned int *extra_n,
-                         uint16_t *extra_v)
-{
-	unsigned int i;
-
-	if (len < ARK_DEFLATE_MIN_MATCH || len > ARK_DEFLATE_MAX_MATCH)
-		return -1;
-	/*
-	 * RFC 1951 section 3.2.5: code 284 covers 227..257 and length 258 has
-	 * its own code 285 with no extra bits. Code 284 with extra value 31
-	 * also decodes as 258, so check 285 first rather than relying on the
-	 * table scan order. Decoders keep accepting the 284 form.
-	 */
-	if (len == ARK_DEFLATE_MAX_MATCH) {
-		*sym = 285U;
-		*extra_n = 0U;
-		*extra_v = 0U;
-		return 0;
-	}
-	for (i = 0; i < 28U; i++) {
-		size_t base;
-		size_t max;
-
-		base = g_len_base[i];
-		max = base + ((size_t)1U << g_len_extra[i]) - 1U;
-		if (len < base || len > max)
-			continue;
-		*sym = 257U + i;
-		*extra_n = g_len_extra[i];
-		*extra_v = (uint16_t)(len - base);
-		return 0;
-	}
-	return -1;
-}
-
-/* Map distance [1..32768] to Deflate distance symbol + extra bits. */
-static int distance_symbol(size_t dist, unsigned int *sym,
-                           unsigned int *extra_n, uint16_t *extra_v)
-{
-	unsigned int i;
-
-	if (dist == 0U || dist > ARK_DEFLATE_WINDOW_SIZE)
-		return -1;
-	for (i = 0; i < 30U; i++) {
-		size_t base;
-		size_t max;
-
-		base = g_dist_base[i];
-		max = base + ((size_t)1U << g_dist_extra[i]) - 1U;
-		if (dist < base || dist > max)
-			continue;
-		*sym = i;
-		*extra_n = g_dist_extra[i];
-		*extra_v = (uint16_t)(dist - base);
-		return 0;
-	}
-	return -1;
-}
-
 /* Emit one canonical Huffman symbol. */
 static int emit_code_symbol(ark_bit_writer_t *bw, const ark_codebook_t *book,
                             unsigned int sym)
@@ -775,68 +705,6 @@ static int insert_hash(const uint8_t *src, size_t src_len, size_t pos,
 	match_finder_prev_set(mf, pos, old);
 	match_finder_head_set(mf, h, (int32_t)pos);
 	return old;
-}
-
-/*
- * Find the best LZ77 match for src[pos..] using hash chains.
- * See ARCHITECTURE.md section 7.2 (hash-chain finding + lazy matching).
- */
-static ark_match_t find_match(const uint8_t *src, size_t src_len, size_t pos,
-                              int32_t candidate, const ark_match_finder_t *mf,
-                              unsigned int max_chain, size_t nice_len)
-{
-	ark_match_t best;
-	size_t max_len;
-	int32_t min_pos;
-	unsigned int tries;
-
-	best.len = 0U;
-	best.dist = 0U;
-
-	if (pos + ARK_DEFLATE_MIN_MATCH > src_len)
-		return best;
-
-	max_len = src_len - pos;
-	if (max_len > ARK_DEFLATE_MAX_MATCH)
-		max_len = ARK_DEFLATE_MAX_MATCH;
-	min_pos = (int32_t)(pos > mf->window_size ? pos - mf->window_size : 0U);
-
-	tries = 0U;
-	while (candidate >= min_pos && tries < max_chain) {
-		size_t cand;
-
-		cand = (size_t)candidate;
-		if (cand >= pos)
-			break;
-		if (src[cand] == src[pos] && src[cand + 1U] == src[pos + 1U] &&
-		    src[cand + 2U] == src[pos + 2U]) {
-			size_t len;
-
-			len = 3U;
-			while (len + 8U <= max_len) {
-				uint64_t a, b;
-
-				a = load_u64_le(src + cand + len);
-				b = load_u64_le(src + pos + len);
-				if (a != b)
-					break;
-				len += 8U;
-			}
-			while (len < max_len &&
-			       src[cand + len] == src[pos + len])
-				len++;
-			if (len > best.len) {
-				best.len = len;
-				best.dist = pos - cand;
-				if (best.len >= nice_len)
-					break;
-			}
-		}
-		candidate = match_finder_prev_get(mf, cand);
-		tries++;
-	}
-
-	return best;
 }
 
 /* Deterministic symbol ordering: lower frequency first, then symbol id. */
@@ -1033,124 +901,6 @@ static int build_length_limited_lengths(const uint32_t *freq, size_t n_symbols,
 	if (idx != used)
 		return -1;
 	return 0;
-}
-
-/* Emit one literal byte using fixed Huffman coding. */
-static int emit_litlen_symbol(ark_bit_writer_t *bw, unsigned int sym)
-{
-	uint16_t code;
-	unsigned int nbits;
-
-	fixed_lit_code(sym, &code, &nbits);
-	return bw_put_bits(bw, code, nbits);
-}
-
-/* Emit one literal byte using fixed Huffman coding. */
-static int emit_literal(ark_bit_writer_t *bw, uint8_t lit)
-{
-	return emit_litlen_symbol(bw, (unsigned int)lit);
-}
-
-/* Emit one match pair (length + distance) using fixed Huffman coding. */
-static int emit_match(ark_bit_writer_t *bw, size_t len, size_t dist)
-{
-	unsigned int lsym;
-	unsigned int lextra_n;
-	uint16_t lextra_v;
-	unsigned int dsym;
-	unsigned int dextra_n;
-	uint16_t dextra_v;
-	uint16_t code;
-	unsigned int nbits;
-
-	if (length_symbol(len, &lsym, &lextra_n, &lextra_v) != 0)
-		return -1;
-	if (distance_symbol(dist, &dsym, &dextra_n, &dextra_v) != 0)
-		return -1;
-
-	if (emit_litlen_symbol(bw, lsym) != 0)
-		return -1;
-	if (lextra_n != 0U && bw_put_bits(bw, lextra_v, lextra_n) != 0)
-		return -1;
-
-	fixed_dist_code(dsym, &code, &nbits);
-	if (bw_put_bits(bw, code, nbits) != 0)
-		return -1;
-	if (dextra_n != 0U && bw_put_bits(bw, dextra_v, dextra_n) != 0)
-		return -1;
-
-	return 0;
-}
-
-/*
- * Compress at the fast level: greedy matching (at most 32 chain candidates,
- * a 32-byte match ends the search) and one fixed-Huffman block.
- * See ARCHITECTURE.md section 7.2.
- */
-static int compress_fixed(ark_match_finder_t *mf, const uint8_t *src,
-                          size_t src_len, uint8_t *dst, size_t dst_cap)
-{
-	ark_bit_writer_t bw;
-	unsigned int max_chain;
-	size_t nice_len;
-	size_t pos;
-	size_t i;
-
-	max_chain = 32U;
-	nice_len = 32U;
-	match_finder_begin_parse(mf);
-
-	bw.dst = dst;
-	bw.cap = dst_cap;
-	bw.pos = 0;
-	bw.bits = 0;
-	bw.nbits = 0;
-
-	if (bw_put_bits(&bw, 1U, 1U) != 0)
-		return -1;
-	if (bw_put_bits(&bw, 1U, 2U) != 0)
-		return -1;
-
-	pos = 0U;
-	while (pos < src_len) {
-		ark_match_t m;
-		int32_t candidate;
-
-		candidate = insert_hash(src, src_len, pos, mf);
-		m = find_match(src, src_len, pos, candidate, mf, max_chain,
-		               nice_len);
-
-		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
-			/*
-			 * SAFETY: emit match only with a distance inside the
-			 * encoder's window and a Deflate-legal length. A
-			 * malformed pair would violate RFC 1951 stream
-			 * invariants or the negotiated window.
-			 */
-			if (m.dist == 0U || m.dist > mf->window_size ||
-			    m.len < ARK_DEFLATE_MIN_MATCH ||
-			    m.len > ARK_DEFLATE_MAX_MATCH)
-				return -1;
-			if (emit_match(&bw, m.len, m.dist) != 0)
-				return -1;
-
-			for (i = 1; i < m.len; i++)
-				(void)insert_hash(src, src_len, pos + i, mf);
-			pos += m.len;
-			continue;
-		}
-
-		if (emit_literal(&bw, src[pos]) != 0)
-			return -1;
-		pos++;
-	}
-
-	if (emit_litlen_symbol(&bw, 256U) != 0)
-		return -1;
-	if (bw_flush_to_byte(&bw) != 0)
-		return -1;
-
-	return (int)bw.pos;
 }
 
 static size_t freq_extra_bits(const ark_freq_t *freq)
@@ -1454,15 +1204,17 @@ static size_t find_longer_match(const uint8_t *src, size_t src_len, size_t pos,
 }
 
 /*
- * Parse src[0..src_len) once into enc->tokens with lazy matching: a match
- * is deferred by one literal when the next position has a longer one, as in
- * zlib's default levels. The hash chains span the whole input, so matches
- * reach back across block boundaries within the window. Returns the token
- * count (at most src_len).
+ * Parse src[0..src_len) once into enc->tokens with the level's search
+ * parameters. With lazy matching (max_lazy > 0) a match shorter than
+ * max_lazy is deferred by one literal when the next position has a longer
+ * one, as in zlib's default levels; greedy levels take every match found.
+ * The hash chains span the whole input, so matches reach back across block
+ * boundaries within the window. Returns the token count (at most src_len).
  */
 static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
                            size_t src_len)
 {
+	const ark_level_params_t *lp;
 	ark_match_finder_t *mf;
 	uint32_t *tokens;
 	size_t count;
@@ -1471,6 +1223,7 @@ static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 	size_t cur_dist;
 	int32_t candidate;
 
+	lp = &enc->lp;
 	mf = &enc->mf;
 	tokens = enc->tokens;
 	match_finder_begin_parse(mf);
@@ -1479,15 +1232,14 @@ static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 	cur_dist = 0U;
 	candidate = insert_hash(src, src_len, 0U, mf);
 	cur_len = find_longer_match(src, src_len, 0U, candidate, mf,
-	                            ARK_DEFAULT_MAX_CHAIN, ARK_DEFAULT_NICE_LEN,
-	                            0U, &cur_dist);
+	                            lp->max_chain, lp->nice_len, 0U, &cur_dist);
 	while (pos < src_len) {
 		if (cur_len >= ARK_DEFLATE_MIN_MATCH) {
 			size_t from;
 			size_t i;
 
 			from = pos + 1U;
-			if (cur_len < ARK_DEFLATE_MAX_MATCH) {
+			if (cur_len < lp->max_lazy) {
 				size_t next_len;
 				size_t next_dist;
 
@@ -1496,10 +1248,10 @@ static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 				    insert_hash(src, src_len, pos + 1U, mf);
 				next_len = find_longer_match(
 				    src, src_len, pos + 1U, candidate, mf,
-				    cur_len >= ARK_DEFAULT_GOOD_LEN
-				        ? ARK_DEFAULT_MAX_CHAIN >> 2
-				        : ARK_DEFAULT_MAX_CHAIN,
-				    ARK_DEFAULT_NICE_LEN, cur_len, &next_dist);
+				    cur_len >= lp->good_len
+				        ? (unsigned int)lp->max_chain >> 2
+				        : lp->max_chain,
+				    lp->nice_len, cur_len, &next_dist);
 				if (next_len > cur_len) {
 					tokens[count++] = src[pos];
 					pos++;
@@ -1529,9 +1281,8 @@ static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 		if (pos < src_len) {
 			candidate = insert_hash(src, src_len, pos, mf);
 			cur_len = find_longer_match(
-			    src, src_len, pos, candidate, mf,
-			    ARK_DEFAULT_MAX_CHAIN, ARK_DEFAULT_NICE_LEN, 0U,
-			    &cur_dist);
+			    src, src_len, pos, candidate, mf, lp->max_chain,
+			    lp->nice_len, 0U, &cur_dist);
 		}
 	}
 	return count;
@@ -1737,14 +1488,14 @@ static int choose_block(const uint32_t *tokens, size_t first, size_t count,
 }
 
 /*
- * Compress at the default level: one lazy-matching parse of the whole input
- * into tokens, then blocks cut from the token stream (choose_block). A
+ * Compress at levels 1-9: one parse of the whole input into tokens with the
+ * level's search, then blocks cut from the token stream (choose_block). A
  * block is written with the fixed codes when that is smaller than its
  * dynamic encoding. Deterministic for a given input (§13.1).
  * See ARCHITECTURE.md section 7.2.
  */
-static int compress_default(ark_deflate_enc_t *enc, const uint8_t *src,
-                            size_t src_len, uint8_t *dst, size_t dst_cap)
+static int compress_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
+                           size_t src_len, uint8_t *dst, size_t dst_cap)
 {
 	ark_codebook_t fixed_lit;
 	ark_codebook_t fixed_dist;
@@ -2123,8 +1874,8 @@ static int enc_params_valid(const ark_deflate_params_t *params)
 {
 	if (params == NULL)
 		return 0;
-	if (params->level != ARK_DEFLATE_LEVEL_FAST &&
-	    params->level != ARK_DEFLATE_LEVEL_DEFAULT)
+	if (params->level < ARK_DEFLATE_LEVEL_NONE ||
+	    params->level > ARK_DEFLATE_LEVEL_BEST)
 		return 0;
 	if (params->window_bits < ARK_DEFLATE_MIN_WINDOW_BITS ||
 	    params->window_bits > ARK_DEFLATE_MAX_WINDOW_BITS)
@@ -2139,20 +1890,19 @@ static int enc_params_valid(const ark_deflate_params_t *params)
 }
 
 /*
- * Encoder memory size: the struct plus head and prev in its tables member
- * and, at the default level, one token per input byte. The hash size
- * follows the window, so window_bits 15 keeps the 15-bit hash of earlier
- * releases. max_input <= ARK_DEFLATE_MAX_INPUT keeps the sum small.
+ * Encoder memory size: the struct, then for levels 1-9 head and prev in its
+ * tables member and one token per input byte; level 0 stores and needs no
+ * tables. The hash size follows the window, so window_bits 15 keeps the
+ * 15-bit hash of earlier releases. max_input <= ARK_DEFLATE_MAX_INPUT keeps
+ * the sum small.
  */
 static size_t enc_mem_size(const ark_deflate_params_t *params)
 {
-	size_t size;
-
-	size = sizeof(struct ark_deflate_enc) +
-	       2U * ((size_t)1U << params->window_bits) * sizeof(int32_t);
-	if (params->level == ARK_DEFLATE_LEVEL_DEFAULT)
-		size += params->max_input * sizeof(uint32_t);
-	return size;
+	if (params->level == ARK_DEFLATE_LEVEL_NONE)
+		return sizeof(struct ark_deflate_enc);
+	return sizeof(struct ark_deflate_enc) +
+	       2U * ((size_t)1U << params->window_bits) * sizeof(int32_t) +
+	       params->max_input * sizeof(uint32_t);
 }
 
 size_t ark_deflate_enc_size(const ark_deflate_params_t *params)
@@ -2177,16 +1927,21 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 
 	enc = mem;
 	enc->level = params->level;
+	enc->lp = g_level_params[params->level];
 	enc->max_input = params->max_input;
 	enc->mf.hash_bits = params->window_bits;
 	enc->mf.window_size = (size_t)1U << params->window_bits;
+	if (enc->level == ARK_DEFLATE_LEVEL_NONE) {
+		enc->mf.head = NULL;
+		enc->mf.prev = NULL;
+		enc->tokens = NULL;
+		return enc;
+	}
 	enc->mf.head = enc->tables;
 	enc->mf.prev = enc->tables + ((size_t)1U << enc->mf.hash_bits);
-	enc->tokens = NULL;
 	/* The token buffer follows prev; C11 6.5p7 lets the unsigned type
 	 * access int32_t storage. */
-	if (enc->level == ARK_DEFLATE_LEVEL_DEFAULT)
-		enc->tokens = (uint32_t *)(enc->mf.prev + enc->mf.window_size);
+	enc->tokens = (uint32_t *)(enc->mf.prev + enc->mf.window_size);
 	/* prev is never read before written; clearing once keeps it defined. */
 	for (i = 0; i < enc->mf.window_size; i++)
 		enc->mf.prev[i] = -1;
@@ -2197,11 +1952,12 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 /*
  * ark_deflate_enc_oneshot - Compress one buffer into a raw RFC 1951 stream.
  *
- * The default level parses the input once with lazy matching and writes
- * blocks whose lengths and codes (dynamic or fixed Huffman) are chosen by
- * exact cost; the fast level uses greedy matching and one fixed-Huffman
- * block. For incompressible input, falls back to stored blocks when that
- * yields smaller output. See ARCHITECTURE.md sections 7.2 and 7.4.
+ * Levels 1-9 parse the input once (greedy matching at 1-3, lazy at 4-9,
+ * with longer searches at higher levels) and write blocks whose lengths and
+ * codes (dynamic or fixed Huffman) are chosen by exact cost; level 0 writes
+ * stored blocks only. For incompressible input, falls back to stored blocks
+ * when that yields smaller output. See ARCHITECTURE.md sections 7.2 and
+ * 7.4.
  */
 ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
                                              const uint8_t *src, size_t src_len,
@@ -2222,11 +1978,10 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 	if (dst_cap < ark_deflate_bound(src_len))
 		return ARK_DEFLATE_ERR_OUTPUT;
 
-	if (enc->level == ARK_DEFLATE_LEVEL_DEFAULT)
-		fixed_len = compress_default(enc, src, src_len, dst, dst_cap);
+	if (enc->level == ARK_DEFLATE_LEVEL_NONE)
+		fixed_len = -1;
 	else
-		fixed_len =
-		    compress_fixed(&enc->mf, src, src_len, dst, dst_cap);
+		fixed_len = compress_tokens(enc, src, src_len, dst, dst_cap);
 
 	/*
 	 * ARCHITECTURE.md section 7.2: for incompressible data, emit stored
@@ -2412,6 +2167,46 @@ int ark_deflate_test_table_fits(const uint8_t *lengths, size_t n_symbols,
 	                           dist ? ARK_TREE_DIST : ARK_TREE_LITLEN);
 }
 
+/*
+ * ARK_DEFLATE_TEST only: RFC 1951 reference mapping of a match length
+ * [3..258] to its length symbol and extra bits, which tests compare the
+ * encoder's g_len_sym table against.
+ */
+static int length_symbol(size_t len, unsigned int *sym, unsigned int *extra_n,
+                         uint16_t *extra_v)
+{
+	unsigned int i;
+
+	if (len < ARK_DEFLATE_MIN_MATCH || len > ARK_DEFLATE_MAX_MATCH)
+		return -1;
+	/*
+	 * RFC 1951 section 3.2.5: code 284 covers 227..257 and length 258 has
+	 * its own code 285 with no extra bits. Code 284 with extra value 31
+	 * also decodes as 258, so check 285 first rather than relying on the
+	 * table scan order.
+	 */
+	if (len == ARK_DEFLATE_MAX_MATCH) {
+		*sym = 285U;
+		*extra_n = 0U;
+		*extra_v = 0U;
+		return 0;
+	}
+	for (i = 0; i < 28U; i++) {
+		size_t base;
+		size_t max;
+
+		base = g_len_base[i];
+		max = base + ((size_t)1U << g_len_extra[i]) - 1U;
+		if (len < base || len > max)
+			continue;
+		*sym = 257U + i;
+		*extra_n = g_len_extra[i];
+		*extra_v = (uint16_t)(len - base);
+		return 0;
+	}
+	return -1;
+}
+
 /* ARK_DEFLATE_TEST only: match length to length symbol + extra bits. */
 int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,
                                    unsigned int *extra_n, uint16_t *extra_v)
@@ -2420,7 +2215,7 @@ int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,
 }
 
 /*
- * ARK_DEFLATE_TEST only: lit/len and distance symbols the default-level
+ * ARK_DEFLATE_TEST only: lit/len and distance symbols the encoder's
  * tables give for a match of len (3..258) at dist (1..32768).
  */
 void ark_deflate_test_token_symbols(size_t len, size_t dist,

@@ -185,3 +185,31 @@ Full 255 MB corpus, one run each, one pinned thread:
 19,248,668 -> 18,962,107 bytes (17.838 % -> 17.572 %); zlib decodes all
 7,661 streams to the original bytes. Encoder memory at the default level
 grows by the 4 MiB token buffer (one per compress worker).
+
+**Compression levels 0-9** (a zlib-style search table; every level from 1
+up uses the single-pass encoder, so the fast level gains dynamic blocks and
+the table-driven token writer; the fixed-block-only fast path is removed).
+Level 6 output is byte-identical to the single-pass compressor above. Old =
+`23a3fa6`, one pinned thread.
+
+Fast level (`--fast`, level 1: greedy, 4 chain candidates, a match of 8
+ends the search), first 32 MiB of the mixed corpus, best of 5 interleaved,
+then `perf stat`:
+
+| Fast level | Compress (s) | Cycles (G) | Ratio | Decode (s) |
+|---|---|---|---|---|
+| Old (greedy, 32 candidates, one fixed block) | 1.05 | 4.20 | 36.334 % | 0.13 |
+| Same search as old, single-pass encoder (level 3) | 0.70 | 3.02 | 31.458 % | 0.14-0.15 |
+| New level 1 | 0.50 | 2.33 | 33.844 % | 0.16 |
+
+Full 255 MB corpus, fast level: 6.97 -> 4.38 s, 33.558 % -> 31.462 %;
+decoding its output 0.97 -> 1.17 s (more short matches and dynamic blocks;
+default-level output is unaffected).
+
+All levels, first 32 MiB, best of 3 (level 4 tuned so it falls between
+levels 3 and 5; zlib's row gave 31.630 % at 0.64 s, larger than level 3):
+
+| Level | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Compress (s) | 0.00 | 0.50 | 0.55 | 0.71 | 0.78 | 0.88 | 1.32 | 1.43 | 1.60 | 1.72 |
+| Ratio (%) | 100.008 | 33.844 | 32.577 | 31.458 | 30.895 | 30.759 | 30.368 | 30.332 | 30.320 | 30.318 |

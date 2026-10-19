@@ -20,10 +20,14 @@
  */
 #define ARK_DEFLATE_MAX_INPUT 1048576U
 
-/* Compression levels accepted by ark_deflate_params_t.level (zlib numbering).
+/*
+ * Compression levels for ark_deflate_params_t.level, zlib numbering: 0
+ * stores without compressing, 1 is the fastest and 9 the smallest.
  */
+#define ARK_DEFLATE_LEVEL_NONE 0
 #define ARK_DEFLATE_LEVEL_FAST 1
 #define ARK_DEFLATE_LEVEL_DEFAULT 6
+#define ARK_DEFLATE_LEVEL_BEST 9
 
 /* LZ77 window size range: 1 << window_bits bytes (RFC 1951, RFC 7692). */
 #define ARK_DEFLATE_MIN_WINDOW_BITS 8U
@@ -46,7 +50,7 @@ typedef enum {
 /*
  * ark_deflate_params_t - Encoder parameters; every field must be set.
  *
- * - level: ARK_DEFLATE_LEVEL_FAST or ARK_DEFLATE_LEVEL_DEFAULT.
+ * - level: ARK_DEFLATE_LEVEL_NONE (0) .. ARK_DEFLATE_LEVEL_BEST (9).
  * - window_bits: ARK_DEFLATE_MIN_WINDOW_BITS..ARK_DEFLATE_MAX_WINDOW_BITS;
  *   no emitted distance exceeds 1 << window_bits.
  * - max_input: largest src_len per one-shot call, 1..ARK_DEFLATE_MAX_INPUT.

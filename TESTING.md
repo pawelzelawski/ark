@@ -215,17 +215,17 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_bound_exact_values` | Bound = n + 5 per started 65,535-byte block + 1 (one block for n = 0), pinned at block edges and `ARK_DEFLATE_MAX_INPUT` |
 | `test_deflate_bound_overflow` | `ark_deflate_bound(SIZE_MAX)` is 0; near `SIZE_MAX` every result is 0 or larger than n (no wrap) |
 | `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes on an encoder with the maximum `max_input`: rejected without output |
-| `test_deflate_enc_size_query` | Encoder size: 256 KiB plus a small header at window 15 for the fast level; the default level adds exactly 4 bytes per `max_input` byte (token buffer); exactly 8 bytes per window byte between window sizes 8 and 15 |
-| `test_deflate_enc_rejects_invalid_params` | NULL params, levels 0/2/9, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 1: size 0 and no encoder |
+| `test_deflate_enc_size_query` | Encoder size for levels 1..9: 256 KiB plus a small header at window 15 plus exactly 4 bytes per `max_input` byte (token buffer), the same for every level; level 0 needs only a small header; exactly 8 bytes per window byte between window sizes 8 and 15 |
+| `test_deflate_enc_rejects_invalid_params` | NULL params, levels -1/10, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 1: size 0 and no encoder |
 | `test_deflate_enc_init_memory_checks` | `enc_init` rejects NULL, one byte too short and misaligned memory; exact size gives an encoder at the start of the memory |
 | `test_deflate_enc_oneshot_status` | NULL `dst_len` or encoder and input above `max_input` give `ERR_USAGE`, `dst_cap` one below the bound gives `ERR_OUTPUT`, `dst_len` 0 after each; the encoder then compresses exactly like a fresh one |
 | `test_deflate_enc_reuse_deterministic` | One encoder compressing A, B, A at both levels gives each time the bytes a fresh encoder gives (no state carried between calls) |
-| `test_deflate_window_bits_round_trip` | Window bits 8..15 at both levels: mixed input with repeats at short, ~256 B and ~32 KiB distances round-trips through `ark_deflate_test_decompress_window`, which rejects any distance beyond the encoder's window |
+| `test_deflate_window_bits_round_trip` | Window bits 8..15 at every level 0..9: mixed input with repeats at short, ~256 B and ~32 KiB distances round-trips through `ark_deflate_test_decompress_window`, which rejects any distance beyond the encoder's window |
 | `test_deflate_window_limits_distance` | A random block repeated just beyond the window (bits 8..14) stays incompressible, while window 15 matches the repeat |
 | `test_deflate_window_checker_rejects_far` | The window-limited test decoder is strict: a window-15 stream with ~32 KiB distances decodes at 15 and fails at every window 8..14; window bits 7 and 16 are refused |
 | `test_deflate_stored_block_valid` | Incompressible chunk stored as Deflate stored block; decompresses correctly |
 | `test_deflate_default_emits_dynamic_block` | Default level emits a dynamic-Huffman block for compressible input |
-| `test_deflate_fast_emits_fixed_block` | Fast level emits a fixed-Huffman block for compressible input |
+| `test_deflate_fast_emits_fixed_block` | Fast level costs fixed against dynamic codes too: 128 bytes of text compress to a fixed-Huffman block |
 | `test_deflate_invalid_stream` | Corrupt compressed bytes fed to decompress; returns -1 |
 | `test_deflate_truncated_stream` | Compressed bytes truncated; returns -1 |
 | `test_deflate_output_buffer_too_small` | Correct compressed stream but insufficient output capacity; returns -1 |
@@ -250,6 +250,7 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_token_symbol_tables` | The default level's `static const` length and distance symbol tables give the RFC 1951 symbol for every length 3..258 and distance 1..32768 |
 | `test_deflate_equal_low_bytes` | The portable equal-byte count of the match search (replaces a count-trailing-zeros builtin) for every lowest differing bit 0..63, with and without higher bits set |
 | `test_deflate_default_matches_across_blocks` | 1 MiB of one repeated 16 KiB random piece: the single parse lets each block match into the previous one, so the output stays below 32 KiB (140,305 bytes before, 23,854 now); round-trip identity |
+| `test_deflate_levels_round_trip` | 300,000 bytes of word text round-trip at every level 0..9; level 0 is stored blocks only (exactly the bound minus its padding byte); sizes shrink from stored to levels 1, 3 and 6, and level 9 is not larger than level 6 |
 | `test_deflate_default_token_buffer_full` | Input of exactly `max_input` mostly literal bytes fills the token buffer of an exactly sized encoder (ASan catches an overrun); the reused encoder then matches a fresh one |
 
 ### 3.4 Archive Write Path (`test_archive.c`)

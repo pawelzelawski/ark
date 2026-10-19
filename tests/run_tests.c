@@ -144,6 +144,7 @@ int test_deflate_token_symbol_tables(void);
 int test_deflate_equal_low_bytes(void);
 int test_deflate_default_matches_across_blocks(void);
 int test_deflate_default_token_buffer_full(void);
+int test_deflate_levels_round_trip(void);
 int test_edge_empty_archive(void);
 int test_edge_single_member(void);
 int test_edge_max_path_length(void);
@@ -369,6 +370,7 @@ static const test_case_t g_tests[] = {
      test_deflate_default_matches_across_blocks},
     {"test_deflate_default_token_buffer_full",
      test_deflate_default_token_buffer_full},
+    {"test_deflate_levels_round_trip", test_deflate_levels_round_trip},
     {"test_write_valid_sequence_zero_members",
      test_write_valid_sequence_zero_members},
     {"test_write_valid_sequence_one_member",

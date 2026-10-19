@@ -434,9 +434,15 @@ int test_deflate_default_emits_dynamic_block(void)
 	return rc;
 }
 
+/*
+ * The fast level costs fixed against dynamic codes like the other levels;
+ * for 128 bytes of text the fixed codes are cheaper.
+ */
 int test_deflate_fast_emits_fixed_block(void)
 {
-	uint8_t in[8192];
+	static const char text[] = "The quick brown fox jumps over the lazy "
+	                           "dog. ";
+	uint8_t in[128];
 	uint8_t *comp;
 	size_t bound;
 	ssize_t comp_len;
@@ -444,7 +450,7 @@ int test_deflate_fast_emits_fixed_block(void)
 	int rc;
 
 	for (i = 0; i < sizeof(in); i++)
-		in[i] = 'a';
+		in[i] = (uint8_t)text[i % (sizeof(text) - 1U)];
 
 	bound = ark_deflate_bound(sizeof(in));
 	comp = malloc(bound);
@@ -453,7 +459,10 @@ int test_deflate_fast_emits_fixed_block(void)
 
 	comp_len = test_deflate_compress(in, sizeof(in), comp, bound,
 	                                 ARK_DEFLATE_LEVEL_FAST);
-	rc = (comp_len > 0 && (comp[0] & 0x06U) == 0x02U) ? 0 : 1;
+	rc = (comp_len > 0 && (size_t)comp_len < sizeof(in) &&
+	      (comp[0] & 0x06U) == 0x02U)
+	         ? 0
+	         : 1;
 
 	free(comp);
 	return rc;
@@ -1100,8 +1109,9 @@ static void fill_windowed(uint8_t *buf, size_t len)
 }
 
 /*
- * Encoder size query: head and prev follow the window; the default level
- * adds one 4-byte token per max_input byte, the fast level nothing.
+ * Encoder size query: for levels 1..9 head and prev follow the window and
+ * one 4-byte token is added per max_input byte; level 0 stores and needs
+ * only a small header.
  */
 int test_deflate_enc_size_query(void)
 {
@@ -1109,26 +1119,32 @@ int test_deflate_enc_size_query(void)
 	size_t base;
 	size_t size15;
 	unsigned int wb;
+	int level;
 
-	p = (ark_deflate_params_t){ARK_DEFLATE_LEVEL_FAST, 15U,
-	                           ARK_DEFLATE_MAX_INPUT, 0};
+	p = (ark_deflate_params_t){ARK_DEFLATE_LEVEL_FAST, 15U, 1U, 0};
 	size15 = ark_deflate_enc_size(&p);
-	/* head and prev: 2 x 32768 x 4 bytes plus a small struct. */
-	if (size15 <= 262144U || size15 > 262144U + 256U)
+	/* head and prev: 2 x 32768 x 4 bytes, one token, a small struct. */
+	if (size15 <= 262144U + 4U || size15 > 262144U + 4U + 256U)
 		return 1;
-	p.level = ARK_DEFLATE_LEVEL_DEFAULT;
-	if (ark_deflate_enc_size(&p) != size15 + 4U * ARK_DEFLATE_MAX_INPUT)
-		return 1;
-	p.max_input = 1U;
-	if (ark_deflate_enc_size(&p) != size15 + 4U)
-		return 1;
-	p.level = ARK_DEFLATE_LEVEL_FAST;
-	if (ark_deflate_enc_size(&p) != size15)
+	for (level = 1; level <= ARK_DEFLATE_LEVEL_BEST; level++) {
+		p.level = level;
+		p.max_input = 1U;
+		if (ark_deflate_enc_size(&p) != size15)
+			return 1;
+		p.max_input = ARK_DEFLATE_MAX_INPUT;
+		if (ark_deflate_enc_size(&p) !=
+		    size15 + 4U * (ARK_DEFLATE_MAX_INPUT - 1U))
+			return 1;
+	}
+	p.level = ARK_DEFLATE_LEVEL_NONE;
+	if (ark_deflate_enc_size(&p) == 0U || ark_deflate_enc_size(&p) > 256U)
 		return 1;
 
+	p.level = ARK_DEFLATE_LEVEL_DEFAULT;
+	p.max_input = 1U;
 	p.window_bits = 8U;
 	base = ark_deflate_enc_size(&p);
-	if (base == 0U || base > 2048U + 256U)
+	if (base == 0U || base > 2048U + 4U + 256U)
 		return 1;
 	for (wb = 8U; wb <= 15U; wb++) {
 		p.window_bits = wb;
@@ -1143,9 +1159,8 @@ int test_deflate_enc_size_query(void)
 int test_deflate_enc_rejects_invalid_params(void)
 {
 	static const ark_deflate_params_t bad[] = {
-	    {0, 15U, 1024U, 0},
-	    {2, 15U, 1024U, 0},
-	    {9, 15U, 1024U, 0},
+	    {-1, 15U, 1024U, 0},
+	    {10, 15U, 1024U, 0},
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 7U, 1024U, 0},
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 16U, 1024U, 0},
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 15U, 0U, 0},
@@ -1326,13 +1341,13 @@ int test_deflate_enc_reuse_deterministic(void)
 }
 
 /*
- * Every window size 8..15 and both levels round-trip mixed input, decoded by
- * a decoder that rejects any back-reference beyond the encoder's window.
+ * Every window size 8..15 and every level 0..9 round-trip mixed input,
+ * decoded by a decoder that rejects any back-reference beyond the encoder's
+ * window.
  */
 int test_deflate_window_bits_round_trip(void)
 {
-	static const int levels[] = {ARK_DEFLATE_LEVEL_DEFAULT,
-	                             ARK_DEFLATE_LEVEL_FAST};
+	static const int levels[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 	uint8_t *in;
 	uint8_t *comp;
 	uint8_t *out;
@@ -1712,7 +1727,7 @@ int test_deflate_table_worst_case(void)
 }
 
 /*
- * The default level's length and distance symbol tables agree with the
+ * The encoder's length and distance symbol tables agree with the
  * RFC 1951 ranges for every length 3..258 and distance 1..32768.
  */
 int test_deflate_token_symbol_tables(void)
@@ -1861,5 +1876,78 @@ int test_deflate_default_token_buffer_full(void)
 done:
 	free(fresh);
 	free(enc);
+	return rc;
+}
+
+/* fill_text - Pseudo-random English-like text from a small word list. */
+static void fill_text(uint8_t *buf, size_t len)
+{
+	static const char *const words[] = {
+	    "the ",     "archive ", "stores ", "files ", "with ",
+	    "deflate ", "and ",     "a ",      "hash ",  "index ",
+	    "member ",  "chunk ",   "of ",     "data, ", "level.\n",
+	};
+	uint32_t x;
+	size_t i;
+
+	x = 0x1234567U;
+	i = 0U;
+	while (i < len) {
+		const char *w;
+
+		x = x * 1664525U + 1013904223U;
+		w = words[(x >> 24) % (sizeof(words) / sizeof(words[0]))];
+		while (*w != '\0' && i < len)
+			buf[i++] = (uint8_t)*w++;
+	}
+}
+
+/*
+ * Every level 0..9 round-trips text. Level 0 writes only stored blocks
+ * (exactly ark_deflate_bound(n) - 1 bytes: no padding byte is needed);
+ * higher levels search harder, so on this input level 1 is smaller than
+ * stored, level 3 than level 1, level 6 than level 3 and level 9 is not
+ * larger than level 6.
+ */
+int test_deflate_levels_round_trip(void)
+{
+	const size_t len = 300000U;
+	uint8_t *in;
+	uint8_t *comp;
+	uint8_t *out;
+	size_t bound;
+	size_t size[10];
+	int level;
+	int rc;
+
+	rc = 1;
+	bound = ark_deflate_bound(len);
+	in = malloc(len);
+	comp = malloc(bound);
+	out = malloc(len);
+	if (in == NULL || comp == NULL || out == NULL)
+		goto done;
+	fill_text(in, len);
+	for (level = 0; level <= ARK_DEFLATE_LEVEL_BEST; level++) {
+		ssize_t c;
+
+		c = test_deflate_compress(in, len, comp, bound, level);
+		if (c <= 0 ||
+		    test_deflate_decompress(comp, (size_t)c, out, len) !=
+		        (ssize_t)len ||
+		    memcmp(out, in, len) != 0)
+			goto done;
+		if (level == 0 && ((comp[0] >> 1) & 3) != 0)
+			goto done;
+		size[level] = (size_t)c;
+	}
+	if (size[0] != bound - 1U || size[1] >= size[0] || size[3] >= size[1] ||
+	    size[6] >= size[3] || size[9] > size[6])
+		goto done;
+	rc = 0;
+done:
+	free(out);
+	free(comp);
+	free(in);
 	return rc;
 }
