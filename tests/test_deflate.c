@@ -20,6 +20,9 @@ ark_deflate_status_t ark_deflate_test_decompress_window(const uint8_t *, size_t,
                                                         unsigned int, size_t *);
 size_t ark_deflate_test_table_cap(int);
 int ark_deflate_test_table_fits(const uint8_t *, size_t, int, size_t);
+void ark_deflate_test_token_symbols(size_t, size_t, unsigned int *,
+                                    unsigned int *);
+size_t ark_deflate_test_equal_low_bytes(uint64_t);
 
 static void fill_pattern(uint8_t *buf, size_t len)
 {
@@ -867,13 +870,17 @@ int test_deflate_small_input_not_stored(void)
 	size_t i;
 	int btype;
 
-	/* The old fixed 4-bit header cost pushed small inputs to stored. */
+	/*
+	 * The old fixed 4-bit header cost pushed small inputs to stored. At
+	 * this size a dynamic header costs more than the fixed codes save, so
+	 * the default level writes a fixed block.
+	 */
 	for (i = 0; i < sizeof(in); i++)
 		in[i] = (uint8_t)text[i % (sizeof(text) - 1U)];
 	btype = -1;
 	comp_len =
 	    compress_size(in, sizeof(in), ARK_DEFLATE_LEVEL_DEFAULT, &btype);
-	if (comp_len <= 0 || (size_t)comp_len >= sizeof(in) || btype != 2)
+	if (comp_len <= 0 || (size_t)comp_len >= sizeof(in) || btype != 1)
 		return 1;
 	return round_trip(in, sizeof(in));
 }
@@ -1092,7 +1099,10 @@ static void fill_windowed(uint8_t *buf, size_t len)
 	}
 }
 
-/* Encoder size query: window-dependent, level-independent, exact deltas. */
+/*
+ * Encoder size query: head and prev follow the window; the default level
+ * adds one 4-byte token per max_input byte, the fast level nothing.
+ */
 int test_deflate_enc_size_query(void)
 {
 	ark_deflate_params_t p;
@@ -1100,16 +1110,19 @@ int test_deflate_enc_size_query(void)
 	size_t size15;
 	unsigned int wb;
 
-	p = (ark_deflate_params_t){ARK_DEFLATE_LEVEL_DEFAULT, 15U,
+	p = (ark_deflate_params_t){ARK_DEFLATE_LEVEL_FAST, 15U,
 	                           ARK_DEFLATE_MAX_INPUT, 0};
 	size15 = ark_deflate_enc_size(&p);
 	/* head and prev: 2 x 32768 x 4 bytes plus a small struct. */
 	if (size15 <= 262144U || size15 > 262144U + 256U)
 		return 1;
-	p.level = ARK_DEFLATE_LEVEL_FAST;
-	if (ark_deflate_enc_size(&p) != size15)
+	p.level = ARK_DEFLATE_LEVEL_DEFAULT;
+	if (ark_deflate_enc_size(&p) != size15 + 4U * ARK_DEFLATE_MAX_INPUT)
 		return 1;
 	p.max_input = 1U;
+	if (ark_deflate_enc_size(&p) != size15 + 4U)
+		return 1;
+	p.level = ARK_DEFLATE_LEVEL_FAST;
 	if (ark_deflate_enc_size(&p) != size15)
 		return 1;
 
@@ -1696,4 +1709,157 @@ int test_deflate_table_worst_case(void)
 	if (table_worst_case(0, 10U, 137U, 286U) != 0)
 		return 1;
 	return table_worst_case(1, 8U, 10U, 32U);
+}
+
+/*
+ * The default level's length and distance symbol tables agree with the
+ * RFC 1951 ranges for every length 3..258 and distance 1..32768.
+ */
+int test_deflate_token_symbol_tables(void)
+{
+	static const uint16_t dist_base[30] = {
+	    1,    2,    3,    4,    5,    7,    9,    13,    17,    25,
+	    33,   49,   65,   97,   129,  193,  257,  385,   513,   769,
+	    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+	};
+	unsigned int expect_dist;
+	size_t len;
+	size_t dist;
+
+	for (len = 3U; len <= 258U; len++) {
+		unsigned int sym;
+		unsigned int extra_n;
+		uint16_t extra_v;
+		unsigned int lsym;
+		unsigned int dsym;
+
+		if (ark_deflate_test_length_symbol(len, &sym, &extra_n,
+		                                   &extra_v) != 0)
+			return 1;
+		ark_deflate_test_token_symbols(len, 1U, &lsym, &dsym);
+		if (lsym != sym)
+			return 1;
+	}
+	expect_dist = 0U;
+	for (dist = 1U; dist <= 32768U; dist++) {
+		unsigned int lsym;
+		unsigned int dsym;
+
+		if (expect_dist < 29U && dist >= dist_base[expect_dist + 1U])
+			expect_dist++;
+		ark_deflate_test_token_symbols(3U, dist, &lsym, &dsym);
+		if (dsym != expect_dist)
+			return 1;
+	}
+	return expect_dist == 29U ? 0 : 1;
+}
+
+/*
+ * The portable trailing-equal-byte count used by the match search: every
+ * position of the lowest differing bit, with and without higher bits set.
+ */
+int test_deflate_equal_low_bytes(void)
+{
+	unsigned int bit;
+
+	for (bit = 0U; bit < 64U; bit++) {
+		uint64_t low;
+
+		low = (uint64_t)1U << bit;
+		if (ark_deflate_test_equal_low_bytes(low) != bit / 8U)
+			return 1;
+		if (ark_deflate_test_equal_low_bytes(low | ~(low - 1U)) !=
+		    bit / 8U)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * One parse spans the whole input, so a block's matches reach back into the
+ * previous block. 1 MiB made of one repeated 16 KiB random piece: blocks
+ * end every 16..128 KiB, and a parse restarting per block would store the
+ * piece's literals again in each of them (140,305 bytes before the single
+ * parse; 23,854 with it).
+ */
+int test_deflate_default_matches_across_blocks(void)
+{
+	const size_t piece = 16384U;
+	const size_t len = ARK_DEFLATE_MAX_INPUT;
+	uint8_t *in;
+	uint8_t *comp;
+	uint8_t *out;
+	size_t bound;
+	ssize_t comp_len;
+	size_t i;
+	int rc;
+
+	rc = 1;
+	bound = ark_deflate_bound(len);
+	in = malloc(len);
+	comp = malloc(bound);
+	out = malloc(len);
+	if (in == NULL || comp == NULL || out == NULL)
+		goto done;
+	fill_randomish(in, piece);
+	for (i = piece; i < len; i++)
+		in[i] = in[i - piece];
+	comp_len = test_deflate_compress(in, len, comp, bound,
+	                                 ARK_DEFLATE_LEVEL_DEFAULT);
+	if (comp_len <= 0 || (size_t)comp_len > 2U * piece)
+		goto done;
+	if (test_deflate_decompress(comp, (size_t)comp_len, out, len) !=
+	        (ssize_t)len ||
+	    memcmp(out, in, len) != 0)
+		goto done;
+	rc = 0;
+done:
+	free(out);
+	free(comp);
+	free(in);
+	return rc;
+}
+
+/*
+ * The default-level token buffer holds exactly max_input tokens: input of
+ * max_input bytes that is nearly all literals fills it (the encoder memory
+ * is allocated at its exact size, so an overrun is caught by ASan), and a
+ * reused encoder still matches a fresh one.
+ */
+int test_deflate_default_token_buffer_full(void)
+{
+	ark_deflate_enc_t *enc;
+	ark_deflate_enc_t *fresh;
+	uint8_t in[3000];
+	uint8_t out[3100];
+	uint8_t ref[3100];
+	uint8_t back[3000];
+	size_t n;
+	size_t ref_n;
+	int rc;
+
+	fill_randomish(in, sizeof(in));
+	enc = test_enc_new(ARK_DEFLATE_LEVEL_DEFAULT, 15U, sizeof(in));
+	fresh = test_enc_new(ARK_DEFLATE_LEVEL_DEFAULT, 15U, sizeof(in));
+	rc = 1;
+	if (enc == NULL || fresh == NULL)
+		goto done;
+	if (ark_deflate_enc_oneshot(enc, in, sizeof(in), out, sizeof(out),
+	                            &n) != ARK_DEFLATE_OK ||
+	    test_deflate_decompress(out, n, back, sizeof(back)) !=
+	        (ssize_t)sizeof(in) ||
+	    memcmp(back, in, sizeof(in)) != 0)
+		goto done;
+	fill_pattern(in, sizeof(in));
+	if (ark_deflate_enc_oneshot(enc, in, sizeof(in), out, sizeof(out),
+	                            &n) != ARK_DEFLATE_OK ||
+	    ark_deflate_enc_oneshot(fresh, in, sizeof(in), ref, sizeof(ref),
+	                            &ref_n) != ARK_DEFLATE_OK ||
+	    n != ref_n || memcmp(out, ref, n) != 0)
+		goto done;
+	rc = 0;
+done:
+	free(fresh);
+	free(enc);
+	return rc;
 }

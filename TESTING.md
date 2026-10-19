@@ -215,7 +215,7 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_bound_exact_values` | Bound = n + 5 per started 65,535-byte block + 1 (one block for n = 0), pinned at block edges and `ARK_DEFLATE_MAX_INPUT` |
 | `test_deflate_bound_overflow` | `ark_deflate_bound(SIZE_MAX)` is 0; near `SIZE_MAX` every result is 0 or larger than n (no wrap) |
 | `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes on an encoder with the maximum `max_input`: rejected without output |
-| `test_deflate_enc_size_query` | Encoder size: 256 KiB plus a small header at window 15, independent of level and `max_input`, exactly 8 bytes per window byte between window sizes 8 and 15 |
+| `test_deflate_enc_size_query` | Encoder size: 256 KiB plus a small header at window 15 for the fast level; the default level adds exactly 4 bytes per `max_input` byte (token buffer); exactly 8 bytes per window byte between window sizes 8 and 15 |
 | `test_deflate_enc_rejects_invalid_params` | NULL params, levels 0/2/9, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 1: size 0 and no encoder |
 | `test_deflate_enc_init_memory_checks` | `enc_init` rejects NULL, one byte too short and misaligned memory; exact size gives an encoder at the start of the memory |
 | `test_deflate_enc_oneshot_status` | NULL `dst_len` or encoder and input above `max_input` give `ERR_USAGE`, `dst_cap` one below the bound gives `ERR_OUTPUT`, `dst_len` 0 after each; the encoder then compresses exactly like a fresh one |
@@ -237,7 +237,7 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_limit_lengths_small_alphabets` | Distance (30, 15 bits) and code-length (19, 7 bits) alphabets complete; single used symbol gets one 1-bit code; no used symbol gives symbol 0 a 1-bit code |
 | `test_deflate_cl_code_always_complete` | Code-length plan with only one used symbol is completed with a second 1-bit code |
 | `test_deflate_header_cost_matches_emitted` | Costed dynamic header size equals the emitted bits for dense and sparse code lengths |
-| `test_deflate_small_input_not_stored` | 128-byte text input compresses to a smaller dynamic block, not a stored block |
+| `test_deflate_small_input_not_stored` | 128-byte text input at the default level compresses to a smaller fixed block (cheaper than a dynamic header at this size), not a stored block |
 | `test_deflate_fixed_then_stored` | Fixed block followed by a stored block decodes correctly (bit reader gives back read-ahead bytes) |
 | `test_deflate_rejects_legacy_length_258` | Length 258 written as code 284 + extra 31 (pre-v1.1.0 ark encoders) is `ARK_DEFLATE_ERR_DATA`; 284 + 30 (length 257) decodes |
 | `test_deflate_dec_src_used_bit_offsets` | Fixed blocks ending at each of the 8 bit offsets, followed by junk bytes: `src_used` counts exactly the stream's bytes |
@@ -247,6 +247,10 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_rejects_incomplete_trees` | Incomplete code-length code, incomplete literal/length code and oversubscribed code-length code; returns -1 |
 | `test_deflate_accepts_allowed_incomplete_trees` | Distance code with no codes, and with a single 1-bit code, decode correctly (zlib-compatible exceptions) |
 | `test_deflate_round_trip_periodic` | Periodic input with periods 1..17 (overlapping matches around the 8-byte copy threshold); round-trip identity |
+| `test_deflate_token_symbol_tables` | The default level's `static const` length and distance symbol tables give the RFC 1951 symbol for every length 3..258 and distance 1..32768 |
+| `test_deflate_equal_low_bytes` | The portable equal-byte count of the match search (replaces a count-trailing-zeros builtin) for every lowest differing bit 0..63, with and without higher bits set |
+| `test_deflate_default_matches_across_blocks` | 1 MiB of one repeated 16 KiB random piece: the single parse lets each block match into the previous one, so the output stays below 32 KiB (140,305 bytes before, 23,854 now); round-trip identity |
+| `test_deflate_default_token_buffer_full` | Input of exactly `max_input` mostly literal bytes fills the token buffer of an exactly sized encoder (ASan catches an overrun); the reused encoder then matches a fresh one |
 
 ### 3.4 Archive Write Path (`test_archive.c`)
 

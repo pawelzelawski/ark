@@ -546,7 +546,8 @@ output buffers and its own Deflate encoder, with no shared state.
 `pool_init` allocates, per compress worker, an input buffer of
 `ARK_CHUNK_SIZE`, an output buffer of `ark_deflate_bound(ARK_CHUNK_SIZE)` and
 the encoder memory reported by `ark_deflate_enc_size` (level from the CLI,
-`window_bits` 15, `max_input` `ARK_CHUNK_SIZE`: about 256 KiB). The pool is
+`window_bits` 15, `max_input` `ARK_CHUNK_SIZE`: about 4.25 MiB at the default
+level, about 256 KiB with `--fast`; see section 7.4). The pool is
 created once per command, so no memory is allocated per chunk. The Deflate
 component itself keeps no global or thread-local state. Compressed results
 are placed into
@@ -696,21 +697,28 @@ stored block instead. This is essential for already-compressed content
 (JPEG, video, existing archives). The chunk size entry in the index
 records the stored block size; the reader handles both cases transparently.
 
-**Lazy matching for archival mode.** The parser searches hash chains for
-the longest match at each position (up to 128 candidates, stopping early
-at a 258-byte match) and defers a match by one position, emitting a
-literal instead, when the next position offers a match at least two bytes
-longer (one-step lazy evaluation, similar to zlib's default levels). It
-does not compute an optimal parse; an optimal or
-single-pass cost-driven parser remains an allowed improvement under §17.
-Archival mode is the default; `--fast` uses greedy parsing with a shorter
-search.
+**Lazy matching for archival mode.** The default level parses each input
+once, into a token buffer of literals and matches, and cuts blocks from
+that token stream afterwards. Because the hash chains span the whole input,
+matches reach back across block boundaries within the window. At each
+position the parser searches the hash chain for the longest match (up to
+128 candidates, stopping at a 258-byte match) and defers a match by one
+position, emitting a literal instead, when the next position offers a
+longer match (lazy evaluation as in zlib's default levels; after a match
+of 32 bytes or more the look-ahead searches a quarter of the chain). It
+does not compute an optimal parse; an optimal parser remains an allowed
+improvement under §17. Archival mode is the default; `--fast` uses greedy
+parsing with a shorter search and no token buffer.
 
 **Aggressive block boundary decisions.** Deflate divides compressed data
 into blocks, each with its own Huffman table. Choosing block boundaries
-to minimise total output size improves ratio. The compressor evaluates
-block splits and selects boundaries that minimise the combined cost of
-the Huffman table and compressed literals/references.
+to minimise total output size improves ratio. For each block the compressor
+grows a candidate through 16, 32, 64 and 128 KiB of input (rounded up to a
+token boundary), computes each candidate's exact dynamic-block size
+(code-length header included) from the token counts, and keeps the one
+with the fewest bits per input byte. That block is then written with the
+fixed Huffman codes when they are smaller than its dynamic encoding, which
+is common for short inputs.
 
 ### 7.3 Implementation
 
@@ -718,7 +726,8 @@ Implemented in `deflate.c` / `deflate.h` as a standalone component with a
 clean API: caller provides input bytes and receives output bytes. No I/O,
 no allocation owned by the component, no global or thread-local mutable
 state. The caller owns all buffers, including the encoder's working memory
-(the hash-chain match finder), whose size it obtains from a size query.
+(the hash-chain match finder and, at the default level, the token buffer),
+whose size it obtains from a size query.
 
 Estimated implementation size: ~2,000-2,500 lines of C11 for compressor
 and decompressor combined.
@@ -746,7 +755,7 @@ later on the same types.
 #define ARK_DEFLATE_MAX_INPUT 1048576U
 
 #define ARK_DEFLATE_LEVEL_FAST    1   /* greedy parsing, one fixed block (--fast) */
-#define ARK_DEFLATE_LEVEL_DEFAULT 6   /* lazy matching + cost-chosen dynamic blocks */
+#define ARK_DEFLATE_LEVEL_DEFAULT 6   /* single lazy parse + cost-chosen blocks */
 #define ARK_DEFLATE_MIN_WINDOW_BITS 8U
 #define ARK_DEFLATE_MAX_WINDOW_BITS 15U
 
@@ -813,8 +822,9 @@ its recovery reader do not). The decoder uses no workspace: its Huffman
 tables live on the stack, sized for the worst-case code (about 28 KiB in a
 dynamic block).
 
-**Level semantics.** `ARK_DEFLATE_LEVEL_DEFAULT` uses lazy matching and
-cost-based block boundary decisions. This is the default level used by the
+**Level semantics.** `ARK_DEFLATE_LEVEL_DEFAULT` uses one lazy-matching
+parse and cost-based block boundary and block type decisions (section 7.2).
+This is the default level used by the
 `ark` CLI. `ARK_DEFLATE_LEVEL_FAST` uses greedy parsing for users who
 explicitly prioritise compression speed over ratio, enabled via the `--fast`
 CLI flag. Levels use zlib's numbering; other levels are not accepted yet.
@@ -822,10 +832,15 @@ CLI flag. Levels use zlib's numbering; other levels are not accepted yet.
 **Encoder memory and window.** The encoder memory holds the hash-chain match
 finder: a head table of `1 << window_bits` entries and a chain table of
 `1 << window_bits` entries, 4 bytes each, plus a small header. At
-`window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. Matches never reach
-further back than `1 << window_bits` bytes, so a smaller window (for example
-one negotiated under RFC 7692) is honored exactly. ark uses `window_bits` 15,
-the RFC 1951 maximum; its output is identical to earlier releases.
+`window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. The default level
+adds a token buffer of 4 bytes per `max_input` byte (4 MiB at 1 MiB, 256 KiB
+at 64 KiB); the fast level needs none. Matches never reach further back than
+`1 << window_bits` bytes, so a smaller window (for example one negotiated
+under RFC 7692) is honored exactly. ark uses `window_bits` 15, the RFC 1951
+maximum. Its fast-level output is identical to earlier releases; the
+default level's output changed in v1.2 with the single parse (smaller, and
+still one valid RFC 1951 stream per chunk; section 13.1 scopes determinism to
+one binary).
 
 **Encoder rules.** The memory must stay in place (the encoder points into
 it) and is released by freeing it. One encoder serves any number of

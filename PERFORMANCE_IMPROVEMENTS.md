@@ -154,3 +154,34 @@ Best of 5 interleaved decodes, then `perf stat`, old -> new:
 |---|---|---|
 | 32 MiB corpus slice, 32 streams | 0.135 -> 0.127 | n/a |
 | `/usr/include` per file, 7,661 streams | 0.311 -> 0.297 | 3.278 -> 3.100 (-5.4 %) |
+
+**Single-pass default compressor** (one lazy-matching parse per chunk into a
+token buffer in the encoder memory, blocks cut from the token stream instead
+of up to five parses per block; matches reach across block boundaries; each
+block takes fixed codes when they are smaller than its dynamic encoding).
+Default-level output changes on purpose; fast-level output is byte-identical.
+Old = `145a4f7`, new = this change; same method as above (best of 5
+interleaved, then `perf stat` user-space counters):
+
+| Level, 32 MiB slice | Best of 5 compress (s), old -> new | Cycles (G), old -> new | Ratio, old -> new |
+|---|---|---|---|
+| Default | 7.75 -> 1.34 (5.8x) | 27.40 -> 5.16 (-81 %) | 31.359 % -> 30.368 % |
+| Fast | 1.03 -> 1.07 | 3.99 -> 4.16 | 36.334 % (identical bytes) |
+
+The fast-level difference is code placement, not code: with every function
+and block aligned the same way in both builds (`-mllvm
+-align-all-functions=6 -mllvm -align-all-nofallthru-blocks=5`) the two take
+4.14-4.18 G and 4.14-4.16 G cycles, and the new build runs 1.8 % fewer
+instructions.
+
+Full 255 MB corpus, one run each, one pinned thread:
+
+| Level | Compress (s), old -> new | Ratio, old -> new |
+|---|---|---|
+| Default | 63.15 -> 10.80 (5.8x) | 29.111 % -> 28.301 % (gzip -6: 28.300 %) |
+| Fast | 6.50 -> 6.74 | 33.558 % (identical bytes) |
+
+`/usr/include` copy compressed file by file (7,645 files, 107,908,150 bytes):
+19,248,668 -> 18,962,107 bytes (17.838 % -> 17.572 %); zlib decodes all
+7,661 streams to the original bytes. Encoder memory at the default level
+grows by the 4 MiB token buffer (one per compress worker).

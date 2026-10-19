@@ -103,14 +103,34 @@ typedef struct {
 /*
  * Encoder state. The struct sits at the start of the caller's memory; tables
  * holds the match-finder arrays: head (1 << hash_bits entries), then prev
- * (window_size entries).
+ * (window_size entries), then at the default level the token buffer
+ * (max_input entries; NULL tokens at the fast level).
  */
 struct ark_deflate_enc {
 	ark_match_finder_t mf;
+	uint32_t *tokens;
 	int level;
 	size_t max_input;
 	int32_t tables[];
 };
+
+/*
+ * Default-level tokens, one uint32_t per literal or match. A literal is its
+ * byte value. A match sets ARK_TOKEN_MATCH and holds length - 3 in bits
+ * 15..22 and distance - 1 in bits 0..14 (distances never exceed 32768).
+ */
+#define ARK_TOKEN_MATCH 0x80000000U
+#define ARK_TOKEN_LEN_SHIFT 15U
+#define ARK_TOKEN_DIST_MASK 0x7fffU
+
+/*
+ * Default-level match search (the zlib level 6 values): at most 128 chain
+ * candidates, a quarter of that for the lazy look-ahead after a match of 32
+ * or more, and no early stop before the longest possible match.
+ */
+#define ARK_DEFAULT_MAX_CHAIN 128U
+#define ARK_DEFAULT_GOOD_LEN 32U
+#define ARK_DEFAULT_NICE_LEN ARK_DEFLATE_MAX_MATCH
 
 typedef struct {
 	uint32_t lit[286];
@@ -118,7 +138,6 @@ typedef struct {
 } ark_freq_t;
 
 typedef struct {
-	size_t len;
 	ark_freq_t freq;
 	uint8_t lit_len[286];
 	uint8_t dist_len[30];
@@ -169,6 +188,58 @@ static const size_t g_default_block_candidates[] = {
     (size_t)32U * 1024U,
     (size_t)64U * 1024U,
     (size_t)128U * 1024U,
+};
+
+/* Length code index (symbol - 257) for match length 3 + i, i = 0..255. */
+static const uint8_t g_len_sym[256] = {
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  8,  9,  9,  10, 10, 11, 11, 12, 12, 12,
+    12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16,
+    16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 19,
+    19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+    20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
+    21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23,
+    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+    25, 25, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 28,
+};
+
+/*
+ * Distance symbol for d = distance - 1: g_dist_sym[d] when d < 256, else
+ * g_dist_sym[256 + (d >> 7)] (entries 256 and 257 are unused).
+ */
+static const uint8_t g_dist_sym[512] = {
+    0,  1,  2,  3,  4,  4,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8,
+    8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,  10, 10, 10, 10, 10, 10,
+    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+    11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 0,  0,  16, 17, 18, 18, 19, 19, 20, 20,
+    20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23,
+    23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
 };
 
 /*
@@ -964,119 +1035,6 @@ static int build_length_limited_lengths(const uint32_t *freq, size_t n_symbols,
 	return 0;
 }
 
-/* Parse a block once, optionally collecting frequencies or emitting symbols. */
-static int parse_block(ark_match_finder_t *mf, const uint8_t *src,
-                       size_t src_len, int level, ark_freq_t *freq,
-                       ark_bit_writer_t *bw, const ark_codebook_t *lit_book,
-                       const ark_codebook_t *dist_book)
-{
-	unsigned int max_chain;
-	size_t nice_len;
-	size_t pos;
-	size_t i;
-
-	max_chain = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 128U;
-	nice_len =
-	    (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : ARK_DEFLATE_MAX_MATCH;
-
-	/* Each parse starts empty, so output is deterministic (§13.1). */
-	match_finder_begin_parse(mf);
-
-	if (freq != NULL) {
-		for (i = 0; i < 286U; i++)
-			freq->lit[i] = 0;
-		for (i = 0; i < 30U; i++)
-			freq->dist[i] = 0;
-	}
-
-	pos = 0U;
-	while (pos < src_len) {
-		ark_match_t m;
-		int32_t candidate;
-
-		candidate = insert_hash(src, src_len, pos, mf);
-		m = find_match(src, src_len, pos, candidate, mf, max_chain,
-		               nice_len);
-
-		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
-		    level == ARK_DEFLATE_LEVEL_DEFAULT) {
-			ark_match_t m_next;
-
-			m_next.len = 0U;
-			m_next.dist = 0U;
-			if (pos + 3U < src_len) {
-				unsigned int hnext;
-				int32_t cnext;
-
-				hnext = hash3(src + pos + 1U, mf->hash_bits);
-				cnext = match_finder_head_get(mf, hnext);
-				m_next =
-				    find_match(src, src_len, pos + 1U, cnext,
-				               mf, max_chain, nice_len);
-			}
-			if (m_next.len > m.len + 1U) {
-				if (freq != NULL)
-					freq->lit[src[pos]]++;
-				if (bw != NULL &&
-				    emit_code_symbol(bw, lit_book, src[pos]) !=
-				        0)
-					return -1;
-				pos++;
-				continue;
-			}
-		}
-
-		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
-			unsigned int lsym;
-			unsigned int lextra_n;
-			uint16_t lextra_v;
-			unsigned int dsym;
-			unsigned int dextra_n;
-			uint16_t dextra_v;
-
-			if (length_symbol(m.len, &lsym, &lextra_n, &lextra_v) !=
-			    0)
-				return -1;
-			if (distance_symbol(m.dist, &dsym, &dextra_n,
-			                    &dextra_v) != 0)
-				return -1;
-			if (freq != NULL) {
-				freq->lit[lsym]++;
-				freq->dist[dsym]++;
-			}
-			if (bw != NULL) {
-				if (emit_code_symbol(bw, lit_book, lsym) != 0)
-					return -1;
-				if (lextra_n != 0U &&
-				    bw_put_bits(bw, lextra_v, lextra_n) != 0)
-					return -1;
-				if (emit_code_symbol(bw, dist_book, dsym) != 0)
-					return -1;
-				if (dextra_n != 0U &&
-				    bw_put_bits(bw, dextra_v, dextra_n) != 0)
-					return -1;
-			}
-
-			for (i = 1; i < m.len; i++)
-				(void)insert_hash(src, src_len, pos + i, mf);
-			pos += m.len;
-			continue;
-		}
-
-		if (freq != NULL)
-			freq->lit[src[pos]]++;
-		if (bw != NULL && emit_code_symbol(bw, lit_book, src[pos]) != 0)
-			return -1;
-		pos++;
-	}
-
-	if (freq != NULL)
-		freq->lit[256]++;
-	if (bw != NULL && emit_code_symbol(bw, lit_book, 256U) != 0)
-		return -1;
-	return 0;
-}
-
 /* Emit one literal byte using fixed Huffman coding. */
 static int emit_litlen_symbol(ark_bit_writer_t *bw, unsigned int sym)
 {
@@ -1125,14 +1083,12 @@ static int emit_match(ark_bit_writer_t *bw, size_t len, size_t dist)
 }
 
 /*
- * Compress with one fixed-Huffman block. Used for the fast level, which
- * matches greedily; the one-step lazy branch below runs only for the default
- * level.
+ * Compress at the fast level: greedy matching (at most 32 chain candidates,
+ * a 32-byte match ends the search) and one fixed-Huffman block.
  * See ARCHITECTURE.md section 7.2.
  */
 static int compress_fixed(ark_match_finder_t *mf, const uint8_t *src,
-                          size_t src_len, uint8_t *dst, size_t dst_cap,
-                          int level)
+                          size_t src_len, uint8_t *dst, size_t dst_cap)
 {
 	ark_bit_writer_t bw;
 	unsigned int max_chain;
@@ -1140,8 +1096,8 @@ static int compress_fixed(ark_match_finder_t *mf, const uint8_t *src,
 	size_t pos;
 	size_t i;
 
-	max_chain = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 256U;
-	nice_len = (level == ARK_DEFLATE_LEVEL_FAST) ? 32U : 128U;
+	max_chain = 32U;
+	nice_len = 32U;
 	match_finder_begin_parse(mf);
 
 	bw.dst = dst;
@@ -1163,36 +1119,6 @@ static int compress_fixed(ark_match_finder_t *mf, const uint8_t *src,
 		candidate = insert_hash(src, src_len, pos, mf);
 		m = find_match(src, src_len, pos, candidate, mf, max_chain,
 		               nice_len);
-
-		if (m.len >= ARK_DEFLATE_MIN_MATCH &&
-		    level == ARK_DEFLATE_LEVEL_DEFAULT) {
-			ark_match_t m_next;
-
-			m_next.len = 0U;
-			m_next.dist = 0U;
-
-			if (pos + 1U < src_len) {
-				if (pos + 3U <= src_len) {
-					unsigned int hnext;
-					int32_t cnext;
-
-					hnext = hash3(src + pos + 1U,
-					              mf->hash_bits);
-					cnext =
-					    match_finder_head_get(mf, hnext);
-					m_next = find_match(
-					    src, src_len, pos + 1U, cnext, mf,
-					    max_chain, nice_len);
-				}
-			}
-
-			if (m_next.len > m.len + 1U) {
-				if (emit_literal(&bw, src[pos]) != 0)
-					return -1;
-				pos++;
-				continue;
-			}
-		}
 
 		if (m.len >= ARK_DEFLATE_MIN_MATCH) {
 			/*
@@ -1393,92 +1319,6 @@ static size_t cl_plan_bits(const ark_cl_plan_t *cp)
 }
 
 /*
- * Build one dynamic-block coding plan for src[0..src_len) from a single
- * frequency parse. The plan is reused for selected-block emission to avoid
- * redundant full parse_block passes. See ARCHITECTURE.md §7.2.
- */
-static int build_dynamic_plan(ark_match_finder_t *mf, const uint8_t *src,
-                              size_t src_len, ark_dynamic_plan_t *plan,
-                              size_t *bits_out)
-{
-	ark_cl_plan_t cp;
-	size_t i;
-
-	if (parse_block(mf, src, src_len, ARK_DEFLATE_LEVEL_DEFAULT,
-	                &plan->freq, NULL, NULL, NULL) != 0)
-		return -1;
-	if (build_length_limited_lengths(plan->freq.lit, 286U, plan->lit_len,
-	                                 15U) != 0)
-		return -1;
-	if (build_length_limited_lengths(plan->freq.dist, 30U, plan->dist_len,
-	                                 15U) != 0)
-		return -1;
-
-	plan->hlit_count = 257U;
-	for (i = 257U; i < 286U; i++) {
-		if (plan->lit_len[i] != 0U)
-			plan->hlit_count = i + 1U;
-	}
-	plan->hdist_count = 1U;
-	for (i = 1U; i < 30U; i++) {
-		if (plan->dist_len[i] != 0U)
-			plan->hdist_count = i + 1U;
-	}
-
-	if (cl_plan_build(plan->lit_len, plan->hlit_count, plan->dist_len,
-	                  plan->hdist_count, &cp) != 0)
-		return -1;
-	*bits_out = cl_plan_bits(&cp) +
-	            huff_data_bits(&plan->freq, plan->lit_len, plan->dist_len);
-	return 0;
-}
-
-/*
- * Select a default-level block plan from deterministic candidate lengths.
- * Candidate enumeration order and strict-better replacement preserve stable
- * block boundary selection. See ARCHITECTURE.md §7.2 and §13.1.
- */
-static int choose_default_block_plan(ark_match_finder_t *mf, const uint8_t *src,
-                                     size_t remaining,
-                                     ark_dynamic_plan_t *best_plan)
-{
-	ark_dynamic_plan_t best;
-	size_t best_score;
-	size_t i;
-
-	best.len = remaining;
-	best_score = (size_t)-1;
-
-	for (i = 0; i < sizeof(g_default_block_candidates) /
-	                    sizeof(g_default_block_candidates[0]);
-	     i++) {
-		ark_dynamic_plan_t cand;
-		size_t len;
-		size_t bits;
-		size_t score;
-
-		len = g_default_block_candidates[i];
-		if (len > remaining)
-			len = remaining;
-		cand.len = len;
-		if (build_dynamic_plan(mf, src, len, &cand, &bits) != 0)
-			continue;
-		score = (bits * 65536U) / (len == 0U ? 1U : len);
-		if (score < best_score) {
-			best_score = score;
-			best = cand;
-		}
-		if (len == remaining)
-			break;
-	}
-
-	if (best_score == (size_t)-1)
-		return -1;
-	*best_plan = best;
-	return 0;
-}
-
-/*
  * Emit a dynamic block header (after BFINAL/BTYPE): HLIT, HDIST, HCLEN, the
  * CL code lengths and the run-length coded code lengths. Also builds the
  * lit/len and distance codebooks used for the block data.
@@ -1525,64 +1365,446 @@ static int emit_dynamic_header(ark_bit_writer_t *bw, const uint8_t *lit_len,
 	return 0;
 }
 
-static int emit_dynamic_block(ark_match_finder_t *mf, ark_bit_writer_t *bw,
-                              const uint8_t *src,
-                              const ark_dynamic_plan_t *plan, int final)
+/*
+ * Number of equal low-order bytes of two 8-byte little-endian loads, given
+ * x = a ^ b != 0. Portable count of trailing zero bytes: x & (0 - x) keeps
+ * the lowest set bit, so subtracting 1 sets every bit below it; bit 7 of
+ * each byte then marks a fully equal byte, and the multiply sums those
+ * marks into the top byte.
+ */
+static size_t equal_low_bytes(uint64_t x)
 {
-	ark_codebook_t lit_book;
-	ark_codebook_t dist_book;
+	uint64_t below;
 
-	if (bw_put_bits(bw, final ? 1U : 0U, 1U) != 0)
+	below = (x & (0U - x)) - 1U;
+	below = (below >> 7) & 0x0101010101010101U;
+	return (size_t)((below * 0x0101010101010101U) >> 56);
+}
+
+/*
+ * Search the hash chain from candidate for a match at pos longer than
+ * prev_len and at least ARK_DEFLATE_MIN_MATCH bytes. Candidates further
+ * back than the window end the search; at most max_chain candidates are
+ * tried, and a match of nice_len bytes stops it. Returns the length found,
+ * or 0 when none is longer, and stores its distance in *dist.
+ */
+static size_t find_longer_match(const uint8_t *src, size_t src_len, size_t pos,
+                                int32_t candidate, const ark_match_finder_t *mf,
+                                unsigned int max_chain, size_t nice_len,
+                                size_t prev_len, size_t *dist)
+{
+	size_t floor_len;
+	size_t best;
+	size_t max_len;
+	int32_t min_pos;
+
+	floor_len = prev_len < 2U ? 2U : prev_len;
+	if (src_len - pos < ARK_DEFLATE_MIN_MATCH)
+		return 0U;
+	max_len = src_len - pos;
+	if (max_len > ARK_DEFLATE_MAX_MATCH)
+		max_len = ARK_DEFLATE_MAX_MATCH;
+	if (floor_len >= max_len)
+		return 0U;
+	best = floor_len;
+	min_pos = (int32_t)(pos > mf->window_size ? pos - mf->window_size : 0U);
+
+	while (candidate >= min_pos && max_chain > 0U) {
+		size_t cand;
+
+		max_chain--;
+		cand = (size_t)candidate;
+		if (cand >= pos)
+			break;
+		/* best < max_len, so src[pos + best] is inside the input. The
+		 * byte that would make the match longer is checked first. */
+		if (src[cand + best] == src[pos + best] &&
+		    src[cand] == src[pos] && src[cand + 1U] == src[pos + 1U]) {
+			size_t len;
+
+			len = 2U;
+			for (;;) {
+				uint64_t x;
+
+				if (len + 8U > max_len) {
+					while (len < max_len &&
+					       src[cand + len] ==
+					           src[pos + len])
+						len++;
+					break;
+				}
+				x = load_u64_le(src + cand + len) ^
+				    load_u64_le(src + pos + len);
+				if (x != 0U) {
+					len += equal_low_bytes(x);
+					break;
+				}
+				len += 8U;
+			}
+			if (len > best) {
+				best = len;
+				*dist = pos - cand;
+				if (len >= nice_len || len >= max_len)
+					break;
+			}
+		}
+		candidate = match_finder_prev_get(mf, cand);
+	}
+	return best > floor_len ? best : 0U;
+}
+
+/*
+ * Parse src[0..src_len) once into enc->tokens with lazy matching: a match
+ * is deferred by one literal when the next position has a longer one, as in
+ * zlib's default levels. The hash chains span the whole input, so matches
+ * reach back across block boundaries within the window. Returns the token
+ * count (at most src_len).
+ */
+static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
+                           size_t src_len)
+{
+	ark_match_finder_t *mf;
+	uint32_t *tokens;
+	size_t count;
+	size_t pos;
+	size_t cur_len;
+	size_t cur_dist;
+	int32_t candidate;
+
+	mf = &enc->mf;
+	tokens = enc->tokens;
+	match_finder_begin_parse(mf);
+	count = 0U;
+	pos = 0U;
+	cur_dist = 0U;
+	candidate = insert_hash(src, src_len, 0U, mf);
+	cur_len = find_longer_match(src, src_len, 0U, candidate, mf,
+	                            ARK_DEFAULT_MAX_CHAIN, ARK_DEFAULT_NICE_LEN,
+	                            0U, &cur_dist);
+	while (pos < src_len) {
+		if (cur_len >= ARK_DEFLATE_MIN_MATCH) {
+			size_t from;
+			size_t i;
+
+			from = pos + 1U;
+			if (cur_len < ARK_DEFLATE_MAX_MATCH) {
+				size_t next_len;
+				size_t next_dist;
+
+				next_dist = 0U;
+				candidate =
+				    insert_hash(src, src_len, pos + 1U, mf);
+				next_len = find_longer_match(
+				    src, src_len, pos + 1U, candidate, mf,
+				    cur_len >= ARK_DEFAULT_GOOD_LEN
+				        ? ARK_DEFAULT_MAX_CHAIN >> 2
+				        : ARK_DEFAULT_MAX_CHAIN,
+				    ARK_DEFAULT_NICE_LEN, cur_len, &next_dist);
+				if (next_len > cur_len) {
+					tokens[count++] = src[pos];
+					pos++;
+					cur_len = next_len;
+					cur_dist = next_dist;
+					continue;
+				}
+				from = pos + 2U;
+			}
+			/*
+			 * SAFETY: cur_len <= 258 and cur_dist <= window_size
+			 * <= 32768, so both fit their token fields.
+			 */
+			tokens[count++] =
+			    ARK_TOKEN_MATCH |
+			    ((uint32_t)(cur_len - ARK_DEFLATE_MIN_MATCH)
+			     << ARK_TOKEN_LEN_SHIFT) |
+			    (uint32_t)(cur_dist - 1U);
+			for (i = from; i < pos + cur_len; i++)
+				(void)insert_hash(src, src_len, i, mf);
+			pos += cur_len;
+		} else {
+			tokens[count++] = src[pos];
+			pos++;
+		}
+		cur_len = 0U;
+		if (pos < src_len) {
+			candidate = insert_hash(src, src_len, pos, mf);
+			cur_len = find_longer_match(
+			    src, src_len, pos, candidate, mf,
+			    ARK_DEFAULT_MAX_CHAIN, ARK_DEFAULT_NICE_LEN, 0U,
+			    &cur_dist);
+		}
+	}
+	return count;
+}
+
+/* Length code index (symbol - 257) of a match token. */
+static unsigned int token_len_index(uint32_t t)
+{
+	return g_len_sym[(t >> ARK_TOKEN_LEN_SHIFT) & 0xffU];
+}
+
+/* Distance symbol of a match token. */
+static unsigned int token_dist_sym(uint32_t t)
+{
+	uint32_t d;
+
+	d = t & ARK_TOKEN_DIST_MASK;
+	return d < 256U ? g_dist_sym[d] : g_dist_sym[256U + (d >> 7)];
+}
+
+/* Input bytes a token covers. */
+static size_t token_bytes(uint32_t t)
+{
+	if ((t & ARK_TOKEN_MATCH) == 0U)
+		return 1U;
+	return (size_t)((t >> ARK_TOKEN_LEN_SHIFT) & 0xffU) +
+	       ARK_DEFLATE_MIN_MATCH;
+}
+
+/* Add a token's symbols to freq. */
+static void token_count(uint32_t t, ark_freq_t *freq)
+{
+	if ((t & ARK_TOKEN_MATCH) == 0U) {
+		freq->lit[t]++;
+		return;
+	}
+	freq->lit[257U + token_len_index(t)]++;
+	freq->dist[token_dist_sym(t)]++;
+}
+
+/* Emit tokens[first..end) and the end-of-block symbol with the codebooks. */
+static int emit_tokens(ark_bit_writer_t *bw, const uint32_t *tokens,
+                       size_t first, size_t end, const ark_codebook_t *lit_book,
+                       const ark_codebook_t *dist_book)
+{
+	size_t k;
+
+	for (k = first; k < end; k++) {
+		uint32_t t;
+		unsigned int li;
+		unsigned int ds;
+		uint32_t d;
+
+		t = tokens[k];
+		if ((t & ARK_TOKEN_MATCH) == 0U) {
+			if (emit_code_symbol(bw, lit_book, t) != 0)
+				return -1;
+			continue;
+		}
+		li = token_len_index(t);
+		ds = token_dist_sym(t);
+		d = (t & ARK_TOKEN_DIST_MASK) + 1U;
+		if (emit_code_symbol(bw, lit_book, 257U + li) != 0)
+			return -1;
+		if (g_len_extra[li] != 0U &&
+		    bw_put_bits(bw, (uint16_t)(token_bytes(t) - g_len_base[li]),
+		                g_len_extra[li]) != 0)
+			return -1;
+		if (emit_code_symbol(bw, dist_book, ds) != 0)
+			return -1;
+		if (g_dist_extra[ds] != 0U &&
+		    bw_put_bits(bw, (uint16_t)(d - g_dist_base[ds]),
+		                g_dist_extra[ds]) != 0)
+			return -1;
+	}
+	return emit_code_symbol(bw, lit_book, 256U);
+}
+
+/*
+ * Fill in the code lengths and HLIT/HDIST of plan from plan->freq and store
+ * the exact size in bits of the dynamic block (3-bit block header, code
+ * header and data) in *bits_out.
+ */
+static int plan_from_freq(ark_dynamic_plan_t *plan, size_t *bits_out)
+{
+	ark_cl_plan_t cp;
+	size_t i;
+
+	if (build_length_limited_lengths(plan->freq.lit, 286U, plan->lit_len,
+	                                 15U) != 0)
 		return -1;
-	if (bw_put_bits(bw, 2U, 2U) != 0)
+	if (build_length_limited_lengths(plan->freq.dist, 30U, plan->dist_len,
+	                                 15U) != 0)
 		return -1;
-	if (emit_dynamic_header(bw, plan->lit_len, plan->dist_len,
-	                        plan->hlit_count, plan->hdist_count, &lit_book,
-	                        &dist_book) != 0)
+
+	plan->hlit_count = 257U;
+	for (i = 257U; i < 286U; i++) {
+		if (plan->lit_len[i] != 0U)
+			plan->hlit_count = i + 1U;
+	}
+	plan->hdist_count = 1U;
+	for (i = 1U; i < 30U; i++) {
+		if (plan->dist_len[i] != 0U)
+			plan->hdist_count = i + 1U;
+	}
+
+	if (cl_plan_build(plan->lit_len, plan->hlit_count, plan->dist_len,
+	                  plan->hdist_count, &cp) != 0)
 		return -1;
-	if (parse_block(mf, src, plan->len, ARK_DEFLATE_LEVEL_DEFAULT, NULL, bw,
-	                &lit_book, &dist_book) != 0)
+	*bits_out = cl_plan_bits(&cp) +
+	            huff_data_bits(&plan->freq, plan->lit_len, plan->dist_len);
+	return 0;
+}
+
+/* Exact size in bits of a fixed-Huffman block with symbol counts freq. */
+static size_t fixed_block_bits(const ark_freq_t *freq)
+{
+	size_t bits;
+	size_t i;
+
+	bits = 3U + freq_extra_bits(freq);
+	for (i = 0; i < 286U; i++) {
+		unsigned int nbits;
+
+		nbits = i <= 143U ? 8U : i <= 255U ? 9U : i <= 279U ? 7U : 8U;
+		bits += (size_t)freq->lit[i] * nbits;
+	}
+	for (i = 0; i < 30U; i++)
+		bits += (size_t)freq->dist[i] * 5U;
+	return bits;
+}
+
+/* Build the RFC 1951 fixed lit/len and distance codebooks (section 3.2.6). */
+static int build_fixed_codebooks(ark_codebook_t *lit_book,
+                                 ark_codebook_t *dist_book)
+{
+	uint8_t lit_len[288];
+	uint8_t dist_len[30];
+	size_t i;
+
+	for (i = 0; i < 288U; i++)
+		lit_len[i] = i <= 143U   ? 8U
+		             : i <= 255U ? 9U
+		             : i <= 279U ? 7U
+		                         : 8U;
+	for (i = 0; i < 30U; i++)
+		dist_len[i] = 5U;
+	if (build_codes(lit_len, 288U, 9U, lit_book) != 0)
 		return -1;
+	return build_codes(dist_len, 30U, 5U, dist_book);
+}
+
+/*
+ * Choose the next block from tokens[first..count): grow it through the
+ * input lengths in g_default_block_candidates (each rounded up to a token
+ * boundary), cost each as a dynamic block, and keep the cheapest per input
+ * byte (the first on ties). Stores the end token in *end, the plan in
+ * *plan and its dynamic size in bits in *bits.
+ */
+static int choose_block(const uint32_t *tokens, size_t first, size_t count,
+                        ark_dynamic_plan_t *plan, size_t *end, size_t *bits)
+{
+	ark_freq_t freq;
+	uint64_t best_score;
+	size_t bytes;
+	size_t k;
+	size_t i;
+
+	for (i = 0; i < 286U; i++)
+		freq.lit[i] = 0U;
+	for (i = 0; i < 30U; i++)
+		freq.dist[i] = 0U;
+	best_score = UINT64_MAX;
+	bytes = 0U;
+	k = first;
+	for (i = 0; i < sizeof(g_default_block_candidates) /
+	                    sizeof(g_default_block_candidates[0]);
+	     i++) {
+		ark_dynamic_plan_t cand;
+		size_t cand_bits;
+		uint64_t score;
+
+		while (k < count && bytes < g_default_block_candidates[i]) {
+			token_count(tokens[k], &freq);
+			bytes += token_bytes(tokens[k]);
+			k++;
+		}
+		cand.freq = freq;
+		cand.freq.lit[256]++;
+		if (plan_from_freq(&cand, &cand_bits) != 0)
+			return -1;
+		score = ((uint64_t)cand_bits * 65536U) / bytes;
+		if (score < best_score) {
+			best_score = score;
+			*plan = cand;
+			*end = k;
+			*bits = cand_bits;
+		}
+		if (k == count)
+			break;
+	}
 	return 0;
 }
 
 /*
- * Compress at the default level using dynamic Huffman blocks.
- * Candidate block sizes are costed before emission so deterministic block
- * boundaries are selected from the local cost model.
+ * Compress at the default level: one lazy-matching parse of the whole input
+ * into tokens, then blocks cut from the token stream (choose_block). A
+ * block is written with the fixed codes when that is smaller than its
+ * dynamic encoding. Deterministic for a given input (§13.1).
+ * See ARCHITECTURE.md section 7.2.
  */
-static int compress_dynamic_default(ark_match_finder_t *mf, const uint8_t *src,
-                                    size_t src_len, uint8_t *dst,
-                                    size_t dst_cap)
+static int compress_default(ark_deflate_enc_t *enc, const uint8_t *src,
+                            size_t src_len, uint8_t *dst, size_t dst_cap)
 {
+	ark_codebook_t fixed_lit;
+	ark_codebook_t fixed_dist;
 	ark_bit_writer_t bw;
-	size_t off;
+	int fixed_ready;
+	size_t count;
+	size_t first;
 
-	off = 0U;
 	if (src_len == 0U)
 		return emit_stored_blocks(src, src_len, dst, dst_cap);
 
+	count = parse_tokens(enc, src, src_len);
 	bw.dst = dst;
 	bw.cap = dst_cap;
 	bw.pos = 0;
 	bw.bits = 0;
 	bw.nbits = 0;
+	fixed_ready = 0;
 
-	while (off < src_len) {
+	first = 0U;
+	while (first < count) {
 		ark_dynamic_plan_t plan;
-		size_t len;
-		int final;
+		size_t end;
+		size_t bits;
+		unsigned int final;
 
-		if (choose_default_block_plan(mf, src + off, src_len - off,
-		                              &plan) != 0)
+		end = first;
+		bits = 0U;
+		if (choose_block(enc->tokens, first, count, &plan, &end,
+		                 &bits) != 0 ||
+		    end <= first)
 			return -1;
-		len = plan.len;
-		if (len == 0U || len > src_len - off)
+		final = end == count ? 1U : 0U;
+		if (bw_put_bits(&bw, (uint16_t) final, 1U) != 0)
 			return -1;
-		final = off + len == src_len;
-		if (emit_dynamic_block(mf, &bw, src + off, &plan, final) != 0)
-			return -1;
-		off += len;
+		if (fixed_block_bits(&plan.freq) < bits) {
+			if (!fixed_ready) {
+				if (build_fixed_codebooks(&fixed_lit,
+				                          &fixed_dist) != 0)
+					return -1;
+				fixed_ready = 1;
+			}
+			if (bw_put_bits(&bw, 1U, 2U) != 0 ||
+			    emit_tokens(&bw, enc->tokens, first, end,
+			                &fixed_lit, &fixed_dist) != 0)
+				return -1;
+		} else {
+			ark_codebook_t lit_book;
+			ark_codebook_t dist_book;
+
+			if (bw_put_bits(&bw, 2U, 2U) != 0 ||
+			    emit_dynamic_header(&bw, plan.lit_len,
+			                        plan.dist_len, plan.hlit_count,
+			                        plan.hdist_count, &lit_book,
+			                        &dist_book) != 0 ||
+			    emit_tokens(&bw, enc->tokens, first, end, &lit_book,
+			                &dist_book) != 0)
+				return -1;
+		}
+		first = end;
 	}
 
 	if (bw_flush_to_byte(&bw) != 0)
@@ -1917,14 +2139,20 @@ static int enc_params_valid(const ark_deflate_params_t *params)
 }
 
 /*
- * Encoder memory size: the struct plus head and prev in its tables member.
- * The hash size follows the window, so window_bits 15 keeps the 15-bit hash
- * of earlier releases.
+ * Encoder memory size: the struct plus head and prev in its tables member
+ * and, at the default level, one token per input byte. The hash size
+ * follows the window, so window_bits 15 keeps the 15-bit hash of earlier
+ * releases. max_input <= ARK_DEFLATE_MAX_INPUT keeps the sum small.
  */
 static size_t enc_mem_size(const ark_deflate_params_t *params)
 {
-	return sizeof(struct ark_deflate_enc) +
+	size_t size;
+
+	size = sizeof(struct ark_deflate_enc) +
 	       2U * ((size_t)1U << params->window_bits) * sizeof(int32_t);
+	if (params->level == ARK_DEFLATE_LEVEL_DEFAULT)
+		size += params->max_input * sizeof(uint32_t);
+	return size;
 }
 
 size_t ark_deflate_enc_size(const ark_deflate_params_t *params)
@@ -1954,6 +2182,11 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 	enc->mf.window_size = (size_t)1U << params->window_bits;
 	enc->mf.head = enc->tables;
 	enc->mf.prev = enc->tables + ((size_t)1U << enc->mf.hash_bits);
+	enc->tokens = NULL;
+	/* The token buffer follows prev; C11 6.5p7 lets the unsigned type
+	 * access int32_t storage. */
+	if (enc->level == ARK_DEFLATE_LEVEL_DEFAULT)
+		enc->tokens = (uint32_t *)(enc->mf.prev + enc->mf.window_size);
 	/* prev is never read before written; clearing once keeps it defined. */
 	for (i = 0; i < enc->mf.window_size; i++)
 		enc->mf.prev[i] = -1;
@@ -1964,11 +2197,11 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 /*
  * ark_deflate_enc_oneshot - Compress one buffer into a raw RFC 1951 stream.
  *
- * Default level uses deterministic hash-chain search with one-step lazy
- * matching and dynamic-Huffman blocks whose lengths are chosen by estimated
- * cost; fast level uses greedy matching and one fixed-Huffman block. For
- * incompressible input, falls back to stored blocks when that yields
- * smaller output. See ARCHITECTURE.md sections 7.2 and 7.4.
+ * The default level parses the input once with lazy matching and writes
+ * blocks whose lengths and codes (dynamic or fixed Huffman) are chosen by
+ * exact cost; the fast level uses greedy matching and one fixed-Huffman
+ * block. For incompressible input, falls back to stored blocks when that
+ * yields smaller output. See ARCHITECTURE.md sections 7.2 and 7.4.
  */
 ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
                                              const uint8_t *src, size_t src_len,
@@ -1990,11 +2223,10 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 		return ARK_DEFLATE_ERR_OUTPUT;
 
 	if (enc->level == ARK_DEFLATE_LEVEL_DEFAULT)
-		fixed_len = compress_dynamic_default(&enc->mf, src, src_len,
-		                                     dst, dst_cap);
+		fixed_len = compress_default(enc, src, src_len, dst, dst_cap);
 	else
-		fixed_len = compress_fixed(&enc->mf, src, src_len, dst, dst_cap,
-		                           enc->level);
+		fixed_len =
+		    compress_fixed(&enc->mf, src, src_len, dst, dst_cap);
 
 	/*
 	 * ARCHITECTURE.md section 7.2: for incompressible data, emit stored
@@ -2185,6 +2417,29 @@ int ark_deflate_test_length_symbol(size_t len, unsigned int *sym,
                                    unsigned int *extra_n, uint16_t *extra_v)
 {
 	return length_symbol(len, sym, extra_n, extra_v);
+}
+
+/*
+ * ARK_DEFLATE_TEST only: lit/len and distance symbols the default-level
+ * tables give for a match of len (3..258) at dist (1..32768).
+ */
+void ark_deflate_test_token_symbols(size_t len, size_t dist,
+                                    unsigned int *len_sym,
+                                    unsigned int *dist_sym)
+{
+	uint32_t t;
+
+	t = ARK_TOKEN_MATCH |
+	    ((uint32_t)(len - ARK_DEFLATE_MIN_MATCH) << ARK_TOKEN_LEN_SHIFT) |
+	    (uint32_t)(dist - 1U);
+	*len_sym = 257U + token_len_index(t);
+	*dist_sym = token_dist_sym(t);
+}
+
+/* ARK_DEFLATE_TEST only: equal low-order bytes for x = a ^ b != 0. */
+size_t ark_deflate_test_equal_low_bytes(uint64_t x)
+{
+	return equal_low_bytes(x);
 }
 
 /* ARK_DEFLATE_TEST only: build length-limited Huffman code lengths. */
