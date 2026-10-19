@@ -70,7 +70,10 @@ The options are as follows:
 Select the hash algorithm.
 The default is BLAKE3.
 .It Fl -fast
-Use faster Deflate parsing with a lower compression ratio.
+Compress with Deflate level 1 instead of the default level 6.
+Creating an archive is roughly two to three times faster, but the
+archive is about a tenth larger and somewhat slower to extract.
+The archive format is the same either way.
 .It Fl -verbose
 Print each member path as it is added.
 .El
@@ -195,6 +198,11 @@ $ ark create archive.ark path
 Create an archive using SHA-256:
 .Bd -literal -offset indent
 $ ark create --hash sha256 archive.ark path
+.Ed
+.Pp
+Create an archive faster, at the cost of a larger archive:
+.Bd -literal -offset indent
+$ ark create --fast archive.ark path
 .Ed
 .Pp
 List archive members:

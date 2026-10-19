@@ -71,6 +71,15 @@ Create an archive:
 ark create archive.ark path
 ```
 
+The default compression (Deflate level 6) favours small archives.
+`--fast` uses level 1 instead: creating is roughly two to three times
+faster, but the archive is about a tenth larger and somewhat slower to
+extract. The archive format is the same either way.
+
+```sh
+ark create --fast archive.ark path
+```
+
 List archive contents:
 
 ```sh

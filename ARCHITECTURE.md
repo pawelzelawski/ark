@@ -1557,8 +1557,9 @@ ark generate-reader [output.c]
 
 **create flags:**
 - `--hash blake3|sha256` - select hash algorithm; default BLAKE3
-- `--fast` - Deflate level 1 (greedy parsing, short search); faster
-  compression, lower ratio
+- `--fast` - Deflate level 1 (greedy parsing, short search) instead of
+  level 6: create roughly two to three times faster, archive about a tenth
+  larger and somewhat slower to extract (section 7.4); same format
 - `--verbose` - print each member path as it is added
 - `path` - source file or directory; single file or full directory tree
 
