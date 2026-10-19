@@ -23,6 +23,7 @@ int ark_deflate_test_table_fits(const uint8_t *, size_t, int, size_t);
 void ark_deflate_test_token_symbols(size_t, size_t, unsigned int *,
                                     unsigned int *);
 size_t ark_deflate_test_equal_low_bytes(uint64_t);
+int ark_deflate_test_enc_chains_ok(const ark_deflate_enc_t *);
 
 static void fill_pattern(uint8_t *buf, size_t len)
 {
@@ -45,18 +46,19 @@ static void fill_randomish(uint8_t *buf, size_t len)
 }
 
 /*
- * test_enc_new - Allocate and initialize an encoder; NULL on failure. The
+ * test_enc_alloc - Allocate and initialize an encoder; NULL on failure. The
  * encoder lives at the start of the allocation, so free() releases it.
  */
-static ark_deflate_enc_t *test_enc_new(int level, unsigned int window_bits,
-                                       size_t max_input)
+static ark_deflate_enc_t *test_enc_alloc(int level, unsigned int window_bits,
+                                         size_t max_input, int streaming)
 {
 	ark_deflate_params_t params;
 	ark_deflate_enc_t *enc;
 	void *mem;
 	size_t size;
 
-	params = (ark_deflate_params_t){level, window_bits, max_input, 0};
+	params =
+	    (ark_deflate_params_t){level, window_bits, max_input, streaming};
 	size = ark_deflate_enc_size(&params);
 	if (size == 0U)
 		return NULL;
@@ -67,6 +69,13 @@ static ark_deflate_enc_t *test_enc_new(int level, unsigned int window_bits,
 	if (enc == NULL)
 		free(mem);
 	return enc;
+}
+
+/* test_enc_new - One-shot encoder (test_enc_alloc without streaming). */
+static ark_deflate_enc_t *test_enc_new(int level, unsigned int window_bits,
+                                       size_t max_input)
+{
+	return test_enc_alloc(level, window_bits, max_input, 0);
 }
 
 /*
@@ -1111,7 +1120,9 @@ static void fill_windowed(uint8_t *buf, size_t len)
 /*
  * Encoder size query: for levels 1..9 head and prev follow the window and
  * one 4-byte token is added per max_input byte; level 0 stores and needs
- * only a small header.
+ * only a small header. Streaming adds the input buffer (two windows plus
+ * max_input; max_input alone at level 0) and the output staging buffer
+ * (ark_deflate_bound(max_input) + 16).
  */
 int test_deflate_enc_size_query(void)
 {
@@ -1152,6 +1163,18 @@ int test_deflate_enc_size_query(void)
 		    base + 8U * (((size_t)1U << wb) - 256U))
 			return 1;
 	}
+
+	for (level = 0; level <= ARK_DEFLATE_LEVEL_BEST; level += 6) {
+		size_t one_shot;
+
+		p = (ark_deflate_params_t){level, 10U, 5000U, 0};
+		one_shot = ark_deflate_enc_size(&p);
+		p.streaming = 1;
+		if (ark_deflate_enc_size(&p) !=
+		    one_shot + (level == 0 ? 0U : 2048U) + 5000U +
+		        ark_deflate_bound(5000U) + 16U)
+			return 1;
+	}
 	return 0;
 }
 
@@ -1165,7 +1188,8 @@ int test_deflate_enc_rejects_invalid_params(void)
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 16U, 1024U, 0},
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 15U, 0U, 0},
 	    {ARK_DEFLATE_LEVEL_DEFAULT, 15U, ARK_DEFLATE_MAX_INPUT + 1U, 0},
-	    {ARK_DEFLATE_LEVEL_FAST, 15U, 1024U, 1},
+	    {ARK_DEFLATE_LEVEL_FAST, 15U, 1024U, 2},
+	    {ARK_DEFLATE_LEVEL_FAST, 15U, 1024U, -1},
 	};
 	ark_deflate_params_t good;
 	void *mem;
@@ -2544,5 +2568,572 @@ done:
 	free(comp);
 	free(in);
 	free(dec);
+	return rc;
+}
+
+/*
+ * enc_feed - Compress src[0..src_len) with a streaming encoder from its
+ * current state: in_piece input bytes per call with flush NONE, the last
+ * piece with flush (0 = random pieces from *seed), and out_piece output
+ * bytes offered per call (0 = random). Calls again after NEED_OUTPUT with
+ * the input not taken. Returns the status of the last call (also when the
+ * output is full: NEED_OUTPUT) and the bytes written in *out_total.
+ */
+static ark_deflate_status_t
+enc_feed(ark_deflate_enc_t *enc, const uint8_t *src, size_t src_len,
+         uint8_t *out, size_t out_cap, size_t in_piece, size_t out_piece,
+         uint32_t *seed, ark_deflate_flush_t flush, size_t *out_total)
+{
+	size_t ip;
+
+	ip = 0U;
+	*out_total = 0U;
+	for (;;) {
+		ark_deflate_flush_t f;
+		ark_deflate_status_t st;
+		size_t il;
+
+		il = src_len - ip;
+		if (in_piece != 0U && il > in_piece)
+			il = in_piece;
+		else if (in_piece == 0U && il > 0U)
+			il = 1U + test_rnd(seed) % (il < 3000U ? il : 3000U);
+		f = ip + il == src_len ? flush : ARK_DEFLATE_FLUSH_NONE;
+		do {
+			size_t ol;
+			size_t iu;
+			size_t ou;
+
+			ol = out_cap - *out_total;
+			if (out_piece != 0U && ol > out_piece)
+				ol = out_piece;
+			else if (out_piece == 0U && ol > 0U)
+				ol = 1U +
+				     test_rnd(seed) % (ol < 700U ? ol : 700U);
+			st = ark_deflate_enc_stream(enc, src + ip, il, &iu,
+			                            out + *out_total, ol, &ou,
+			                            f);
+			ip += iu;
+			il -= iu;
+			*out_total += ou;
+		} while (st == ARK_DEFLATE_NEED_OUTPUT && *out_total < out_cap);
+		if (ip == src_len || st != ARK_DEFLATE_NEED_INPUT)
+			return st;
+	}
+}
+
+/*
+ * Streaming round trip over levels 0, 1, 6, 9 and three (window bits,
+ * max_input) shapes, two of them sliding the input buffer many times:
+ * the output is the same whether input and output come whole, in random
+ * pieces or (one shape) one input byte per call, and it decodes within
+ * its window to the input. When the whole input fits one step (max_input
+ * 1 MiB) the stream equals the one-shot output.
+ */
+int test_deflate_enc_stream_round_trip(void)
+{
+	static const int levels[] = {0, 1, 6, 9};
+	static const unsigned int wbs[] = {15U, 9U, 12U};
+	static const size_t max_inputs[] = {ARK_DEFLATE_MAX_INPUT, 1000U,
+	                                    16384U};
+	static const size_t lens[] = {60000U, 20000U, 70000U};
+	uint8_t *in;
+	uint8_t *ref;
+	uint8_t *comp;
+	uint8_t *out;
+	uint32_t seed;
+	size_t cap;
+	size_t k;
+	int rc;
+
+	rc = 1;
+	seed = 0x5eedU;
+	cap = 80000U;
+	in = malloc(70000U);
+	ref = malloc(cap);
+	comp = malloc(cap);
+	out = malloc(70000U);
+	if (in == NULL || ref == NULL || comp == NULL || out == NULL)
+		goto done;
+	for (k = 0; k < 3U; k++) {
+		size_t li;
+		size_t si;
+
+		if (k == 0U)
+			fill_text(in, lens[k]);
+		else if (k == 1U)
+			fill_randomish(in, lens[k]);
+		else
+			fill_windowed(in, lens[k]);
+		for (li = 0; li < 4U; li++) {
+			for (si = 0; si < 3U; si++) {
+				ark_deflate_enc_t *enc;
+				size_t ref_n;
+				size_t n;
+				size_t dn;
+				int ok;
+
+				enc = test_enc_alloc(levels[li], wbs[si],
+				                     max_inputs[si], 1);
+				ok = enc != NULL &&
+				     enc_feed(enc, in, lens[k], ref, cap,
+				              SIZE_MAX, SIZE_MAX, &seed,
+				              ARK_DEFLATE_FLUSH_FINISH,
+				              &ref_n) == ARK_DEFLATE_END &&
+				     ark_deflate_test_decompress_window(
+				         ref, ref_n, out, lens[k], wbs[si],
+				         &dn) == ARK_DEFLATE_OK &&
+				     dn == lens[k] &&
+				     memcmp(out, in, lens[k]) == 0;
+				if (ok) {
+					ark_deflate_enc_reset(enc, 0);
+					ok = enc_feed(enc, in, lens[k], comp,
+					              cap, 0U, 0U, &seed,
+					              ARK_DEFLATE_FLUSH_FINISH,
+					              &n) == ARK_DEFLATE_END &&
+					     n == ref_n &&
+					     memcmp(comp, ref, n) == 0;
+				}
+				if (ok && si == 0U) {
+					ok =
+					    test_deflate_compress(
+					        in, lens[k], comp, cap,
+					        levels[li]) == (ssize_t)ref_n &&
+					    memcmp(comp, ref, ref_n) == 0;
+				}
+				if (ok && k == 1U && li == 2U && si == 1U) {
+					ark_deflate_enc_reset(enc, 0);
+					ok = enc_feed(enc, in, lens[k], comp,
+					              cap, 1U, SIZE_MAX, &seed,
+					              ARK_DEFLATE_FLUSH_FINISH,
+					              &n) == ARK_DEFLATE_END &&
+					     n == ref_n &&
+					     memcmp(comp, ref, n) == 0;
+				}
+				free(enc);
+				if (!ok)
+					goto done;
+			}
+		}
+	}
+	rc = 0;
+done:
+	free(out);
+	free(comp);
+	free(ref);
+	free(in);
+	return rc;
+}
+
+/* has_sync_marker - out[0..n) ends with the sync-flush bytes 00 00 FF FF. */
+static int has_sync_marker(const uint8_t *out, size_t n)
+{
+	return n >= 4U && out[n - 4U] == 0x00U && out[n - 3U] == 0x00U &&
+	       out[n - 2U] == 0xffU && out[n - 1U] == 0xffU;
+}
+
+/*
+ * RFC 7692 messages: each SYNC call returns OK with output ending in
+ * 00 00 FF FF; the receiver strips and re-appends them and decodes with
+ * history. A repeated message costs under a tenth with history and the same
+ * bytes as the first without it (reset(enc, 0) + reset(dec, 0)); an empty
+ * message is the single byte 00; one output byte per call writes the same
+ * bytes (the flush is not repeated on the calls that drain it).
+ */
+int test_deflate_enc_stream_sync_flush(void)
+{
+	ark_deflate_enc_t *enc;
+	ark_deflate_dec_t *dec;
+	uint8_t msg[5000];
+	uint8_t first[6000];
+	uint8_t comp[6000];
+	uint8_t out[5001];
+	uint32_t seed;
+	size_t first_n;
+	size_t n;
+	size_t iu;
+	size_t ou;
+	int rc;
+
+	rc = 1;
+	seed = 0x7692U;
+	fill_text(msg, sizeof(msg));
+	enc = test_enc_alloc(ARK_DEFLATE_LEVEL_DEFAULT, 15U, 16384U, 1);
+	dec = test_dec_new(15U);
+	if (enc == NULL || dec == NULL)
+		goto done;
+	if (enc_feed(enc, msg, sizeof(msg), first, sizeof(first), 0U, 0U, &seed,
+	             ARK_DEFLATE_FLUSH_SYNC, &first_n) != ARK_DEFLATE_OK ||
+	    !has_sync_marker(first, first_n) || first_n > sizeof(msg) / 2U ||
+	    stream_feed(dec, first, first_n, out, sizeof(out), 0U, 0U, &seed,
+	                &iu, &ou) != ARK_DEFLATE_NEED_INPUT ||
+	    ou != sizeof(msg) || memcmp(out, msg, sizeof(msg)) != 0)
+		goto done;
+
+	/* Same message again: a match into the history. */
+	if (enc_feed(enc, msg, sizeof(msg), comp, sizeof(comp), SIZE_MAX,
+	             SIZE_MAX, &seed, ARK_DEFLATE_FLUSH_SYNC,
+	             &n) != ARK_DEFLATE_OK ||
+	    !has_sync_marker(comp, n) || n > first_n / 10U ||
+	    stream_feed(dec, comp, n, out, sizeof(out), SIZE_MAX, SIZE_MAX,
+	                &seed, &iu, &ou) != ARK_DEFLATE_NEED_INPUT ||
+	    ou != sizeof(msg) || memcmp(out, msg, sizeof(msg)) != 0)
+		goto done;
+
+	/* Empty message: 00 plus the marker. */
+	if (enc_feed(enc, msg, 0U, comp, sizeof(comp), SIZE_MAX, SIZE_MAX,
+	             &seed, ARK_DEFLATE_FLUSH_SYNC, &n) != ARK_DEFLATE_OK ||
+	    n != 5U || comp[0] != 0x00U || !has_sync_marker(comp, n) ||
+	    stream_feed(dec, comp, n, out, sizeof(out), SIZE_MAX, SIZE_MAX,
+	                &seed, &iu, &ou) != ARK_DEFLATE_NEED_INPUT ||
+	    ou != 0U)
+		goto done;
+
+	/* No context takeover: the first message's bytes again, also when
+	 * the output is taken one byte per call. */
+	ark_deflate_enc_reset(enc, 0);
+	ark_deflate_dec_reset(dec, 0);
+	if (enc_feed(enc, msg, sizeof(msg), comp, sizeof(comp), 0U, 1U, &seed,
+	             ARK_DEFLATE_FLUSH_SYNC, &n) != ARK_DEFLATE_OK ||
+	    n != first_n || memcmp(comp, first, n) != 0 ||
+	    stream_feed(dec, comp, n, out, sizeof(out), 0U, 0U, &seed, &iu,
+	                &ou) != ARK_DEFLATE_NEED_INPUT ||
+	    ou != sizeof(msg))
+		goto done;
+
+	/* A finished stream continued with keep_history still matches. */
+	if (ark_deflate_enc_stream(enc, NULL, 0U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) != ARK_DEFLATE_END)
+		goto done;
+	ark_deflate_enc_reset(enc, 1);
+	if (enc_feed(enc, msg, sizeof(msg), comp, sizeof(comp), SIZE_MAX,
+	             SIZE_MAX, &seed, ARK_DEFLATE_FLUSH_FINISH,
+	             &n) != ARK_DEFLATE_END ||
+	    n > first_n / 10U)
+		goto done;
+	rc = 0;
+done:
+	free(dec);
+	free(enc);
+	return rc;
+}
+
+/*
+ * Streams far longer than the input buffer, with random SYNC flushes,
+ * decode within their window at every window bits 8..15 (level 6 and 1):
+ * the buffer slides and the hash positions move with it (the hash chains
+ * stay consistent after every piece). Matches survive
+ * the slides: 100 KB made of one repeated 16 KiB random piece, streamed
+ * at window 15 in 1000-byte steps, compresses to under a tenth.
+ */
+int test_deflate_enc_stream_window_limit(void)
+{
+	static const int levels[] = {ARK_DEFLATE_LEVEL_DEFAULT,
+	                             ARK_DEFLATE_LEVEL_FAST};
+	uint8_t *in;
+	uint8_t *comp;
+	uint8_t *out;
+	uint32_t seed;
+	unsigned int wb;
+	size_t len;
+	size_t cap;
+	int rc;
+
+	rc = 1;
+	seed = 0xa11ceU;
+	len = 100000U;
+	cap = 120000U;
+	in = malloc(len);
+	comp = malloc(cap);
+	out = malloc(len);
+	if (in == NULL || comp == NULL || out == NULL)
+		goto done;
+	fill_windowed(in, len);
+	for (wb = 8U; wb <= 15U; wb++) {
+		size_t li;
+
+		for (li = 0; li < 2U; li++) {
+			ark_deflate_enc_t *enc;
+			size_t ip;
+			size_t op;
+			size_t dn;
+			int ok;
+
+			enc = test_enc_alloc(levels[li], wb, 3000U, 1);
+			ok = enc != NULL;
+			ip = 0U;
+			op = 0U;
+			while (ok && ip < len) {
+				size_t piece;
+				size_t n;
+
+				piece = 1U + test_rnd(&seed) % 9000U;
+				if (piece > len - ip)
+					piece = len - ip;
+				ok = enc_feed(enc, in + ip, piece, comp + op,
+				              cap - op, 0U, 0U, &seed,
+				              ip + piece == len
+				                  ? ARK_DEFLATE_FLUSH_FINISH
+				                  : ARK_DEFLATE_FLUSH_SYNC,
+				              &n) == (ip + piece == len
+				                          ? ARK_DEFLATE_END
+				                          : ARK_DEFLATE_OK) &&
+				     ark_deflate_test_enc_chains_ok(enc);
+				ip += piece;
+				op += n;
+			}
+			ok = ok &&
+			     ark_deflate_test_decompress_window(comp, op, out,
+			                                        len, wb, &dn) ==
+			         ARK_DEFLATE_OK &&
+			     dn == len && memcmp(out, in, len) == 0;
+			free(enc);
+			if (!ok)
+				goto done;
+		}
+	}
+
+	{
+		ark_deflate_enc_t *enc;
+		size_t i;
+		size_t n;
+		int ok;
+
+		fill_randomish(in, 16384U);
+		for (i = 16384U; i < len; i++)
+			in[i] = in[i - 16384U];
+		enc = test_enc_alloc(ARK_DEFLATE_LEVEL_DEFAULT, 15U, 1000U, 1);
+		ok =
+		    enc != NULL &&
+		    enc_feed(enc, in, len, comp, cap, 0U, 0U, &seed,
+		             ARK_DEFLATE_FLUSH_FINISH, &n) == ARK_DEFLATE_END &&
+		    n < 16384U + (len - 16384U) / 10U;
+		free(enc);
+		if (!ok)
+			goto done;
+	}
+	rc = 0;
+done:
+	free(out);
+	free(comp);
+	free(in);
+	return rc;
+}
+
+/*
+ * Streaming statuses: usage errors take nothing; NONE buffers input
+ * (NEED_INPUT, no output); FINISH without output space waits
+ * (NEED_OUTPUT), then ends; END repeats, input after it is a usage error
+ * until reset; an empty stream is 03 00; a one-shot call on a streaming
+ * encoder matches a one-shot encoder and resets the stream.
+ */
+int test_deflate_enc_stream_status(void)
+{
+	ark_deflate_enc_t *enc;
+	ark_deflate_enc_t *plain;
+	uint8_t in[3000];
+	uint8_t comp[4000];
+	uint8_t ref[4000];
+	size_t iu;
+	size_t ou;
+	size_t n;
+	size_t ref_n;
+	int rc;
+
+	rc = 1;
+	fill_text(in, sizeof(in));
+	enc = test_enc_alloc(ARK_DEFLATE_LEVEL_DEFAULT, 15U, 4096U, 1);
+	plain = test_enc_new(ARK_DEFLATE_LEVEL_DEFAULT, 15U, 4096U);
+	if (enc == NULL || plain == NULL)
+		goto done;
+
+	if (ark_deflate_enc_stream(plain, in, 10U, &iu, comp, sizeof(comp), &ou,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    iu != 0U || ou != 0U ||
+	    ark_deflate_enc_set_dict(plain, in, 10U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(NULL, in, 10U, &iu, comp, sizeof(comp), &ou,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(enc, in, 10U, NULL, comp, sizeof(comp), &ou,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(enc, in, 10U, &iu, comp, sizeof(comp), NULL,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(enc, NULL, 10U, &iu, comp, sizeof(comp), &ou,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(enc, in, 10U, &iu, NULL, 10U, &ou,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_stream(enc, in, 10U, &iu, comp, sizeof(comp), &ou,
+	                           (ark_deflate_flush_t)7) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    iu != 0U || ou != 0U)
+		goto done;
+	ark_deflate_enc_reset(plain, 0);
+	ark_deflate_enc_reset(NULL, 0);
+
+	/* Empty stream: final fixed block with only end-of-block. */
+	if (ark_deflate_enc_stream(enc, NULL, 0U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_END ||
+	    n != 2U || comp[0] != 0x03U || comp[1] != 0x00U)
+		goto done;
+
+	/* After END: END again, input refused until reset. */
+	if (ark_deflate_enc_stream(enc, NULL, 0U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_NONE) != ARK_DEFLATE_END ||
+	    n != 0U ||
+	    ark_deflate_enc_stream(enc, in, 1U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_ERR_USAGE ||
+	    iu != 0U)
+		goto done;
+	ark_deflate_enc_reset(enc, 0);
+
+	/* NONE buffers; FINISH with no space waits, then completes. */
+	if (ark_deflate_enc_stream(enc, in, sizeof(in), &iu, comp, sizeof(comp),
+	                           &n, ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_NEED_INPUT ||
+	    iu != sizeof(in) || n != 0U ||
+	    ark_deflate_enc_stream(enc, NULL, 0U, &iu, NULL, 0U, &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_NEED_OUTPUT ||
+	    n != 0U ||
+	    ark_deflate_enc_stream(enc, NULL, 0U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_END ||
+	    test_deflate_decompress(comp, n, ref, sizeof(in)) !=
+	        (ssize_t)sizeof(in) ||
+	    memcmp(ref, in, sizeof(in)) != 0)
+		goto done;
+
+	/* One-shot on the streaming encoder mid-stream: same bytes as a
+	 * one-shot encoder, and the stream starts over (empty: 03 00). */
+	ark_deflate_enc_reset(enc, 0);
+	if (ark_deflate_enc_stream(enc, in, 100U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_NEED_INPUT ||
+	    ark_deflate_enc_oneshot(enc, in, sizeof(in), comp, sizeof(comp),
+	                            &n) != ARK_DEFLATE_OK ||
+	    ark_deflate_enc_oneshot(plain, in, sizeof(in), ref, sizeof(ref),
+	                            &ref_n) != ARK_DEFLATE_OK ||
+	    n != ref_n || memcmp(comp, ref, n) != 0 ||
+	    ark_deflate_enc_stream(enc, NULL, 0U, &iu, comp, sizeof(comp), &n,
+	                           ARK_DEFLATE_FLUSH_FINISH) !=
+	        ARK_DEFLATE_END ||
+	    n != 2U || comp[0] != 0x03U)
+		goto done;
+	rc = 0;
+done:
+	free(plain);
+	free(enc);
+	return rc;
+}
+
+/*
+ * Preset dictionary (pseudo-random bytes, so only the dictionary can
+ * supply matches): a message that repeats part of it compresses to under
+ * a tenth with it and decodes when the decoder has the
+ * same dictionary; without it the first match is out of range
+ * (ERR_DATA). A dictionary longer than the window counts with its last
+ * 1 << window_bits bytes on both sides; the dictionary's positions join
+ * the hash chains in order. Setting one after the stream
+ * took input, or a NULL one with a length, is a usage error; level 0
+ * accepts and ignores it.
+ */
+int test_deflate_stream_dictionary(void)
+{
+	static const unsigned int wbs[] = {15U, 9U};
+	ark_deflate_enc_t *enc;
+	ark_deflate_dec_t *dec;
+	uint8_t dict[20000];
+	uint8_t plain_out[6000];
+	uint8_t comp[6000];
+	uint8_t out[5000];
+	const uint8_t *msg;
+	uint32_t seed;
+	size_t plain_n;
+	size_t k;
+	size_t n;
+	size_t iu;
+	size_t ou;
+	int rc;
+
+	rc = 1;
+	seed = 0xd1c7U;
+	enc = NULL;
+	dec = NULL;
+	fill_randomish(dict, sizeof(dict));
+	for (k = 0; k < 2U; k++) {
+		/* At window 9 only the dictionary's last 512 bytes count. */
+		msg = k == 0U ? dict + 100 : dict + sizeof(dict) - 400U;
+		n = k == 0U ? sizeof(out) : 400U;
+		free(enc);
+		free(dec);
+		enc =
+		    test_enc_alloc(ARK_DEFLATE_LEVEL_DEFAULT, wbs[k], 8192U, 1);
+		dec = test_dec_new(wbs[k]);
+		if (enc == NULL || dec == NULL ||
+		    enc_feed(enc, msg, n, plain_out, sizeof(plain_out),
+		             SIZE_MAX, SIZE_MAX, &seed,
+		             ARK_DEFLATE_FLUSH_FINISH,
+		             &plain_n) != ARK_DEFLATE_END)
+			goto done;
+		ark_deflate_enc_reset(enc, 0);
+		if (ark_deflate_enc_set_dict(enc, dict, sizeof(dict)) !=
+		        ARK_DEFLATE_OK ||
+		    enc_feed(enc, msg, n, comp, sizeof(comp), 0U, 0U, &seed,
+		             ARK_DEFLATE_FLUSH_FINISH,
+		             &ou) != ARK_DEFLATE_END ||
+		    !ark_deflate_test_enc_chains_ok(enc) ||
+		    ou > plain_n / 10U ||
+		    ark_deflate_dec_set_dict(dec, dict, sizeof(dict)) !=
+		        ARK_DEFLATE_OK ||
+		    stream_feed(dec, comp, ou, out, n, 0U, 0U, &seed, &iu,
+		                &plain_n) != ARK_DEFLATE_END ||
+		    iu != ou || plain_n != n || memcmp(out, msg, n) != 0)
+			goto done;
+		ark_deflate_dec_reset(dec, 0);
+		if (stream_feed(dec, comp, ou, out, n, SIZE_MAX, SIZE_MAX,
+		                &seed, &iu, &plain_n) != ARK_DEFLATE_ERR_DATA)
+			goto done;
+	}
+
+	/* Too late, or NULL with a length. */
+	ark_deflate_enc_reset(enc, 0);
+	ark_deflate_dec_reset(dec, 0);
+	if (ark_deflate_enc_set_dict(enc, NULL, 1U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_set_dict(NULL, dict, 1U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_set_dict(dec, NULL, 1U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_set_dict(NULL, dict, 1U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_enc_set_dict(enc, NULL, 0U) != ARK_DEFLATE_OK ||
+	    ark_deflate_dec_set_dict(dec, NULL, 0U) != ARK_DEFLATE_OK ||
+	    ark_deflate_enc_stream(enc, dict, 10U, &iu, comp, sizeof(comp), &ou,
+	                           ARK_DEFLATE_FLUSH_NONE) !=
+	        ARK_DEFLATE_NEED_INPUT ||
+	    ark_deflate_enc_set_dict(enc, dict, 10U) != ARK_DEFLATE_ERR_USAGE ||
+	    ark_deflate_dec_stream(dec, comp, 1U, &iu, out, sizeof(out), &ou) !=
+	        ARK_DEFLATE_NEED_INPUT ||
+	    ark_deflate_dec_set_dict(dec, dict, 10U) != ARK_DEFLATE_ERR_USAGE)
+		goto done;
+
+	/* Level 0 never matches: the dictionary is accepted and unused. */
+	free(enc);
+	enc = test_enc_alloc(ARK_DEFLATE_LEVEL_NONE, 15U, 8192U, 1);
+	if (enc == NULL ||
+	    ark_deflate_enc_set_dict(enc, dict, sizeof(dict)) !=
+	        ARK_DEFLATE_OK ||
+	    enc_feed(enc, dict, 300U, comp, sizeof(comp), SIZE_MAX, SIZE_MAX,
+	             &seed, ARK_DEFLATE_FLUSH_FINISH, &ou) != ARK_DEFLATE_END ||
+	    test_deflate_decompress(comp, ou, out, 300U) != 300 ||
+	    memcmp(out, dict, 300U) != 0)
+		goto done;
+	rc = 0;
+done:
+	free(dec);
+	free(enc);
 	return rc;
 }

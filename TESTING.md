@@ -139,8 +139,9 @@ runs one guest thread at a time.
 Command sequence points that are not syscalls use `ark_test_cli_fault_inject`
 in `src/main.c` (for example `ARK_CLI_FAULT_CLEANUP_GROW`, which fails the
 extraction cleanup-tracker allocation). Deflate encoder internals and a
-window-limited decoder (`ark_deflate_test_decompress_window`) are reached
-through stateless `ark_deflate_test_*` accessors compiled only with
+window-limited decoder (`ark_deflate_test_decompress_window`) and a
+hash-chain check of a streaming encoder (`ark_deflate_test_enc_chains_ok`)
+are reached through stateless `ark_deflate_test_*` accessors compiled only with
 `-DARK_DEFLATE_TEST`, the codec's own test flag, so `deflate.c` does not
 depend on ark's `ARK_TEST`.
 
@@ -215,8 +216,8 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_bound_exact_values` | Bound = n + 5 per started 65,535-byte block + 1 (one block for n = 0), pinned at block edges and `ARK_DEFLATE_MAX_INPUT` |
 | `test_deflate_bound_overflow` | `ark_deflate_bound(SIZE_MAX)` is 0; near `SIZE_MAX` every result is 0 or larger than n (no wrap) |
 | `test_deflate_rejects_oversize_input` | `ARK_DEFLATE_MAX_INPUT + 1` input bytes on an encoder with the maximum `max_input`: rejected without output |
-| `test_deflate_enc_size_query` | Encoder size for levels 1..9: 256 KiB plus a small header at window 15 plus exactly 4 bytes per `max_input` byte (token buffer), the same for every level; level 0 needs only a small header; exactly 8 bytes per window byte between window sizes 8 and 15 |
-| `test_deflate_enc_rejects_invalid_params` | NULL params, levels -1/10, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 1: size 0 and no encoder |
+| `test_deflate_enc_size_query` | Encoder size for levels 1..9: 256 KiB plus a small header at window 15 plus exactly 4 bytes per `max_input` byte (token buffer), the same for every level; level 0 needs only a small header; exactly 8 bytes per window byte between window sizes 8 and 15; streaming adds exactly two windows (none at level 0) plus `max_input` plus `ark_deflate_bound(max_input)` + 16 bytes |
+| `test_deflate_enc_rejects_invalid_params` | NULL params, levels -1/10, window bits 7/16, `max_input` 0 or above the maximum, `streaming` 2 or -1: size 0 and no encoder |
 | `test_deflate_enc_init_memory_checks` | `enc_init` rejects NULL, one byte too short and misaligned memory; exact size gives an encoder at the start of the memory |
 | `test_deflate_enc_oneshot_status` | NULL `dst_len` or encoder and input above `max_input` give `ERR_USAGE`, `dst_cap` one below the bound gives `ERR_OUTPUT`, `dst_len` 0 after each; the encoder then compresses exactly like a fresh one |
 | `test_deflate_enc_reuse_deterministic` | One encoder compressing A, B, A at both levels gives each time the bytes a fresh encoder gives (no state carried between calls) |
@@ -258,6 +259,11 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_deflate_dec_stream_concatenated` | Back-to-back streams: each `END` at its exact size, later calls return `END` consuming nothing, `reset` starts the next |
 | `test_deflate_dec_stream_errors` | Size query and init checks (window bits 7/16, short and misaligned memory); usage errors consume nothing; truncation is `NEED_INPUT` and the rest completes the stream; reserved block type, stored LEN/NLEN mismatch and 284 + 31 are `ERR_DATA`; 284 + 30 decodes |
 | `test_deflate_dec_stream_fuzz` | 400 mutated default- and fast-level streams (fixed seed): streaming agrees with the one-shot decoder (same bytes and `in_used` on success, `ERR_DATA` or `NEED_INPUT` where it reports malformed input, `NEED_OUTPUT` on overflow) and random pieces give the same result as whole input |
+| `test_deflate_enc_stream_round_trip` | Streaming encoder at levels 0, 1, 6, 9 with (window bits, `max_input`) (15, 1 MiB), (9, 1000), (12, 16384) on text, random and windowed input: the bytes are the same with input and output whole, in random pieces and one input byte per call; they decode within the window to the input; with the whole input in one step they equal the one-shot output |
+| `test_deflate_enc_stream_sync_flush` | RFC 7692 messages: `SYNC` returns `OK` with output ending in `00 00 FF FF`; the streaming decoder decodes each message with history; a repeated message costs under a tenth; an empty message is `00` + marker; `reset(.., 0)` on both sides gives the first message's bytes again, also one output byte per call (the flush is written once); `reset(.., 1)` after `FINISH` keeps history |
+| `test_deflate_enc_stream_window_limit` | 100 KB streams with random `SYNC` flushes at window bits 8..15 (levels 6 and 1, `max_input` 3000) slide the input buffer many times, keep consistent hash chains (`ark_deflate_test_enc_chains_ok` after every piece) and decode within their window; a repeated 16 KiB random piece streamed in 1000-byte steps compresses to under a tenth (matches survive the slides) |
+| `test_deflate_enc_stream_status` | Usage errors (one-shot encoder, NULL encoder or counts, NULL buffers with sizes, unknown flush) take nothing; an empty stream is `03 00`; `END` repeats and input after it is `ERR_USAGE` until reset; `NONE` buffers (`NEED_INPUT`, no output); `FINISH` without space is `NEED_OUTPUT`, then `END`; a one-shot call mid-stream equals a one-shot encoder's bytes and resets the stream |
+| `test_deflate_stream_dictionary` | Preset dictionary on both sides (window 15, and window 9 where only its last 512 bytes count): a message repeating part of it compresses to under a tenth, decodes with the dictionary and is `ERR_DATA` without it; the hash chains stay consistent; `set_dict` after input or with NULL and a length is `ERR_USAGE`; level 0 accepts and ignores it |
 
 ### 3.4 Archive Write Path (`test_archive.c`)
 

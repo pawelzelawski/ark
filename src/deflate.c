@@ -1,11 +1,12 @@
 /*
  * deflate.c - RFC 1951 Deflate component implementation.
  *
- * Implements ark_deflate_bound, the encoder (ark_deflate_enc_*) and the
- * decoder (ark_deflate_dec_oneshot) from deflate.h. This component performs
- * pure in-memory transformation only: no I/O, no component-owned allocation
- * and no global or thread-local mutable state; encoder state lives in caller
- * memory. See ARCHITECTURE.md section 7.
+ * Implements ark_deflate_bound, the encoder (ark_deflate_enc_*, one-shot
+ * and streaming) and the decoder (ark_deflate_dec_*) from deflate.h. This
+ * component performs pure in-memory transformation only: no I/O, no
+ * component-owned allocation and no global or thread-local mutable state;
+ * encoder and decoder state live in caller memory. See ARCHITECTURE.md
+ * section 7.
  */
 
 #include <limits.h>
@@ -96,12 +97,6 @@ typedef struct {
 } ark_match_finder_t;
 
 /*
- * Encoder state. The struct sits at the start of the caller's memory; tables
- * holds the match-finder arrays: head (1 << hash_bits entries), then prev
- * (window_size entries), then the token buffer (max_input entries). Level 0
- * has no tables (head, prev and tokens are NULL).
- */
-/*
  * Match-search parameters of one compression level (zlib's
  * configuration table, adapted). max_chain: hash-chain candidates tried
  * per search; nice_len: a match this long ends the search; max_lazy:
@@ -116,12 +111,55 @@ typedef struct {
 	uint16_t good_len;
 } ark_level_params_t;
 
+/* Streaming encoder phases (ark_deflate_enc_stream). */
+typedef enum {
+	ARK_SE_ACTIVE = 0, /* taking input */
+	ARK_SE_FINISHING,  /* final block staged, output not all returned */
+	ARK_SE_DONE,
+	ARK_SE_ERROR,
+} ark_se_mode_t;
+
+/*
+ * Streaming state. win holds the stream's recent input: win[0..start) is
+ * history (matches reach back up to window_size bytes of it), and
+ * win[start..fill) is input taken but not compressed yet, at most max_input
+ * bytes. Hash positions are offsets into win; positions below ins are in
+ * the hash chains. obuf stages the compressed bytes of one step, returned
+ * from obuf_pos; bits and nbits hold the bits of a byte not complete yet.
+ */
+typedef struct {
+	uint8_t *win;
+	size_t win_cap;
+	size_t hist;
+	size_t start;
+	size_t fill;
+	size_t ins;
+	uint8_t *obuf;
+	size_t obuf_cap;
+	size_t obuf_len;
+	size_t obuf_pos;
+	uint64_t bits;
+	unsigned int nbits;
+	ark_se_mode_t mode;
+	int synced;
+	int started;
+} ark_enc_stream_t;
+
+/*
+ * Encoder state. The struct sits at the start of the caller's memory; tables
+ * holds the match-finder arrays: head (1 << hash_bits entries), then prev
+ * (window_size entries), then the token buffer (max_input entries). Level 0
+ * has no tables (head, prev and tokens are NULL). A streaming encoder adds
+ * the bytes of win and obuf after them.
+ */
 struct ark_deflate_enc {
 	ark_match_finder_t mf;
 	uint32_t *tokens;
 	ark_level_params_t lp;
 	int level;
+	int streaming;
 	size_t max_input;
+	ark_enc_stream_t s;
 	int32_t tables[];
 };
 
@@ -565,66 +603,61 @@ static int inflate_decode_sym(ark_bit_reader_t *br, const uint32_t *tab,
 	return 0;
 }
 
-/* Emit one RFC 1951 stored block, splitting as needed at 65535 bytes. */
+/*
+ * Write src as RFC 1951 stored blocks of at most 65535 bytes after the bits
+ * already in bw; final marks the last block. An empty src gives one empty
+ * block (with final 0, the sync-flush marker 00 00 FF FF).
+ */
+static int emit_stored(ark_bit_writer_t *bw, const uint8_t *src, size_t src_len,
+                       unsigned int final)
+{
+	size_t off;
+
+	off = 0;
+	do {
+		uint16_t chunk;
+		uint16_t nlen;
+		size_t i;
+
+		chunk = (uint16_t)((src_len - off) > 65535U ? 65535U
+		                                            : (src_len - off));
+		nlen = (uint16_t)~chunk;
+		if (bw_put_bits(bw,
+		                (uint16_t)(off + chunk == src_len ? final : 0U),
+		                1U) != 0)
+			return -1;
+		if (bw_put_bits(bw, 0U, 2U) != 0)
+			return -1;
+		if (bw_flush_to_byte(bw) != 0)
+			return -1;
+
+		if (bw->pos + 4U + chunk > bw->cap)
+			return -1;
+		bw->dst[bw->pos++] = (uint8_t)(chunk & 0xffU);
+		bw->dst[bw->pos++] = (uint8_t)(chunk >> 8);
+		bw->dst[bw->pos++] = (uint8_t)(nlen & 0xffU);
+		bw->dst[bw->pos++] = (uint8_t)(nlen >> 8);
+		for (i = 0; i < chunk; i++)
+			bw->dst[bw->pos + i] = src[off + i];
+		bw->pos += (size_t)chunk;
+		off += chunk;
+	} while (off < src_len);
+	return 0;
+}
+
+/* Emit src as one complete stream of stored blocks; returns its size. */
 static int emit_stored_blocks(const uint8_t *src, size_t src_len, uint8_t *dst,
                               size_t dst_cap)
 {
 	ark_bit_writer_t bw;
-	size_t off;
 
 	bw.dst = dst;
 	bw.cap = dst_cap;
 	bw.pos = 0;
 	bw.bits = 0;
 	bw.nbits = 0;
-	off = 0;
-
-	if (src_len == 0U) {
-		if (bw_put_bits(&bw, 1U, 1U) != 0)
-			return -1;
-		if (bw_put_bits(&bw, 0U, 2U) != 0)
-			return -1;
-		if (bw_flush_to_byte(&bw) != 0)
-			return -1;
-		if (bw.pos + 4U > bw.cap)
-			return -1;
-		bw.dst[bw.pos++] = 0x00;
-		bw.dst[bw.pos++] = 0x00;
-		bw.dst[bw.pos++] = 0xff;
-		bw.dst[bw.pos++] = 0xff;
-		return (int)bw.pos;
-	}
-
-	while (off < src_len) {
-		uint16_t chunk;
-		uint16_t nlen;
-		unsigned int final;
-		size_t i;
-
-		chunk = (uint16_t)((src_len - off) > 65535U ? 65535U
-		                                            : (src_len - off));
-		nlen = (uint16_t)~chunk;
-		final = (off + chunk == src_len) ? 1U : 0U;
-
-		if (bw_put_bits(&bw, (uint16_t) final, 1U) != 0)
-			return -1;
-		if (bw_put_bits(&bw, 0U, 2U) != 0)
-			return -1;
-		if (bw_flush_to_byte(&bw) != 0)
-			return -1;
-
-		if (bw.pos + 4U + chunk > bw.cap)
-			return -1;
-		bw.dst[bw.pos++] = (uint8_t)(chunk & 0xffU);
-		bw.dst[bw.pos++] = (uint8_t)(chunk >> 8);
-		bw.dst[bw.pos++] = (uint8_t)(nlen & 0xffU);
-		bw.dst[bw.pos++] = (uint8_t)(nlen >> 8);
-		for (i = 0; i < chunk; i++)
-			bw.dst[bw.pos + i] = src[off + i];
-		bw.pos += (size_t)chunk;
-		off += chunk;
-	}
-
+	if (emit_stored(&bw, src, src_len, 1U) != 0)
+		return -1;
 	return (int)bw.pos;
 }
 
@@ -1204,15 +1237,17 @@ static size_t find_longer_match(const uint8_t *src, size_t src_len, size_t pos,
 }
 
 /*
- * Parse src[0..src_len) once into enc->tokens with the level's search
- * parameters. With lazy matching (max_lazy > 0) a match shorter than
- * max_lazy is deferred by one literal when the next position has a longer
- * one, as in zlib's default levels; greedy levels take every match found.
- * The hash chains span the whole input, so matches reach back across block
- * boundaries within the window. Returns the token count (at most src_len).
+ * Parse src[start..src_len) once into enc->tokens with the level's search
+ * parameters; the positions before start are history the caller has already
+ * inserted into the hash chains. With lazy matching (max_lazy > 0) a match
+ * shorter than max_lazy is deferred by one literal when the next position
+ * has a longer one, as in zlib's default levels; greedy levels take every
+ * match found. The hash chains span the whole input, so matches reach back
+ * across block boundaries within the window. Returns the token count (at
+ * most src_len - start).
  */
 static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
-                           size_t src_len)
+                           size_t start, size_t src_len)
 {
 	const ark_level_params_t *lp;
 	ark_match_finder_t *mf;
@@ -1226,12 +1261,11 @@ static size_t parse_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 	lp = &enc->lp;
 	mf = &enc->mf;
 	tokens = enc->tokens;
-	match_finder_begin_parse(mf);
 	count = 0U;
-	pos = 0U;
+	pos = start;
 	cur_dist = 0U;
-	candidate = insert_hash(src, src_len, 0U, mf);
-	cur_len = find_longer_match(src, src_len, 0U, candidate, mf,
+	candidate = insert_hash(src, src_len, pos, mf);
+	cur_len = find_longer_match(src, src_len, pos, candidate, mf,
 	                            lp->max_chain, lp->nice_len, 0U, &cur_dist);
 	while (pos < src_len) {
 		if (cur_len >= ARK_DEFLATE_MIN_MATCH) {
@@ -1488,39 +1522,25 @@ static int choose_block(const uint32_t *tokens, size_t first, size_t count,
 }
 
 /*
- * Compress at levels 1-9: one parse of the whole input into tokens with the
- * level's search, then blocks cut from the token stream (choose_block). A
- * block is written with the fixed codes when that is smaller than its
- * dynamic encoding. Deterministic for a given input (§13.1).
- * See ARCHITECTURE.md section 7.2.
+ * Write enc->tokens[0..count) as blocks cut from the token stream
+ * (choose_block) after the bits already in bw; final marks the last block.
+ * A block is written with the fixed codes when that is smaller than its
+ * dynamic encoding.
  */
-static int compress_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
-                           size_t src_len, uint8_t *dst, size_t dst_cap)
+static int emit_token_blocks(const ark_deflate_enc_t *enc, size_t count,
+                             ark_bit_writer_t *bw, unsigned int final)
 {
 	ark_codebook_t fixed_lit;
 	ark_codebook_t fixed_dist;
-	ark_bit_writer_t bw;
 	int fixed_ready;
-	size_t count;
 	size_t first;
 
-	if (src_len == 0U)
-		return emit_stored_blocks(src, src_len, dst, dst_cap);
-
-	count = parse_tokens(enc, src, src_len);
-	bw.dst = dst;
-	bw.cap = dst_cap;
-	bw.pos = 0;
-	bw.bits = 0;
-	bw.nbits = 0;
 	fixed_ready = 0;
-
 	first = 0U;
 	while (first < count) {
 		ark_dynamic_plan_t plan;
 		size_t end;
 		size_t bits;
-		unsigned int final;
 
 		end = first;
 		bits = 0U;
@@ -1528,8 +1548,8 @@ static int compress_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 		                 &bits) != 0 ||
 		    end <= first)
 			return -1;
-		final = end == count ? 1U : 0U;
-		if (bw_put_bits(&bw, (uint16_t) final, 1U) != 0)
+		if (bw_put_bits(bw, (uint16_t)(end == count ? final : 0U),
+		                1U) != 0)
 			return -1;
 		if (fixed_block_bits(&plan.freq) < bits) {
 			if (!fixed_ready) {
@@ -1538,27 +1558,51 @@ static int compress_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
 					return -1;
 				fixed_ready = 1;
 			}
-			if (bw_put_bits(&bw, 1U, 2U) != 0 ||
-			    emit_tokens(&bw, enc->tokens, first, end,
-			                &fixed_lit, &fixed_dist) != 0)
+			if (bw_put_bits(bw, 1U, 2U) != 0 ||
+			    emit_tokens(bw, enc->tokens, first, end, &fixed_lit,
+			                &fixed_dist) != 0)
 				return -1;
 		} else {
 			ark_codebook_t lit_book;
 			ark_codebook_t dist_book;
 
-			if (bw_put_bits(&bw, 2U, 2U) != 0 ||
-			    emit_dynamic_header(&bw, plan.lit_len,
-			                        plan.dist_len, plan.hlit_count,
+			if (bw_put_bits(bw, 2U, 2U) != 0 ||
+			    emit_dynamic_header(bw, plan.lit_len, plan.dist_len,
+			                        plan.hlit_count,
 			                        plan.hdist_count, &lit_book,
 			                        &dist_book) != 0 ||
-			    emit_tokens(&bw, enc->tokens, first, end, &lit_book,
+			    emit_tokens(bw, enc->tokens, first, end, &lit_book,
 			                &dist_book) != 0)
 				return -1;
 		}
 		first = end;
 	}
+	return 0;
+}
 
-	if (bw_flush_to_byte(&bw) != 0)
+/*
+ * Compress at levels 1-9: one parse of the whole input into tokens with the
+ * level's search, then blocks cut from the token stream. Deterministic for
+ * a given input (§13.1). See ARCHITECTURE.md section 7.2.
+ */
+static int compress_tokens(ark_deflate_enc_t *enc, const uint8_t *src,
+                           size_t src_len, uint8_t *dst, size_t dst_cap)
+{
+	ark_bit_writer_t bw;
+	size_t count;
+
+	if (src_len == 0U)
+		return emit_stored_blocks(src, src_len, dst, dst_cap);
+
+	match_finder_begin_parse(&enc->mf);
+	count = parse_tokens(enc, src, 0U, src_len);
+	bw.dst = dst;
+	bw.cap = dst_cap;
+	bw.pos = 0;
+	bw.bits = 0;
+	bw.nbits = 0;
+	if (emit_token_blocks(enc, count, &bw, 1U) != 0 ||
+	    bw_flush_to_byte(&bw) != 0)
 		return -1;
 	return bw.pos > (size_t)INT_MAX ? -1 : (int)bw.pos;
 }
@@ -1883,26 +1927,49 @@ static int enc_params_valid(const ark_deflate_params_t *params)
 	if (params->max_input == 0U ||
 	    params->max_input > ARK_DEFLATE_MAX_INPUT)
 		return 0;
-	/* Streaming state is added with the streaming calls (§7.4). */
-	if (params->streaming != 0)
+	if (params->streaming != 0 && params->streaming != 1)
 		return 0;
 	return 1;
+}
+
+/*
+ * Streaming buffers: win keeps window_size bytes of history (none at level
+ * 0, which never matches) plus up to max_input bytes of new input, with
+ * room to slide by whole windows (stream_slide); obuf holds one step's
+ * output, at most stored blocks of max_input bytes plus the bits carried
+ * in, a sync-flush marker and an empty final block.
+ */
+static size_t enc_win_cap(const ark_deflate_params_t *params)
+{
+	if (params->level == ARK_DEFLATE_LEVEL_NONE)
+		return params->max_input;
+	return 2U * ((size_t)1U << params->window_bits) + params->max_input;
+}
+
+static size_t enc_obuf_cap(const ark_deflate_params_t *params)
+{
+	return ark_deflate_bound(params->max_input) + 16U;
 }
 
 /*
  * Encoder memory size: the struct, then for levels 1-9 head and prev in its
  * tables member and one token per input byte; level 0 stores and needs no
  * tables. The hash size follows the window, so window_bits 15 keeps the
- * 15-bit hash of earlier releases. max_input <= ARK_DEFLATE_MAX_INPUT keeps
- * the sum small.
+ * 15-bit hash of earlier releases. Streaming adds win and obuf.
+ * max_input <= ARK_DEFLATE_MAX_INPUT keeps the sum small.
  */
 static size_t enc_mem_size(const ark_deflate_params_t *params)
 {
-	if (params->level == ARK_DEFLATE_LEVEL_NONE)
-		return sizeof(struct ark_deflate_enc);
-	return sizeof(struct ark_deflate_enc) +
-	       2U * ((size_t)1U << params->window_bits) * sizeof(int32_t) +
-	       params->max_input * sizeof(uint32_t);
+	size_t size;
+
+	size = sizeof(struct ark_deflate_enc);
+	if (params->level != ARK_DEFLATE_LEVEL_NONE)
+		size +=
+		    2U * ((size_t)1U << params->window_bits) * sizeof(int32_t) +
+		    params->max_input * sizeof(uint32_t);
+	if (params->streaming)
+		size += enc_win_cap(params) + enc_obuf_cap(params);
+	return size;
 }
 
 size_t ark_deflate_enc_size(const ark_deflate_params_t *params)
@@ -1916,7 +1983,7 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
                                         const ark_deflate_params_t *params)
 {
 	ark_deflate_enc_t *enc;
-	size_t i;
+	int32_t *tail;
 
 	if (mem == NULL || !enc_params_valid(params))
 		return NULL;
@@ -1927,25 +1994,40 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 
 	enc = mem;
 	enc->level = params->level;
+	enc->streaming = params->streaming;
 	enc->lp = g_level_params[params->level];
 	enc->max_input = params->max_input;
 	enc->mf.hash_bits = params->window_bits;
 	enc->mf.window_size = (size_t)1U << params->window_bits;
-	if (enc->level == ARK_DEFLATE_LEVEL_NONE) {
-		enc->mf.head = NULL;
-		enc->mf.prev = NULL;
-		enc->tokens = NULL;
-		return enc;
+	enc->mf.head = NULL;
+	enc->mf.prev = NULL;
+	enc->tokens = NULL;
+	tail = enc->tables;
+	if (enc->level != ARK_DEFLATE_LEVEL_NONE) {
+		size_t i;
+
+		enc->mf.head = enc->tables;
+		enc->mf.prev = enc->tables + ((size_t)1U << enc->mf.hash_bits);
+		/* The token buffer follows prev; C11 6.5p7 lets the unsigned
+		 * type access int32_t storage. */
+		enc->tokens = (uint32_t *)(enc->mf.prev + enc->mf.window_size);
+		tail = enc->mf.prev + enc->mf.window_size + enc->max_input;
+		/* prev is never read before written; clearing once keeps it
+		 * defined. */
+		for (i = 0; i < enc->mf.window_size; i++)
+			enc->mf.prev[i] = -1;
+		match_finder_begin_parse(&enc->mf);
 	}
-	enc->mf.head = enc->tables;
-	enc->mf.prev = enc->tables + ((size_t)1U << enc->mf.hash_bits);
-	/* The token buffer follows prev; C11 6.5p7 lets the unsigned type
-	 * access int32_t storage. */
-	enc->tokens = (uint32_t *)(enc->mf.prev + enc->mf.window_size);
-	/* prev is never read before written; clearing once keeps it defined. */
-	for (i = 0; i < enc->mf.window_size; i++)
-		enc->mf.prev[i] = -1;
-	match_finder_begin_parse(&enc->mf);
+	if (enc->streaming) {
+		enc->s.win = (uint8_t *)tail;
+		enc->s.win_cap = enc_win_cap(params);
+		enc->s.hist = enc->level == ARK_DEFLATE_LEVEL_NONE
+		                  ? 0U
+		                  : enc->mf.window_size;
+		enc->s.obuf = enc->s.win + enc->s.win_cap;
+		enc->s.obuf_cap = enc_obuf_cap(params);
+		ark_deflate_enc_reset(enc, 0);
+	}
 	return enc;
 }
 
@@ -1982,6 +2064,8 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 		fixed_len = -1;
 	else
 		fixed_len = compress_tokens(enc, src, src_len, dst, dst_cap);
+	/* The parse reused the match finder: the stream starts over. */
+	ark_deflate_enc_reset(enc, 0);
 
 	/*
 	 * ARCHITECTURE.md section 7.2: for incompressible data, emit stored
@@ -1998,6 +2082,292 @@ ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
 	}
 
 	*dst_len = (size_t)fixed_len;
+	return ARK_DEFLATE_OK;
+}
+
+/* Bit writer over the stream's staging buffer, continuing its bits. */
+static void stream_bw_load(const ark_enc_stream_t *s, ark_bit_writer_t *bw)
+{
+	bw->dst = s->obuf;
+	bw->cap = s->obuf_cap;
+	bw->pos = s->obuf_len;
+	bw->bits = s->bits;
+	bw->nbits = s->nbits;
+}
+
+static void stream_bw_store(ark_enc_stream_t *s, const ark_bit_writer_t *bw)
+{
+	s->obuf_len = bw->pos;
+	s->bits = bw->bits;
+	s->nbits = bw->nbits;
+}
+
+/*
+ * Compress the input taken so far, win[start..fill), into obuf as blocks
+ * after the bits carried in; final marks the stream's last block. Matches
+ * reach into the history before start. Like the one-shot call, falls back
+ * to stored blocks when compressing does not make the piece smaller.
+ */
+static int stream_step(ark_deflate_enc_t *enc, unsigned int final)
+{
+	ark_enc_stream_t *s;
+	ark_bit_writer_t bw;
+	ark_bit_writer_t saved;
+	size_t pend;
+	int rc;
+
+	s = &enc->s;
+	pend = s->fill - s->start;
+	stream_bw_load(s, &bw);
+	saved = bw;
+	rc = -1;
+	if (enc->level != ARK_DEFLATE_LEVEL_NONE) {
+		size_t count;
+
+		/* History not in the chains yet: the last two positions of the
+		 * previous piece, or a preset dictionary. */
+		while (s->ins < s->start && s->ins + 2U < s->fill)
+			(void)insert_hash(s->win, s->fill, s->ins++, &enc->mf);
+		count = parse_tokens(enc, s->win, s->start, s->fill);
+		if (s->fill >= 2U && s->ins < s->fill - 2U)
+			s->ins = s->fill - 2U;
+		rc = emit_token_blocks(enc, count, &bw, final);
+		if (rc == 0 && (bw.pos - saved.pos) * 8U + bw.nbits >=
+		                   pend * 8U + saved.nbits)
+			rc = -1;
+	}
+	if (rc != 0) {
+		bw = saved;
+		if (emit_stored(&bw, s->win + s->start, pend, final) != 0)
+			return -1;
+	}
+	stream_bw_store(s, &bw);
+	s->start = s->fill;
+	return 0;
+}
+
+/*
+ * Make room in a full win (nothing pending): keep the last window_size to
+ * 2 * window_size - 1 bytes, moving by a multiple of window_size so prev
+ * slots (indexed by position & (window_size - 1)) stay in place, and move
+ * every hash position with them; positions that fall off become -1.
+ */
+static void stream_slide(ark_deflate_enc_t *enc)
+{
+	ark_enc_stream_t *s;
+	size_t shift;
+	size_t n;
+	size_t i;
+
+	s = &enc->s;
+	if (s->hist == 0U) {
+		s->start = 0U;
+		s->fill = 0U;
+		return;
+	}
+	shift = (s->fill - s->hist) / s->hist * s->hist;
+	for (i = shift; i < s->fill; i++)
+		s->win[i - shift] = s->win[i];
+	n = (size_t)1U << enc->mf.hash_bits;
+	for (i = 0; i < n; i++)
+		enc->mf.head[i] = enc->mf.head[i] >= (int32_t)shift
+		                      ? enc->mf.head[i] - (int32_t)shift
+		                      : -1;
+	for (i = 0; i < enc->mf.window_size; i++)
+		enc->mf.prev[i] = enc->mf.prev[i] >= (int32_t)shift
+		                      ? enc->mf.prev[i] - (int32_t)shift
+		                      : -1;
+	s->fill -= shift;
+	s->start -= shift;
+	s->ins = s->ins > shift ? s->ins - shift : 0U;
+}
+
+/*
+ * Stage what a flush needs once all input is taken: SYNC compresses the
+ * pending input and adds an empty stored block; FINISH compresses it into
+ * the final block (an empty fixed block when nothing is pending) and pads
+ * to a byte.
+ */
+static int stream_flush(ark_deflate_enc_t *enc, ark_deflate_flush_t flush)
+{
+	ark_enc_stream_t *s;
+	ark_bit_writer_t bw;
+	unsigned int final;
+
+	s = &enc->s;
+	final = flush == ARK_DEFLATE_FLUSH_FINISH ? 1U : 0U;
+	if (s->fill > s->start) {
+		if (stream_step(enc, final) != 0)
+			return -1;
+		stream_bw_load(s, &bw);
+	} else {
+		stream_bw_load(s, &bw);
+		/* Empty final block: BFINAL, fixed codes, end of block. */
+		if (final && (bw_put_bits(&bw, 3U, 3U) != 0 ||
+		              bw_put_bits(&bw, 0U, 7U) != 0))
+			return -1;
+	}
+	/* win is only a valid pointer here: the marker copies no bytes. */
+	if (!final && emit_stored(&bw, s->win, 0U, 0U) != 0)
+		return -1;
+	if (final && bw_flush_to_byte(&bw) != 0)
+		return -1;
+	stream_bw_store(s, &bw);
+	return 0;
+}
+
+/*
+ * ark_deflate_enc_stream - Compress the next piece of a raw RFC 1951 stream.
+ *
+ * Staged output is returned first. Input is taken into win until max_input
+ * bytes are pending or win is full, then compressed as one step
+ * (stream_step) into obuf; the flush runs once all input is taken. See
+ * ARCHITECTURE.md section 7.4.
+ */
+ark_deflate_status_t ark_deflate_enc_stream(ark_deflate_enc_t *enc,
+                                            const uint8_t *in, size_t in_len,
+                                            size_t *in_used, uint8_t *out,
+                                            size_t out_cap, size_t *out_used,
+                                            ark_deflate_flush_t flush)
+{
+	ark_enc_stream_t *s;
+	ark_deflate_status_t st;
+	size_t ip;
+	size_t op;
+
+	if (in_used == NULL || out_used == NULL)
+		return ARK_DEFLATE_ERR_USAGE;
+	*in_used = 0U;
+	*out_used = 0U;
+	if (enc == NULL || !enc->streaming || (in == NULL && in_len != 0U) ||
+	    (out == NULL && out_cap != 0U) ||
+	    (flush != ARK_DEFLATE_FLUSH_NONE &&
+	     flush != ARK_DEFLATE_FLUSH_SYNC &&
+	     flush != ARK_DEFLATE_FLUSH_FINISH))
+		return ARK_DEFLATE_ERR_USAGE;
+	s = &enc->s;
+	if (s->mode == ARK_SE_ERROR)
+		return ARK_DEFLATE_ERR_OUTPUT;
+	if (s->mode != ARK_SE_ACTIVE && in_len != 0U)
+		return ARK_DEFLATE_ERR_USAGE;
+	if (s->mode == ARK_SE_DONE)
+		return ARK_DEFLATE_END;
+
+	ip = 0U;
+	op = 0U;
+	for (;;) {
+		while (s->obuf_pos < s->obuf_len && op < out_cap)
+			out[op++] = s->obuf[s->obuf_pos++];
+		if (s->obuf_pos < s->obuf_len) {
+			st = ARK_DEFLATE_NEED_OUTPUT;
+			break;
+		}
+		s->obuf_pos = 0U;
+		s->obuf_len = 0U;
+		if (s->mode == ARK_SE_FINISHING) {
+			s->mode = ARK_SE_DONE;
+			st = ARK_DEFLATE_END;
+			break;
+		}
+		if (ip < in_len) {
+			size_t pend;
+			size_t n;
+			size_t i;
+
+			pend = s->fill - s->start;
+			if (pend != 0U &&
+			    (pend == enc->max_input || s->fill == s->win_cap)) {
+				if (stream_step(enc, 0U) != 0)
+					goto fail;
+				continue;
+			}
+			if (s->fill == s->win_cap)
+				stream_slide(enc);
+			n = in_len - ip;
+			if (n > s->win_cap - s->fill)
+				n = s->win_cap - s->fill;
+			if (n > enc->max_input - pend)
+				n = enc->max_input - pend;
+			for (i = 0; i < n; i++)
+				s->win[s->fill + i] = in[ip + i];
+			s->fill += n;
+			ip += n;
+			s->synced = 0;
+			s->started = 1;
+			continue;
+		}
+		if (flush == ARK_DEFLATE_FLUSH_NONE) {
+			st = ARK_DEFLATE_NEED_INPUT;
+			break;
+		}
+		if (flush == ARK_DEFLATE_FLUSH_SYNC && s->synced) {
+			/* This flush is written out completely. */
+			s->synced = 0;
+			st = ARK_DEFLATE_OK;
+			break;
+		}
+		if (stream_flush(enc, flush) != 0)
+			goto fail;
+		s->started = 1;
+		if (flush == ARK_DEFLATE_FLUSH_SYNC)
+			s->synced = 1;
+		else
+			s->mode = ARK_SE_FINISHING;
+	}
+	*in_used = ip;
+	*out_used = op;
+	return st;
+fail:
+	/* Not reached with the buffer sizes of enc_mem_size(). */
+	s->mode = ARK_SE_ERROR;
+	*in_used = ip;
+	*out_used = op;
+	return ARK_DEFLATE_ERR_OUTPUT;
+}
+
+void ark_deflate_enc_reset(ark_deflate_enc_t *enc, int keep_history)
+{
+	ark_enc_stream_t *s;
+
+	if (enc == NULL || !enc->streaming)
+		return;
+	s = &enc->s;
+	s->obuf_len = 0U;
+	s->obuf_pos = 0U;
+	s->bits = 0U;
+	s->nbits = 0U;
+	s->mode = ARK_SE_ACTIVE;
+	s->synced = 0;
+	s->started = 0;
+	/* Pending input is dropped; it is never in the hash chains. */
+	s->fill = s->start;
+	if (!keep_history || s->hist == 0U) {
+		s->start = 0U;
+		s->fill = 0U;
+		s->ins = 0U;
+		if (enc->level != ARK_DEFLATE_LEVEL_NONE)
+			match_finder_begin_parse(&enc->mf);
+	}
+}
+
+ark_deflate_status_t ark_deflate_enc_set_dict(ark_deflate_enc_t *enc,
+                                              const uint8_t *dict,
+                                              size_t dict_len)
+{
+	ark_enc_stream_t *s;
+	size_t n;
+	size_t i;
+
+	if (enc == NULL || !enc->streaming ||
+	    (dict == NULL && dict_len != 0U) || enc->s.started)
+		return ARK_DEFLATE_ERR_USAGE;
+	s = &enc->s;
+	ark_deflate_enc_reset(enc, 0);
+	n = dict_len < s->hist ? dict_len : s->hist;
+	for (i = 0; i < n; i++)
+		s->win[i] = dict[dict_len - n + i];
+	s->start = n;
+	s->fill = n;
 	return ARK_DEFLATE_OK;
 }
 
@@ -2160,6 +2530,7 @@ struct ark_deflate_dec {
 	size_t hdist;
 	size_t hclen;
 	unsigned int len_index;
+	int started;
 	uint8_t literal;
 	uint8_t cl_len[19];
 	uint8_t lens[288 + 32];
@@ -2678,6 +3049,7 @@ void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history)
 	dec->dist_root = ARK_INFLATE_FIXED_DIST_ROOT;
 	dec->length = 0U;
 	dec->dist = 0U;
+	dec->started = 0;
 	if (!keep_history) {
 		dec->whave = 0U;
 		dec->wnext = 0U;
@@ -2714,9 +3086,23 @@ ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
 	if (st == ARK_DEFLATE_ERR_DATA)
 		dec->mode = ARK_SD_ERROR;
 	sd_update_window(dec, out, io.op);
+	if (io.ip != 0U)
+		dec->started = 1;
 	*in_used = io.ip;
 	*out_used = io.op;
 	return st;
+}
+
+ark_deflate_status_t ark_deflate_dec_set_dict(ark_deflate_dec_t *dec,
+                                              const uint8_t *dict,
+                                              size_t dict_len)
+{
+	if (dec == NULL || (dict == NULL && dict_len != 0U) || dec->started)
+		return ARK_DEFLATE_ERR_USAGE;
+	dec->whave = 0U;
+	dec->wnext = 0U;
+	sd_update_window(dec, dict, dict_len);
+	return ARK_DEFLATE_OK;
 }
 
 #ifdef ARK_DEFLATE_TEST
@@ -2843,6 +3229,39 @@ void ark_deflate_test_token_symbols(size_t len, size_t dist,
 size_t ark_deflate_test_equal_low_bytes(uint64_t x)
 {
 	return equal_low_bytes(x);
+}
+
+/*
+ * ARK_DEFLATE_TEST only: check the hash chains of a streaming encoder.
+ * Every chain, walked from its head while inside the window, must hold
+ * strictly decreasing positions that were inserted (below ins) and hash to
+ * the chain. Returns 1 when they do (always for level 0 or a one-shot
+ * encoder), 0 otherwise.
+ */
+int ark_deflate_test_enc_chains_ok(const ark_deflate_enc_t *enc)
+{
+	const ark_enc_stream_t *s;
+	size_t lo;
+	size_t h;
+
+	if (!enc->streaming || enc->level == ARK_DEFLATE_LEVEL_NONE)
+		return 1;
+	s = &enc->s;
+	lo = s->fill > enc->mf.window_size ? s->fill - enc->mf.window_size : 0U;
+	for (h = 0; h < ((size_t)1U << enc->mf.hash_bits); h++) {
+		int32_t p;
+		int32_t last;
+
+		last = INT32_MAX;
+		for (p = enc->mf.head[h]; p >= (int32_t)lo;
+		     p = match_finder_prev_get(&enc->mf, (size_t)p)) {
+			if (p >= last || (size_t)p >= s->ins ||
+			    hash3(s->win + p, enc->mf.hash_bits) != h)
+				return 0;
+			last = p;
+		}
+	}
+	return 1;
 }
 
 /* ARK_DEFLATE_TEST only: build length-limited Huffman code lengths. */

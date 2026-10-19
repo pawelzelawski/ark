@@ -746,8 +746,8 @@ Implemented in `deflate.c` / `deflate.h` as a standalone component. No I/O,
 no allocation owned by the component, no global or thread-local mutable
 state. The caller owns all buffers and all encoder memory. The component is
 extractable for reuse in other projects without modification. The API is the
-v2 design of the `v1.2` round; streaming encoder and decoder calls are added
-later on the same types.
+v2 design of the `v1.2` round: one-shot and streaming calls on the same
+types.
 
 ```c
 /* Largest max_input of an encoder (1 MiB), so the largest input of one
@@ -770,12 +770,14 @@ typedef enum {
     ARK_DEFLATE_ERR_DATA,    /* malformed input (decoder) */
     ARK_DEFLATE_ERR_OUTPUT   /* dst too small */
 } ark_deflate_status_t;
+/* Streaming encoder statuses: NEED_INPUT (flush NONE, all input taken), OK
+   (flush SYNC written out), END (stream finished), NEED_OUTPUT (out full). */
 
 typedef struct {
     int          level;        /* ARK_DEFLATE_LEVEL_NONE..ARK_DEFLATE_LEVEL_BEST */
     unsigned int window_bits;  /* 8..15: no distance exceeds 1 << window_bits */
-    size_t       max_input;    /* 1..ARK_DEFLATE_MAX_INPUT */
-    int          streaming;    /* must be 0 for now */
+    size_t       max_input;    /* 1..ARK_DEFLATE_MAX_INPUT; stream step size */
+    int          streaming;    /* 1 adds the streaming buffers, else 0 */
 } ark_deflate_params_t;
 
 typedef struct ark_deflate_enc ark_deflate_enc_t;   /* opaque, in caller memory */
@@ -790,11 +792,29 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
 
 /* Compress src into one complete raw RFC 1951 stream (final block marked).
    dst_cap must be at least ark_deflate_bound(src_len). When compressed
-   output >= src_len, emits Deflate stored blocks. */
+   output >= src_len, emits Deflate stored blocks. On a streaming encoder it
+   also resets the stream. */
 ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
                                              const uint8_t *src, size_t src_len,
                                              uint8_t *dst, size_t dst_cap,
                                              size_t *dst_len);
+
+/* Streaming encoder (streaming = 1; not used by ark itself). */
+typedef enum {
+    ARK_DEFLATE_FLUSH_NONE = 0,   /* input may stay buffered */
+    ARK_DEFLATE_FLUSH_SYNC,       /* all, then empty stored block 00 00 FF FF */
+    ARK_DEFLATE_FLUSH_FINISH      /* all into the final block */
+} ark_deflate_flush_t;
+ark_deflate_status_t ark_deflate_enc_stream(ark_deflate_enc_t *enc,
+                                            const uint8_t *in, size_t in_len,
+                                            size_t *in_used, uint8_t *out,
+                                            size_t out_cap, size_t *out_used,
+                                            ark_deflate_flush_t flush);
+void ark_deflate_enc_reset(ark_deflate_enc_t *enc, int keep_history);
+/* Preset dictionary, before the stream's first input (OK or ERR_USAGE). */
+ark_deflate_status_t ark_deflate_enc_set_dict(ark_deflate_enc_t *enc,
+                                              const uint8_t *dict,
+                                              size_t dict_len);
 
 /* Returns the maximum compressed size for src_len bytes of uncompressed input:
    src_len + 5 bytes per started 65,535-byte stored block + 1. Caller uses
@@ -826,6 +846,9 @@ ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
                                             size_t *in_used, uint8_t *out,
                                             size_t out_cap, size_t *out_used);
 void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history);
+ark_deflate_status_t ark_deflate_dec_set_dict(ark_deflate_dec_t *dec,
+                                              const uint8_t *dict,
+                                              size_t dict_len);
 ```
 
 **Decoder strictness.** The decoder follows RFC 1951 strictly: invalid or
@@ -864,6 +887,37 @@ read ahead before stopping. Its throughput matches the one-shot decoder
 (PERFORMANCE_IMPROVEMENTS.md). ark's archive code uses only the one-shot
 calls.
 
+**Streaming encoder.** For callers that compress in pieces (per-message
+compression with history across messages in libgate, RFC 7692; large
+objects in arv), an encoder initialized with `streaming = 1` takes input
+through `ark_deflate_enc_stream` and buffers it. Each step compresses the
+buffered input, at most `max_input` bytes, with the one-shot encoder's
+parse and block choice, and its matches reach back into the stream's
+earlier input up to `1 << window_bits` bytes (the hash chains persist
+between steps). A step runs when `max_input` bytes are pending or when a
+flush asks for it; it falls back to stored blocks when compressing does not
+make the piece smaller, as the one-shot call does. The output therefore
+depends only on the input, the parameters and where the flushes are, not
+on how the input or the output space is split across calls; a whole input
+of up to `max_input` bytes with one `FINISH` gives the one-shot call's
+bytes. Flushes: `NONE` returns `NEED_INPUT` once all input is taken; `SYNC`
+writes everything so far and then an empty stored block (`00 00 FF FF`
+after byte alignment, which RFC 7692 strips per message) and returns `OK`;
+`FINISH` writes the final block (an empty fixed block, `03 00`, when
+nothing is pending) and returns `END`, which later calls repeat until
+`ark_deflate_enc_reset`. A step's output is staged in the encoder memory and
+handed out as `out` allows (`NEED_OUTPUT` asks for more space; the caller
+calls again with the input not taken and the same flush, and a flush is
+written once). Usage errors take nothing and leave the stream unchanged.
+`ark_deflate_enc_reset` drops pending input and staged output and starts a
+new stream, keeping the history (context takeover) or not.
+
+**Preset dictionary.** `ark_deflate_enc_set_dict` and
+`ark_deflate_dec_set_dict` load a dictionary as history before a stream's
+first input (zlib's `deflateSetDictionary` / `inflateSetDictionary`); only
+its last `1 << window_bits` bytes count, and both sides must use the same
+bytes. A level-0 encoder accepts and ignores it.
+
 **Level semantics.** Levels use zlib's numbering, 0..9. Level 0 writes
 stored blocks only. Levels 1..9 share one encoder (section 7.2: one parse,
 cost-based block boundaries and block types) and differ only in the match
@@ -898,8 +952,12 @@ finder: a head table of `1 << window_bits` entries and a chain table of
 `1 << window_bits` entries, 4 bytes each, plus a small header. At
 `window_bits` 15 that is about 256 KiB; at 8 about 2 KiB. A token buffer of
 4 bytes per `max_input` byte follows (4 MiB at 1 MiB, 256 KiB at 64 KiB).
-Level 0 needs only the small header. Matches never reach further back than
-`1 << window_bits` bytes, so a smaller window (for example one negotiated
+Level 0 needs only the small header. A streaming encoder adds its input
+buffer (two windows plus `max_input` bytes, which lets it slide by whole
+windows; `max_input` alone at level 0) and an output staging buffer of
+`ark_deflate_bound(max_input) + 16` bytes: at `window_bits` 15 and
+`max_input` 16 KiB, about 416 KiB in all. Matches never reach further back
+than `1 << window_bits` bytes, so a smaller window (for example one negotiated
 under RFC 7692) is honored exactly. ark uses `window_bits` 15, the RFC 1951
 maximum. ark's output changed in v1.2 at both of its levels (single parse;
 smaller, and still one valid RFC 1951 stream per chunk; section 13.1 scopes
@@ -907,11 +965,14 @@ determinism to one binary).
 
 **Encoder rules.** The memory must stay in place (the encoder points into
 it) and is released by freeing it. One encoder serves any number of
-sequential calls, never two at once; each call starts from an empty match
-finder, so the output depends only on the input and the parameters. After a
-failed call the encoder stays valid. Failures: `ARK_DEFLATE_ERR_USAGE` for
-NULL arguments or `src_len` above `max_input`, `ARK_DEFLATE_ERR_OUTPUT` when
-`dst_cap` is below the bound; `dst_len` is 0 after a failure.
+sequential calls, never two at once; each one-shot call starts from an
+empty match finder, so the output depends only on the input and the
+parameters. After a failed call the encoder stays valid. Failures:
+`ARK_DEFLATE_ERR_USAGE` for NULL arguments or `src_len` above `max_input`,
+`ARK_DEFLATE_ERR_OUTPUT` when `dst_cap` is below the bound; `dst_len` is 0
+after a failure. The streaming call's staging buffer is sized so that it
+cannot overflow; should it ever (a defect), the call returns
+`ARK_DEFLATE_ERR_OUTPUT` until reset.
 
 ---
 

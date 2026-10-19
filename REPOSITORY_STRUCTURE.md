@@ -90,10 +90,11 @@ src/
 │                       #
 │                       # Types:
 │                       #   ark_deflate_params_t - level, window bits,
-│                       #     max input
+│                       #     max input, streaming
 │                       #   ark_deflate_enc_t    - opaque encoder in
 │                       #     caller memory
 │                       #   ark_deflate_status_t - call result
+│                       #   ark_deflate_flush_t  - streaming flush mode
 │                       #
 │                       # Functions:
 │                       #   ark_deflate_enc_size()   - encoder memory size
@@ -101,9 +102,12 @@ src/
 │                       #   ark_deflate_enc_oneshot()- compress one chunk
 │                       #   ark_deflate_dec_oneshot()- decompress one chunk
 │                       #     and report the input bytes used
-│                       #   ark_deflate_dec_size/init/stream/reset()
-│                       #     - streaming decoder in caller memory
+│                       #   ark_deflate_enc_stream/reset/set_dict()
+│                       #     - streaming encoder, preset dictionary
 │                       #     (library API; ark does not call it)
+│                       #   ark_deflate_dec_size/init/stream/reset/
+│                       #     set_dict() - streaming decoder in caller
+│                       #     memory (library API; ark does not call it)
 │                       #   ark_deflate_bound()      - maximum compressed
 │                       #     output size for a given input size; used by
 │                       #     main.c to size output buffers
@@ -463,7 +467,8 @@ Platform detected via `OS != uname -s`. `-DARK_TEST` is defined in
 `make test`, `make dev`, `make valgrind`, and `make test-tsan` so that
 fault injection stubs are always active during development. The same
 targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
-test accessors and a window-limited test decoder.
+test accessors (including a hash-chain check of a streaming encoder) and a
+window-limited test decoder.
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates
@@ -534,11 +539,15 @@ Checks: >
 | `ark_deflate_enc_size` | `src/deflate.c` | Public; encoder memory size query |
 | `ark_deflate_enc_init` | `src/deflate.c` | Public; encoder in caller memory (`pool_init`) |
 | `ark_deflate_enc_oneshot` | `src/deflate.c` | Public; called by worker threads |
+| `ark_deflate_enc_stream` | `src/deflate.c` | Public; compress the next piece of a stream, flush NONE/SYNC/FINISH (library API, unused by ark) |
+| `ark_deflate_enc_reset` | `src/deflate.c` | Public; start a new stream, optionally keeping history (library API) |
+| `ark_deflate_enc_set_dict` | `src/deflate.c` | Public; preset dictionary for a stream (library API) |
 | `ark_deflate_dec_oneshot` | `src/deflate.c` | Public; called by worker threads and `ark_read_chunk` |
 | `ark_deflate_dec_size` | `src/deflate.c` | Public; streaming decoder memory size (library API, unused by ark) |
 | `ark_deflate_dec_init` | `src/deflate.c` | Public; streaming decoder in caller memory (library API) |
 | `ark_deflate_dec_stream` | `src/deflate.c` | Public; decode the next piece of a stream (library API) |
 | `ark_deflate_dec_reset` | `src/deflate.c` | Public; start a new stream, optionally keeping history (library API) |
+| `ark_deflate_dec_set_dict` | `src/deflate.c` | Public; preset dictionary as history (library API) |
 | `ark_deflate_bound` | `src/deflate.c` | Public; output buffer sizing |
 | `ark_write_init` | `src/archive.c` | Public |
 | `ark_write_header` | `src/archive.c` | Public |

@@ -35,7 +35,7 @@
 
 /*
  * ark_deflate_status_t - Result of the encoder and decoder calls.
- * END, NEED_INPUT and NEED_OUTPUT are reserved for the streaming calls.
+ * END, NEED_INPUT and NEED_OUTPUT come only from the streaming calls.
  */
 typedef enum {
 	ARK_DEFLATE_OK = 0,
@@ -54,7 +54,11 @@ typedef enum {
  * - window_bits: ARK_DEFLATE_MIN_WINDOW_BITS..ARK_DEFLATE_MAX_WINDOW_BITS;
  *   no emitted distance exceeds 1 << window_bits.
  * - max_input: largest src_len per one-shot call, 1..ARK_DEFLATE_MAX_INPUT.
- * - streaming: must be 0 (streaming calls are not implemented yet).
+ *   A streaming encoder compresses its input in pieces of at most max_input
+ *   bytes; a larger max_input gives larger blocks and better ratio, a
+ *   smaller one less memory.
+ * - streaming: 0 for one-shot calls only; 1 adds the history and the
+ *   buffers ark_deflate_enc_stream() needs.
  */
 typedef struct {
 	int level;
@@ -119,12 +123,93 @@ ark_deflate_enc_t *ark_deflate_enc_init(void *mem, size_t mem_len,
  * max_input; ARK_DEFLATE_ERR_OUTPUT when dst_cap is below
  * ark_deflate_bound(src_len). dst contents are unspecified after a failure;
  * the encoder stays valid for later calls.
+ * On a streaming encoder the call also resets the stream, as
+ * ark_deflate_enc_reset(enc, 0) does.
  * Preconditions: enc was returned by ark_deflate_enc_init().
  */
 ark_deflate_status_t ark_deflate_enc_oneshot(ark_deflate_enc_t *enc,
                                              const uint8_t *src, size_t src_len,
                                              uint8_t *dst, size_t dst_cap,
                                              size_t *dst_len);
+
+/*
+ * ark_deflate_flush_t - What ark_deflate_enc_stream() does once all of its
+ * input is taken.
+ *
+ * - NONE: nothing; input may stay buffered in the encoder.
+ * - SYNC: compress everything buffered and end it with an empty stored
+ *   block (00 00 FF FF after byte alignment), so a decoder can produce all
+ *   of the input so far. The stream continues (RFC 7692 messages).
+ * - FINISH: compress everything buffered into the final block and end the
+ *   stream.
+ */
+typedef enum {
+	ARK_DEFLATE_FLUSH_NONE = 0,
+	ARK_DEFLATE_FLUSH_SYNC,
+	ARK_DEFLATE_FLUSH_FINISH
+} ark_deflate_flush_t;
+
+/*
+ * ark_deflate_enc_stream - Compress the next piece of a raw RFC 1951
+ * stream on an encoder initialized with streaming = 1.
+ *
+ * Parameters:
+ * - enc: streaming encoder.
+ * - in, in_len: the next input bytes; in may be NULL only when in_len is 0.
+ * - in_used: receives the input bytes taken.
+ * - out, out_cap: output space; out may be NULL only when out_cap is 0.
+ * - out_used: receives the output bytes written.
+ * - flush: see ark_deflate_flush_t.
+ *
+ * Matches reach back over earlier input of the stream, including input of
+ * earlier messages after a SYNC, up to 1 << window_bits bytes.
+ *
+ * Returns:
+ * - ARK_DEFLATE_NEED_INPUT (flush NONE): all input was taken.
+ * - ARK_DEFLATE_OK (flush SYNC): all input was taken and the sync flush is
+ *   completely written; the output so far ends at a byte boundary. Each
+ *   SYNC call that returns OK writes one sync flush, also without input.
+ * - ARK_DEFLATE_END (flush FINISH): the final block is completely written.
+ *   Later calls return END until ark_deflate_enc_reset().
+ * - ARK_DEFLATE_NEED_OUTPUT: out is full and output is waiting; call again
+ *   with more space, the input not taken (in + in_used) and the same flush.
+ * - ARK_DEFLATE_ERR_USAGE: NULL out-parameters, NULL enc, an encoder
+ *   without streaming, a NULL buffer with a non-zero size, an unknown flush,
+ *   or input after the stream ended; nothing is taken, and the stream is
+ *   unchanged.
+ * in_used and out_used are always set (0 on usage errors).
+ * Preconditions: enc was returned by ark_deflate_enc_init().
+ */
+ark_deflate_status_t ark_deflate_enc_stream(ark_deflate_enc_t *enc,
+                                            const uint8_t *in, size_t in_len,
+                                            size_t *in_used, uint8_t *out,
+                                            size_t out_cap, size_t *out_used,
+                                            ark_deflate_flush_t flush);
+
+/*
+ * ark_deflate_enc_reset - Start a new stream on a streaming encoder. Input
+ * still buffered and output not yet returned are dropped. With
+ * keep_history non-zero the input of the previous stream stays as history
+ * for matches (RFC 7692 context takeover; the decoder must keep its history
+ * too); with 0 it is forgotten. A NULL enc or an encoder without streaming
+ * is ignored.
+ */
+void ark_deflate_enc_reset(ark_deflate_enc_t *enc, int keep_history);
+
+/*
+ * ark_deflate_enc_set_dict - Use dict as preset history (zlib's
+ * deflateSetDictionary): matches may refer into its last 1 << window_bits
+ * bytes. The decoder must be given the same dictionary
+ * (ark_deflate_dec_set_dict()).
+ *
+ * Returns ARK_DEFLATE_OK, or ARK_DEFLATE_ERR_USAGE for a NULL enc, an
+ * encoder without streaming, NULL dict with dict_len non-zero, or a stream
+ * that has already taken input or written output since init or reset. The
+ * dictionary replaces any kept history.
+ */
+ark_deflate_status_t ark_deflate_enc_set_dict(ark_deflate_enc_t *enc,
+                                              const uint8_t *dict,
+                                              size_t dict_len);
 
 /*
  * ark_deflate_bound - Return a safe upper bound for compressed output size.
@@ -247,5 +332,19 @@ ark_deflate_status_t ark_deflate_dec_stream(ark_deflate_dec_t *dec,
  * is ignored.
  */
 void ark_deflate_dec_reset(ark_deflate_dec_t *dec, int keep_history);
+
+/*
+ * ark_deflate_dec_set_dict - Use dict as the history window (zlib's
+ * inflateSetDictionary), so the stream may refer into its last
+ * 1 << window_bits bytes. Call after init or reset, before the stream's
+ * first input.
+ *
+ * Returns ARK_DEFLATE_OK, or ARK_DEFLATE_ERR_USAGE for a NULL dec, NULL
+ * dict with dict_len non-zero, or a decoder that has taken input since init
+ * or reset.
+ */
+ark_deflate_status_t ark_deflate_dec_set_dict(ark_deflate_dec_t *dec,
+                                              const uint8_t *dict,
+                                              size_t dict_len);
 
 #endif /* ARK_DEFLATE_H */
