@@ -259,6 +259,8 @@ components are self-contained and have no dependencies beyond libc.
   counter, stack)
 - [x] Implement `ark_blake3_init`, `ark_blake3_update`, `ark_blake3_final`
   in `blake3.c`; sequential mode only; output fixed to 32 bytes
+  (v1.2 adds optional SIMD chunk functions in separate files,
+  `blake3_x86.c` / `blake3_arm.c`; `blake3.c` stays portable C11)
 - [x] Implement `ark_blake3` single-shot wrapper
 - [x] Verify `blake3.h` is self-contained:
   `cc -std=c11 -fsyntax-only src/blake3.h`

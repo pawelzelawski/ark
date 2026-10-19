@@ -7,6 +7,12 @@
 #define BLAKE3_FLAG_PARENT 0x04U
 #define BLAKE3_FLAG_ROOT 0x08U
 
+/*
+ * Most whole chunks hashed as one subtree by update(): a power of two, so
+ * the subtree's chaining values fit on the stack (64 x 32 bytes).
+ */
+#define BLAKE3_MAX_SUBTREE_CHUNKS 64U
+
 typedef struct blake3_output {
 	uint32_t input_cv[8];
 	uint32_t block[16];
@@ -205,17 +211,22 @@ static void parent_output(const uint32_t left_cv[8], const uint32_t right_cv[8],
 	out->flags = BLAKE3_FLAG_PARENT;
 }
 
-/* Push one completed chunk chaining value into the binary-tree stack. */
-static void push_chunk_cv(ark_blake3_ctx_t *ctx, const uint32_t chunk_cv[8],
-                          uint64_t total_chunks)
+/*
+ * Push the chaining value of a completed subtree into the binary-tree
+ * stack: a chunk (total = chunks done, this one included) or an aligned
+ * subtree of 2^k chunks (total = chunks done >> k). Merges with the stack
+ * while total is even.
+ */
+static void push_cv(ark_blake3_ctx_t *ctx, const uint32_t subtree_cv[8],
+                    uint64_t total)
 {
 	uint32_t cv[8];
 	size_t i;
 
 	for (i = 0; i < 8; i++)
-		cv[i] = chunk_cv[i];
+		cv[i] = subtree_cv[i];
 
-	while ((total_chunks & 1U) == 0U) {
+	while ((total & 1U) == 0U) {
 		blake3_output_t parent;
 		uint32_t parent_cv[8];
 		uint32_t left_cv[8];
@@ -227,7 +238,7 @@ static void push_chunk_cv(ark_blake3_ctx_t *ctx, const uint32_t chunk_cv[8],
 		output_chaining_value(&parent, parent_cv);
 		for (i = 0; i < 8; i++)
 			cv[i] = parent_cv[i];
-		total_chunks >>= 1;
+		total >>= 1;
 	}
 
 	for (i = 0; i < 8; i++)
@@ -258,9 +269,154 @@ static void finalize_current_chunk(ark_blake3_ctx_t *ctx)
 
 	chunk_output(ctx, &out);
 	output_chaining_value(&out, cv);
-	push_chunk_cv(ctx, cv, ctx->chunk_counter + 1U);
+	push_cv(ctx, cv, ctx->chunk_counter + 1U);
 	ctx->chunk_counter++;
 	reset_chunk_state(ctx);
+}
+
+/*
+ * Portable hash of one input of `blocks` blocks: the per-lane work of the
+ * SIMD functions (see blake3.h), written to out as 32 bytes.
+ */
+static void hash_one(const uint8_t *input, size_t blocks, const uint32_t key[8],
+                     uint64_t counter, uint32_t flags, uint32_t flags_start,
+                     uint32_t flags_end, uint8_t out[32])
+{
+	uint32_t cv[8];
+	uint32_t block_flags;
+	size_t i;
+
+	for (i = 0; i < 8; i++)
+		cv[i] = key[i];
+	block_flags = flags | flags_start;
+	while (blocks > 0U) {
+		uint32_t block_words[16];
+		uint32_t out_words[16];
+
+		if (blocks == 1U)
+			block_flags |= flags_end;
+		block_to_words(input, block_words);
+		blake3_compress(cv, block_words, counter, BLAKE3_BLOCK_LEN,
+		                block_flags, out_words);
+		for (i = 0; i < 8; i++)
+			cv[i] = out_words[i];
+		block_flags = flags;
+		input += BLAKE3_BLOCK_LEN;
+		blocks--;
+	}
+	for (i = 0; i < 8; i++)
+		store_le32(out + i * 4, cv[i]);
+}
+
+/*
+ * Hash n inputs of `blocks` blocks each into n chaining values at out
+ * (32 bytes each), with the context's backend: groups of 8 (AVX2) and 4
+ * (SSE4.1, NEON) lanes, the rest one by one. The SIMD functions exist only
+ * in builds that define their macro.
+ */
+static void hash_many(const ark_blake3_ctx_t *ctx, const uint8_t *const *inputs,
+                      size_t n, size_t blocks, const uint32_t key[8],
+                      uint64_t counter, int increment_counter, uint32_t flags,
+                      uint32_t flags_start, uint32_t flags_end, uint8_t *out)
+{
+	/* Unused without the SIMD macros: only the portable loop is left. */
+	(void)ctx;
+#ifdef ARK_BLAKE3_X86
+	while (ctx->backend == ARK_BLAKE3_BACKEND_AVX2 && n >= 8U) {
+		ark_blake3_x86_avx2_hash8(inputs, blocks, key, counter,
+		                          increment_counter, flags, flags_start,
+		                          flags_end, out);
+		inputs += 8;
+		n -= 8U;
+		counter += increment_counter ? 8U : 0U;
+		out += (size_t)8U * 32U;
+	}
+	while ((ctx->backend == ARK_BLAKE3_BACKEND_AVX2 ||
+	        ctx->backend == ARK_BLAKE3_BACKEND_SSE41) &&
+	       n >= 4U) {
+		ark_blake3_x86_sse41_hash4(inputs, blocks, key, counter,
+		                           increment_counter, flags,
+		                           flags_start, flags_end, out);
+		inputs += 4;
+		n -= 4U;
+		counter += increment_counter ? 4U : 0U;
+		out += (size_t)4U * 32U;
+	}
+#endif
+#ifdef ARK_BLAKE3_ARM
+	while (ctx->backend == ARK_BLAKE3_BACKEND_NEON && n >= 4U) {
+		ark_blake3_arm_neon_hash4(inputs, blocks, key, counter,
+		                          increment_counter, flags, flags_start,
+		                          flags_end, out);
+		inputs += 4;
+		n -= 4U;
+		counter += increment_counter ? 4U : 0U;
+		out += (size_t)4U * 32U;
+	}
+#endif
+	while (n > 0U) {
+		hash_one(*inputs, blocks, key, counter, flags, flags_start,
+		         flags_end, out);
+		inputs++;
+		n--;
+		counter += increment_counter ? 1U : 0U;
+		out += 32;
+	}
+}
+
+/*
+ * Hash whole chunks straight from data as one subtree and push its
+ * chaining value; returns the bytes used. Called at a chunk boundary with
+ * len > BLAKE3_CHUNK_LEN. The subtree is the largest power of two of
+ * chunks, at most BLAKE3_MAX_SUBTREE_CHUNKS, that leaves at least one byte
+ * of data and that chunk_counter is a multiple of: such a subtree is a
+ * subtree of the final tree, and never its root because input follows it.
+ * Its chunks, then each level of parents, go through hash_many(). See
+ * ARCHITECTURE.md §8.4.
+ */
+static size_t hash_subtree(ark_blake3_ctx_t *ctx, const uint8_t *data,
+                           size_t len)
+{
+	const uint8_t *inputs[BLAKE3_MAX_SUBTREE_CHUNKS] = {NULL};
+	uint8_t cvs[2][BLAKE3_MAX_SUBTREE_CHUNKS * 32U];
+	uint32_t root[8];
+	size_t avail;
+	size_t n;
+	size_t i;
+	unsigned int level;
+	unsigned int cur;
+
+	avail = (len - 1U) / BLAKE3_CHUNK_LEN;
+	n = BLAKE3_MAX_SUBTREE_CHUNKS;
+	while (n > avail || (ctx->chunk_counter & (uint64_t)(n - 1U)) != 0U)
+		n >>= 1;
+
+	for (i = 0; i < n; i++)
+		inputs[i] = data + i * BLAKE3_CHUNK_LEN;
+	hash_many(ctx, inputs, n, BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN, ctx->key,
+	          ctx->chunk_counter, 1, 0U, BLAKE3_FLAG_CHUNK_START,
+	          BLAKE3_FLAG_CHUNK_END, cvs[0]);
+
+	/* Two neighbouring chaining values are one parent block. */
+	level = 0;
+	cur = 0;
+	while ((n >> level) > 1U) {
+		size_t parents;
+
+		parents = n >> (level + 1U);
+		for (i = 0; i < parents; i++)
+			inputs[i] = cvs[cur] + i * 64U;
+		hash_many(ctx, inputs, parents, 1, blake3_iv, 0, 0,
+		          BLAKE3_FLAG_PARENT, 0U, 0U, cvs[cur ^ 1U]);
+		cur ^= 1U;
+		level++;
+	}
+
+	for (i = 0; i < 8; i++)
+		root[i] = load_le32(cvs[cur] + i * 4);
+	push_cv(ctx, root, (ctx->chunk_counter >> level) + 1U);
+	ctx->chunk_counter += (uint64_t)n;
+	return n * BLAKE3_CHUNK_LEN;
 }
 
 void ark_blake3_init(ark_blake3_ctx_t *ctx)
@@ -271,7 +427,30 @@ void ark_blake3_init(ark_blake3_ctx_t *ctx)
 		ctx->key[i] = blake3_iv[i];
 	ctx->chunk_counter = 0;
 	ctx->cv_stack_len = 0;
+	ctx->backend = ARK_BLAKE3_BACKEND_PORTABLE;
 	reset_chunk_state(ctx);
+}
+
+int ark_blake3_init_backend(ark_blake3_ctx_t *ctx, ark_blake3_backend_t backend)
+{
+	ark_blake3_init(ctx);
+	switch (backend) {
+	case ARK_BLAKE3_BACKEND_PORTABLE:
+		return 0;
+#ifdef ARK_BLAKE3_X86
+	case ARK_BLAKE3_BACKEND_SSE41:
+	case ARK_BLAKE3_BACKEND_AVX2:
+		ctx->backend = backend;
+		return 0;
+#endif
+#ifdef ARK_BLAKE3_ARM
+	case ARK_BLAKE3_BACKEND_NEON:
+		ctx->backend = backend;
+		return 0;
+#endif
+	default:
+		return -1;
+	}
 }
 
 void ark_blake3_update(ark_blake3_ctx_t *ctx, const uint8_t *data, size_t len)
@@ -281,6 +460,18 @@ void ark_blake3_update(ark_blake3_ctx_t *ctx, const uint8_t *data, size_t len)
 
 		if (chunk_len(ctx) == BLAKE3_CHUNK_LEN) {
 			finalize_current_chunk(ctx);
+			continue;
+		}
+
+		/*
+		 * At a chunk boundary, whole chunks followed by more input
+		 * are hashed as subtrees, several chunks at once with a SIMD
+		 * backend.
+		 */
+		if (chunk_len(ctx) == 0U && len > BLAKE3_CHUNK_LEN) {
+			n = hash_subtree(ctx, data, len);
+			data += n;
+			len -= n;
 			continue;
 		}
 
@@ -380,3 +571,28 @@ void ark_blake3(const uint8_t *data, size_t len, uint8_t digest[32])
 	ark_blake3_update(&ctx, data, len);
 	ark_blake3_final(&ctx, digest);
 }
+
+#ifdef ARK_BLAKE3_TEST
+/*
+ * ARK_BLAKE3_TEST only: hash_many() with the given backend and the BLAKE3
+ * IV as key, so tests can compare SIMD lanes with the portable code for
+ * any counter, flags and block count (whole-input tests never reach
+ * chunk counters above 2^32). Returns -1 when the backend is not built in.
+ * Compiled out of production builds; tests declare it locally.
+ */
+int ark_blake3_test_hash_many(ark_blake3_backend_t backend,
+                              const uint8_t *const *inputs, size_t n,
+                              size_t blocks, uint64_t counter,
+                              int increment_counter, uint32_t flags,
+                              uint32_t flags_start, uint32_t flags_end,
+                              uint8_t *out)
+{
+	ark_blake3_ctx_t ctx;
+
+	if (ark_blake3_init_backend(&ctx, backend) != 0)
+		return -1;
+	hash_many(&ctx, inputs, n, blocks, ctx.key, counter, increment_counter,
+	          flags, flags_start, flags_end, out);
+	return 0;
+}
+#endif

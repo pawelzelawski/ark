@@ -45,8 +45,8 @@ tests/
 └── test_integration.c    # end-to-end create → verify → extract pipelines
 ```
 
-`make test` builds all test files with `-DARK_TEST` and `-DARK_DEFLATE_TEST`
-against all source files and runs the binary.
+`make test` builds all test files with `-DARK_TEST`, `-DARK_DEFLATE_TEST`
+and `-DARK_BLAKE3_TEST` against all source files and runs the binary.
 
 ### 2.2 Test Assertion Macro
 
@@ -144,7 +144,9 @@ window-limited decoder (`ark_deflate_test_decompress_window`) and a
 hash-chain check of a streaming encoder (`ark_deflate_test_enc_chains_ok`)
 are reached through stateless `ark_deflate_test_*` accessors compiled only with
 `-DARK_DEFLATE_TEST`, the codec's own test flag, so `deflate.c` does not
-depend on ark's `ARK_TEST`.
+depend on ark's `ARK_TEST`. Likewise `-DARK_BLAKE3_TEST` compiles
+`ark_blake3_test_hash_many`, which runs BLAKE3's chunk and parent hashing
+with one backend for any counter and flags (the SIMD lane test).
 
 ---
 
@@ -183,7 +185,11 @@ run the ARMv8 path natively.
 
 Tests validate the implementation against the official BLAKE3 test vectors
 published in the reference repository. The test vectors cover input lengths
-0 through 2^n for progressively larger n. All vectors must pass.
+0 through 2^n for progressively larger n. All vectors must pass. The backend
+tests cover the SIMD chunk functions on CPUs that have them (run-time check,
+no platform-conditional test code); `make test-qemu` runs the BLAKE3 tests
+on an emulated x86 CPU with AVX2, and CI's arm64 runners run the NEON path
+natively.
 
 | Test case | What is verified |
 |---|---|
@@ -198,6 +204,11 @@ published in the reference repository. The test vectors cover input lengths
 | `test_blake3_incremental_updates` | 1-byte updates produce same digest as single update |
 | `test_blake3_vectors_random_splits` | Every official vector fed in randomly sized updates, empty ones included, matches its official digest (fixed seed) |
 | `test_blake3_random_splits` | 100 random inputs of random length (0-8 chunks): randomly sized updates give the single-update digest (fixed seed) |
+| `test_blake3_backend_vectors` | Every official vector through every backend the CPU supports (`ark_blake3_cpu_supports`), in one update and in random pieces; prints `blake3 backends tested: [...]` |
+| `test_blake3_subtree_matches_sequential` | For every supported backend: lengths around 1-192 chunks (+0, 1, 1023 bytes) hashed in one update (whole-chunk subtrees) equal chunk-by-chunk updates (no subtrees), also after a first update of 1-5 chunks (subtrees at counters that are not multiples of 64) |
+| `test_blake3_backend_differential` | Each supported SIMD backend equals the portable one on 40 random lengths up to 160 KiB in random pieces from an odd address, and on 1 MiB in one update |
+| `test_blake3_backend_selection` | Unknown and not-built backends: `init_backend` returns -1 and the context works as portable; `cpu_supports` only reports backends `init_backend` accepts; `cpu_best` is supported |
+| `test_blake3_backend_lanes` | Through `ark_blake3_test_hash_many`: each SIMD backend's lanes (13 inputs: 8 + 4 lanes + 1 portable) equal the portable code for whole chunks with counters carrying into the high 32 bits, one-block parents, 3 blocks with distinct flags, and a counter above 2^32 without increment |
 
 ### 3.3 Deflate (`test_deflate.c`)
 
@@ -675,7 +686,7 @@ of Linux 5.13.
 | Memory errors, leaks | Valgrind | Linux | After each phase; before release |
 | Memory errors, undefined behaviour | ASan/UBSan | Linux | Every `make test` (dev build) |
 | Data races | TSan | Linux (Clang only) | At thread phase boundary; before release |
-| SHA-256 hardware backends | `make test-qemu` (qemu-x86_64 -cpu max); CI runners natively | Linux x86-64; CI arm64 | When the SHA-256 files change; before release |
+| SHA-256 hardware and BLAKE3 SIMD backends | `make test-qemu` (qemu-x86_64 -cpu max); CI runners natively | Linux x86-64; CI arm64 | When the hash files change; before release |
 | Static analysis | clang-tidy | Linux, OpenBSD | Before release |
 | Static analysis | cppcheck | Linux, OpenBSD | Before release |
 | Code formatting | clang-format | Both | Before every commit |

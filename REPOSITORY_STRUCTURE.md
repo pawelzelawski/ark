@@ -86,21 +86,39 @@ src/
 │                       # Types:
 │                       #   ark_blake3_ctx_t   - streaming context (struct
 │                       #     defined in the header; stack-allocatable)
+│                       #   ark_blake3_backend_t - chunk function
+│                       #     (portable, x86 SSE4.1 / AVX2, arm64 NEON)
 │                       #
 │                       # Functions:
 │                       #   ark_blake3_init()   - initialise context
+│                       #   ark_blake3_init_backend() - with a backend
 │                       #   ark_blake3_update() - feed data
 │                       #   ark_blake3_final()  - produce 32-byte digest
 │                       #   ark_blake3()        - single-shot convenience
 │                       #
 │                       # Output length is fixed at 32 bytes. Variable-length
 │                       #   output is not exposed. Tree parallelism is not
-│                       #   exposed. Sequential mode only.
-│                       #   See ARCHITECTURE.md §8.4.
+│                       #   exposed (update hashes whole-chunk subtrees
+│                       #   internally). See ARCHITECTURE.md §8.4.
 │
 ├── blake3.c            # BLAKE3 implementation per the BLAKE3 specification.
 │                       # Validated against the official BLAKE3 test vectors.
-│                       # No dependencies beyond blake3.h and libc.
+│                       # No dependencies beyond blake3.h and libc;
+│                       #   calls a SIMD chunk function only under
+│                       #   ARK_BLAKE3_X86 / ARK_BLAKE3_ARM.
+│
+├── blake3_x86.c        # BLAKE3 chunks 4 (SSE4.1) or 8 (AVX2) at a time
+│                       #   (intrinsics, target attributes). Built on
+│                       #   x86-64 only, with ARK_BLAKE3_X86.
+│
+├── blake3_arm.c        # BLAKE3 chunks 4 at a time with NEON
+│                       #   (intrinsics). Built on arm64 only, with
+│                       #   ARK_BLAKE3_ARM.
+│
+├── blake3_cpu.h        # Which BLAKE3 backend the CPU supports:
+│                       #   ark_blake3_cpu_supports(), ark_blake3_cpu_best().
+├── blake3_cpu.c        # The only BLAKE3 file that asks the CPU (cpuid,
+│                       #   xgetbv on x86; NEON is always present on arm64).
 │
 │   - Compression component -
 │
@@ -507,7 +525,7 @@ make release      # optimised binary (build/ark)
 make test         # compile and run tests (dev flags, -DARK_TEST)
 make test-tsan    # TSan build and test run (Linux/Clang only)
 make valgrind     # run tests under Valgrind (Linux only, no sanitisers)
-make test-qemu    # SHA-256 tests under qemu-x86_64 -cpu max (SHA-NI)
+make test-qemu    # SHA-256 and BLAKE3 tests under qemu-x86_64 -cpu max (SHA-NI, AVX2)
 make lint         # clang-tidy on the src/ components, cppcheck on src/ and tests/
 make format       # clang-format -i on all source and test files
 make clean        # remove build artefacts
@@ -515,14 +533,17 @@ make install      # install ark binary and man page to PREFIX
 ```
 
 Platform detected via `OS != uname -s`; the SHA-256 hardware file and its
-macro (`SHA256_HW_SRCS`, `SHA256_HW_DEFS`) via `uname -m`.
+macro (`SHA256_HW_SRCS`, `SHA256_HW_DEFS`) and the BLAKE3 SIMD file and its
+macro (`BLAKE3_HW_SRCS`, `BLAKE3_HW_DEFS`) via `uname -m`.
 `build/tests/run_tests [prefix]` runs only the tests whose names start with
 `prefix`. `-DARK_TEST` is defined in
 `make test`, `make dev`, `make valgrind`, and `make test-tsan` so that
 fault injection stubs are always active during development. The same
 targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
 test accessors (including a hash-chain check of a streaming encoder) and a
-window-limited test decoder.
+window-limited test decoder, and `-DARK_BLAKE3_TEST`, which compiles
+`ark_blake3_test_hash_many` (the chunk/parent hashing of one backend, for
+the SIMD lane tests).
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates
@@ -595,6 +616,12 @@ Checks: >
 | `ark_blake3_update` | `src/blake3.c` | Public |
 | `ark_blake3_final` | `src/blake3.c` | Public |
 | `ark_blake3` | `src/blake3.c` | Public; single-shot wrapper |
+| `ark_blake3_init_backend` | `src/blake3.c` | Public; init with a chunk function (`hash_init` in `archive.c`) |
+| `ark_blake3_x86_sse41_hash4` | `src/blake3_x86.c` | Public; SSE4.1 4-lane chunk/parent hashing, called by `blake3.c` |
+| `ark_blake3_x86_avx2_hash8` | `src/blake3_x86.c` | Public; AVX2 8-lane chunk/parent hashing, called by `blake3.c` |
+| `ark_blake3_arm_neon_hash4` | `src/blake3_arm.c` | Public; NEON 4-lane chunk/parent hashing, called by `blake3.c` |
+| `ark_blake3_cpu_supports` | `src/blake3_cpu.c` | Public; backend built in and supported by the CPU |
+| `ark_blake3_cpu_best` | `src/blake3_cpu.c` | Public; fastest supported backend (`ark_write_init`, `ark_read_header`) |
 | `ark_deflate_enc_size` | `src/deflate.c` | Public; encoder memory size query |
 | `ark_deflate_enc_init` | `src/deflate.c` | Public; encoder in caller memory (`pool_init`) |
 | `ark_deflate_enc_oneshot` | `src/deflate.c` | Public; called by worker threads |

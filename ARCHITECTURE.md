@@ -1254,9 +1254,11 @@ state index is a constant and compilers keep the state in registers; as
 functions, gcc did not inline the G calls and ran at about half of clang's
 speed. `update` compresses whole blocks straight from the caller's input
 (except a chunk's last block, which `final` may still need to mark as the
-chunk end) instead of copying them into the context first. Both compilers
-then reach about 600 MB/s on one core of the reference machine
-(PERFORMANCE_IMPROVEMENTS.md); the code stays plain C11 with no intrinsics.
+chunk end) instead of copying them into the context first; whole chunks
+followed by more input are hashed straight from the input as subtrees (see
+BLAKE3 backends below). Both compilers then reach about 600 MB/s on one
+core of the reference machine (PERFORMANCE_IMPROVEMENTS.md); the code stays
+plain C11 with no intrinsics.
 
 **SHA-256 backends.** `ark_sha256_init_backend(ctx, backend)` initializes a
 context with a block function; `ark_sha256_init` uses the portable one, and
@@ -1297,6 +1299,49 @@ in CI where the runners have the instructions, and the x86 path on an AMD
 Ryzen 7 4800H, where SHA-NI hashes at about 2 GB/s per core, 6.8 times
 the portable code (PERFORMANCE_IMPROVEMENTS.md).
 
+**BLAKE3 backends.** `ark_blake3_init_backend(ctx, backend)` initializes a
+context with a chunk function; `ark_blake3_init` uses the portable one, and
+every backend gives the same digests.
+
+```c
+typedef enum {
+    ARK_BLAKE3_BACKEND_PORTABLE = 0,   /* plain C, always available */
+    ARK_BLAKE3_BACKEND_SSE41,          /* x86 SSE4.1: 4 chunks at once */
+    ARK_BLAKE3_BACKEND_AVX2,           /* x86 AVX2: 8 chunks (+ SSE4.1) */
+    ARK_BLAKE3_BACKEND_NEON            /* arm64 NEON: 4 chunks at once */
+} ark_blake3_backend_t;
+int ark_blake3_init_backend(ark_blake3_ctx_t *ctx,
+                            ark_blake3_backend_t backend); /* 0, or -1 */
+
+/* blake3_cpu.h */
+int ark_blake3_cpu_supports(ark_blake3_backend_t backend);
+ark_blake3_backend_t ark_blake3_cpu_best(void);
+```
+
+At a chunk boundary, `update` hashes whole chunks that more input follows
+as one subtree: the largest power of two of chunks, at most 64, that the
+chunk counter is a multiple of. Such a subtree is a subtree of the final
+tree and never its root, so its chaining value goes onto the stack like a
+chunk's, one level higher. Its chunks, then each level of its parent nodes,
+go through one function that hashes several inputs in parallel lanes (the
+BLAKE3 reference's `hash_many`): 8 lanes with AVX2, 4 with SSE4.1 or NEON,
+the rest one at a time in portable C. The last chunk of the input stays in
+the context for `final`, as before. The portable backend takes the same
+path one input at a time. The files follow the SHA-256 layout:
+`blake3.c` / `blake3.h` alone are the portable BLAKE3, plain C11;
+`blake3_x86.c` (SSE4.1 and AVX2, `target` attributes) and `blake3_arm.c`
+(NEON) hold the intrinsics, compiled only on their architecture and called
+by `blake3.c` only under `ARK_BLAKE3_X86` / `ARK_BLAKE3_ARM`;
+`blake3_cpu.c` / `blake3_cpu.h` are the only BLAKE3 code that asks the CPU:
+on x86 the `cpuid` instruction (SSSE3, SSE4.1, AVX2, OSXSAVE, AVX) and
+`xgetbv` (the OS saves the AVX registers), no OS call; on arm64 nothing,
+since NEON is part of every arm64 CPU. ark chooses the backend once per
+archive context with `ark_blake3_cpu_best()` (`archive.c`), like SHA-256;
+`ark_blake3` (the single-shot call) stays portable, and the recovery reader
+keeps its own portable BLAKE3 (section 15). On the reference machine AVX2
+hashes about 2.3 GB/s per core, SSE4.1 about 1.2 GB/s, 3.9 and 2.1 times
+the portable code (PERFORMANCE_IMPROVEMENTS.md).
+
 **Output length.** Both APIs produce exactly 32 bytes of output, matching the
 hash field size in the index entry. BLAKE3 natively supports variable-length
 output; that capability is intentionally not exposed. ark has no use for output
@@ -1304,9 +1349,10 @@ lengths other than 32 bytes and exposing it adds caller complexity for no
 benefit.
 
 **BLAKE3 tree parallelism.** BLAKE3's internal tree hashing is not exposed in
-the API. ark uses BLAKE3 in sequential mode only. Internal exploitation of
-tree parallelism within `ark_blake3_update` is permitted as an implementation
-detail but is not required.
+the API. ark hashes each member and the index with one context, in one
+thread. Inside `ark_blake3_update` the tree is used as an implementation
+detail: whole-chunk subtrees are hashed with SIMD lanes (BLAKE3 backends
+above); no threads are used.
 
 ---
 

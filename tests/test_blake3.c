@@ -1,8 +1,15 @@
 #include "blake3.h"
+#include "blake3_cpu.h"
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+
+/* ARK_BLAKE3_TEST-only accessor defined in src/blake3.c. */
+int ark_blake3_test_hash_many(ark_blake3_backend_t, const uint8_t *const *,
+                              size_t, size_t, uint64_t, int, uint32_t, uint32_t,
+                              uint32_t, uint8_t *);
 
 typedef struct {
 	size_t input_len;
@@ -491,4 +498,303 @@ int test_blake3_random_splits(void)
 			return 1;
 	}
 	return 0;
+}
+
+/* Every backend, in enum order, with the name the tests print. */
+static const struct {
+	ark_blake3_backend_t backend;
+	const char *name;
+} g_blake3_backends[] = {
+    {ARK_BLAKE3_BACKEND_PORTABLE, "portable"},
+    {ARK_BLAKE3_BACKEND_SSE41, "x86 SSE4.1"},
+    {ARK_BLAKE3_BACKEND_AVX2, "x86 AVX2"},
+    {ARK_BLAKE3_BACKEND_NEON, "arm64 NEON"},
+};
+
+#define BLAKE3_TEST_BACKENDS                                                   \
+	(sizeof(g_blake3_backends) / sizeof(g_blake3_backends[0]))
+
+/*
+ * Hash input with backend b: in one update when piece is 0, else in
+ * pieces of piece bytes (the last one shorter).
+ */
+static int backend_digest(ark_blake3_backend_t b, const uint8_t *input,
+                          size_t len, size_t piece, uint8_t digest[32])
+{
+	ark_blake3_ctx_t ctx;
+	size_t off;
+
+	if (ark_blake3_init_backend(&ctx, b) != 0)
+		return -1;
+	if (piece == 0)
+		piece = len;
+	off = 0;
+	while (off < len) {
+		size_t n;
+
+		n = len - off < piece ? len - off : piece;
+		ark_blake3_update(&ctx, input + off, n);
+		off += n;
+	}
+	ark_blake3_final(&ctx, digest);
+	return 0;
+}
+
+/*
+ * Every official vector through every backend the CPU supports, in one
+ * update and in random pieces; prints which backends ran. A supported
+ * backend must be accepted by ark_blake3_init_backend().
+ */
+int test_blake3_backend_vectors(void)
+{
+	static uint8_t input[102400];
+	uint8_t digest[32];
+	uint32_t rng;
+	size_t b;
+	size_t i;
+	int rc;
+
+	rc = 0;
+	rng = 0xb1a4e303U;
+	printf("blake3 backends tested:");
+	for (b = 0; b < BLAKE3_TEST_BACKENDS; b++) {
+		ark_blake3_backend_t be;
+
+		be = g_blake3_backends[b].backend;
+		if (!ark_blake3_cpu_supports(be))
+			continue;
+		printf(" [%s]", g_blake3_backends[b].name);
+		for (i = 0;
+		     i < sizeof(g_blake3_vectors) / sizeof(g_blake3_vectors[0]);
+		     i++) {
+			ark_blake3_ctx_t ctx;
+			size_t len;
+
+			len = g_blake3_vectors[i].input_len;
+			fill_vector_input(input, len);
+			if (backend_digest(be, input, len, 0, digest) != 0 ||
+			    !digest_matches(digest, g_blake3_vectors[i].digest))
+				rc = 1;
+			if (ark_blake3_init_backend(&ctx, be) != 0)
+				rc = 1;
+			update_random_splits(&ctx, input, len, &rng);
+			ark_blake3_final(&ctx, digest);
+			if (!digest_matches(digest, g_blake3_vectors[i].digest))
+				rc = 1;
+		}
+	}
+	printf("\n");
+	return rc;
+}
+
+/*
+ * Whole chunks hashed as subtrees (one large update) give the digest of
+ * chunk-by-chunk hashing (updates of at most one chunk never take the
+ * subtree path), for every supported backend: lengths around subtree
+ * sizes up to 3 x 64 chunks, and a first update of a few chunks so that
+ * the following subtrees start at counters that are not multiples of 64.
+ */
+int test_blake3_subtree_matches_sequential(void)
+{
+	static const size_t chunks[] = {1,  2,  3,  4,   5,   7,   8,
+	                                9,  15, 16, 17,  31,  32,  33,
+	                                63, 64, 65, 127, 128, 129, 192};
+	static uint8_t input[193 * 1024];
+	uint32_t rng;
+	size_t b;
+	size_t i;
+	int rc;
+
+	rc = 0;
+	rng = 0xb1a4e304U;
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)next_random(&rng);
+	for (b = 0; b < BLAKE3_TEST_BACKENDS; b++) {
+		ark_blake3_backend_t be;
+
+		be = g_blake3_backends[b].backend;
+		if (!ark_blake3_cpu_supports(be))
+			continue;
+		for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+			static const size_t extra[] = {0, 1, 1023};
+			size_t e;
+
+			for (e = 0; e < 3; e++) {
+				ark_blake3_ctx_t ctx;
+				uint8_t want[32];
+				uint8_t got[32];
+				size_t len;
+				size_t first;
+
+				len = chunks[i] * 1024U + extra[e];
+				if (backend_digest(be, input, len, 1024,
+				                   want) != 0 ||
+				    backend_digest(be, input, len, 0, got) !=
+				        0 ||
+				    !digest_matches(got, want))
+					rc = 1;
+				/* 1..5 chunks first, then the rest at once. */
+				first = (i % 5U + 1U) * 1024U;
+				if (first > len)
+					first = len;
+				if (ark_blake3_init_backend(&ctx, be) != 0)
+					rc = 1;
+				ark_blake3_update(&ctx, input, first);
+				ark_blake3_update(&ctx, input + first,
+				                  len - first);
+				ark_blake3_final(&ctx, got);
+				if (!digest_matches(got, want))
+					rc = 1;
+			}
+		}
+	}
+	return rc;
+}
+
+/*
+ * Each supported SIMD backend agrees with the portable one on 40 random
+ * lengths up to 160 KiB fed in random pieces from an odd address
+ * (unaligned loads), and on 1 MiB hashed in one update.
+ */
+int test_blake3_backend_differential(void)
+{
+	static uint8_t msg[1048576 + 1];
+	uint32_t rng;
+	size_t b;
+	size_t i;
+	int rc;
+
+	rc = 0;
+	rng = 0xb1a4e305U;
+	for (i = 0; i < sizeof(msg); i++)
+		msg[i] = (uint8_t)next_random(&rng);
+	for (b = 1; b < BLAKE3_TEST_BACKENDS; b++) {
+		ark_blake3_backend_t be;
+		uint8_t want[32];
+		uint8_t got[32];
+
+		be = g_blake3_backends[b].backend;
+		if (!ark_blake3_cpu_supports(be))
+			continue;
+		for (i = 0; i < 40; i++) {
+			ark_blake3_ctx_t ctx;
+			size_t len;
+
+			len = (size_t)next_random(&rng) % (160U * 1024U + 1U);
+			ark_blake3(msg + 1, len, want);
+			if (ark_blake3_init_backend(&ctx, be) != 0)
+				rc = 1;
+			update_random_splits(&ctx, msg + 1, len, &rng);
+			ark_blake3_final(&ctx, got);
+			if (!digest_matches(got, want))
+				rc = 1;
+		}
+		ark_blake3(msg, sizeof(msg) - 1U, want);
+		if (backend_digest(be, msg, sizeof(msg) - 1U, 0, got) != 0 ||
+		    !digest_matches(got, want))
+			rc = 1;
+	}
+	return rc;
+}
+
+/*
+ * An unknown backend, and a SIMD backend this build does not have, make
+ * ark_blake3_init_backend() return -1 and leave a working portable
+ * context; ark_blake3_cpu_supports() reports only what init accepts, and
+ * ark_blake3_cpu_best() returns a supported backend.
+ */
+int test_blake3_backend_selection(void)
+{
+	static uint8_t input[2048];
+	ark_blake3_ctx_t ctx;
+	uint8_t digest[32];
+	const uint8_t *expected;
+	size_t b;
+	int rc;
+
+	rc = 0;
+	if (find_vector(2048, &expected) != 0)
+		return 1;
+	fill_vector_input(input, sizeof(input));
+	if (ark_blake3_init_backend(&ctx, (ark_blake3_backend_t)99) != -1 ||
+	    ctx.backend != ARK_BLAKE3_BACKEND_PORTABLE)
+		rc = 1;
+	ark_blake3_update(&ctx, input, sizeof(input));
+	ark_blake3_final(&ctx, digest);
+	if (!digest_matches(digest, expected) ||
+	    ark_blake3_cpu_supports((ark_blake3_backend_t)99) != 0 ||
+	    !ark_blake3_cpu_supports(ark_blake3_cpu_best()))
+		rc = 1;
+	for (b = 0; b < BLAKE3_TEST_BACKENDS; b++) {
+		ark_blake3_backend_t be;
+		int built;
+
+		be = g_blake3_backends[b].backend;
+		built = ark_blake3_init_backend(&ctx, be) == 0;
+		if (ark_blake3_cpu_supports(be) && !built)
+			rc = 1;
+		if (!built && ctx.backend != ARK_BLAKE3_BACKEND_PORTABLE)
+			rc = 1;
+	}
+	return rc;
+}
+
+/*
+ * Each supported SIMD backend's lanes equal the portable code for 13
+ * inputs (8 + 4 lanes + 1 portable on AVX2) in four cases: whole chunks
+ * with counters that carry into the high 32 bits inside a lane group,
+ * one-block parents (no counter increment), three blocks with all flag
+ * arguments distinct, and a counter above 2^32 without increment.
+ */
+int test_blake3_backend_lanes(void)
+{
+	static const struct {
+		size_t blocks;
+		uint64_t counter;
+		int increment;
+		uint32_t flags;
+		uint32_t start;
+		uint32_t end;
+	} c[] = {
+	    {16, 0xfffffffaU, 1, 0x00U, 0x01U, 0x02U},
+	    {1, 0, 0, 0x04U, 0x00U, 0x00U},
+	    {3, 0x123456789aU, 1, 0x10U, 0x01U, 0x22U},
+	    {2, 0x200000007U, 0, 0x00U, 0x01U, 0x02U},
+	};
+	static uint8_t input[13 * 1024 + 3];
+	const uint8_t *inputs[13];
+	uint8_t want[13 * 32];
+	uint8_t got[13 * 32];
+	uint32_t rng;
+	size_t b;
+	size_t i;
+	size_t k;
+	int rc;
+
+	rc = 0;
+	rng = 0xb1a4e306U;
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)next_random(&rng);
+	for (i = 0; i < 13; i++)
+		inputs[i] = input + 3 + i * 1024U - (i % 3U);
+	for (b = 1; b < BLAKE3_TEST_BACKENDS; b++) {
+		ark_blake3_backend_t be;
+
+		be = g_blake3_backends[b].backend;
+		if (!ark_blake3_cpu_supports(be))
+			continue;
+		for (k = 0; k < sizeof(c) / sizeof(c[0]); k++) {
+			if (ark_blake3_test_hash_many(
+			        ARK_BLAKE3_BACKEND_PORTABLE, inputs, 13,
+			        c[k].blocks, c[k].counter, c[k].increment,
+			        c[k].flags, c[k].start, c[k].end, want) != 0 ||
+			    ark_blake3_test_hash_many(
+			        be, inputs, 13, c[k].blocks, c[k].counter,
+			        c[k].increment, c[k].flags, c[k].start,
+			        c[k].end, got) != 0 ||
+			    memcmp(want, got, sizeof(want)) != 0)
+				rc = 1;
+		}
+	}
+	return rc;
 }

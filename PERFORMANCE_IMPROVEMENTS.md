@@ -277,3 +277,32 @@ one-shot, best of 5, pinned, three rounds, digests equal in every run:
 SHA-NI is 6.8 times the portable code there and 2.8 times BLAKE3's portable
 speed. The same run on the i7-7500U: SHA-256 portable 214-216 MB/s, BLAKE3
 604-610 MB/s (clang). The ARMv8 path is not measured yet.
+
+**BLAKE3 SIMD chunk functions** (x86 SSE4.1 and AVX2, arm64 NEON; ark's
+default hash on create, verify and extract). Whole chunks are hashed 4
+(SSE4.1, NEON) or 8 (AVX2) at a time in vector lanes, as subtrees of up to
+64 chunks whose parent nodes also go through the lanes; the portable code
+takes the same path one chunk at a time. i7-7500U (AVX2, no AVX-512),
+128 MiB one-shot, best of 5, pinned, three rounds, digests equal:
+
+| i7-7500U | clang 22 | gcc 16 |
+|---|---|---|
+| BLAKE3 portable | 582-589 MB/s | 588-596 MB/s |
+| BLAKE3 x86 SSE4.1 | 1,224-1,249 MB/s | 1,067-1,108 MB/s |
+| BLAKE3 x86 AVX2 | 2,200-2,290 MB/s | 1,973-2,013 MB/s |
+
+AVX2 is 3.9 times the portable code with clang. The kernels alone (8 or 4
+chunks per call, no tree) reach 2,375-2,451 and 1,370-1,401 MB/s, so the
+tree costs about 4 %; the rest is register pressure (16 state and 16
+message vectors in 16 registers). The portable speed is unchanged within
+noise (interleaved against the previous code: clang 601-606 vs 583-596,
+gcc 568-587 vs 589-599 MB/s), and so is every input size up to 4 KiB,
+which needs at least four whole chunks before the next one to use the
+lanes. One-shot time per hash, clang: 16 KiB 26.4 -> 12.6 us (AVX2) /
+15.1 us (SSE4.1); 64 KiB 106 -> 29 / 45 us; 1 MiB 1.69 -> 0.35 / 0.65 ms.
+ark (release, clang), best of 5, interleaved with the previous binary: a
+256 MiB file of random bytes (stored chunks, so hashing dominates) verifies
+in 0.13 s instead of 0.48 s and extracts in 0.45 s instead of 0.73 s; the
+255 MB corpus archive (decode-bound) verifies in 0.98 s instead of 1.03 s
+and extracts in 0.53 s instead of 0.59 s. The NEON path is tested under
+qemu-aarch64 and on CI's arm64 runners but not measured.

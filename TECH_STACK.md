@@ -255,7 +255,7 @@ make release      # optimised binary
 make test         # run test suite (dev build)
 make test-tsan    # TSan build and test run (Linux/Clang only)
 make valgrind     # Valgrind run (Linux only, no sanitisers)
-make test-qemu    # SHA-256 tests on an emulated SHA-NI CPU (x86-64 Linux, qemu-user)
+make test-qemu    # SHA-256 and BLAKE3 tests on an emulated SHA-NI/AVX2 CPU (x86-64 Linux, qemu-user)
 make lint         # clang-tidy + cppcheck
 make format       # clang-format -i on all source files
 make clean        # remove build artefacts
@@ -468,15 +468,17 @@ in active use will satisfy both requirements.
 | ARM64 | First-class |
 
 The codebase is POSIX C with no inline assembly. The only
-architecture-specific code is SHA-256's optional hardware block functions:
+architecture-specific code is the hashes' optional hardware files, written
+with compiler intrinsics (gcc and clang only): SHA-256's block functions
 `src/sha256_x86.c` (x86 SHA extensions) and `src/sha256_arm.c` (ARMv8 SHA2),
-written with compiler intrinsics and a `target` attribute (gcc and clang
-only). The Makefile compiles the one matching `uname -m` and defines
-`ARK_SHA256_X86` or `ARK_SHA256_ARM`; `src/sha256_cpu.c` tells at run time
+and BLAKE3's chunk functions `src/blake3_x86.c` (SSE4.1 and AVX2) and
+`src/blake3_arm.c` (NEON). The Makefile compiles the ones matching `uname -m`
+and defines `ARK_SHA256_X86` / `ARK_BLAKE3_X86` or `ARK_SHA256_ARM` /
+`ARK_BLAKE3_ARM`; `src/sha256_cpu.c` and `src/blake3_cpu.c` tell at run time
 whether the CPU has the instructions, and the portable C code is used
-otherwise. `sha256.c` itself, blake3, deflate and zwrap stay portable ISO
-C11 with no extensions, so they also build with compilers that have no
-intrinsics. See ARCHITECTURE.md section 8.4.
+otherwise. `sha256.c` and `blake3.c` themselves, deflate and zwrap stay
+portable ISO C11 with no extensions, so they also build with compilers that
+have no intrinsics. See ARCHITECTURE.md section 8.4.
 
 ### 8.3 Platform-Specific Behaviour Summary
 

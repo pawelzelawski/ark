@@ -98,6 +98,11 @@ int test_blake3_independent_contexts(void);
 int test_blake3_incremental_updates(void);
 int test_blake3_vectors_random_splits(void);
 int test_blake3_random_splits(void);
+int test_blake3_backend_vectors(void);
+int test_blake3_subtree_matches_sequential(void);
+int test_blake3_backend_differential(void);
+int test_blake3_backend_selection(void);
+int test_blake3_backend_lanes(void);
 int test_deflate_round_trip_text(void);
 int test_deflate_round_trip_binary(void);
 int test_deflate_round_trip_empty(void);
@@ -321,6 +326,12 @@ static const test_case_t g_tests[] = {
     {"test_blake3_incremental_updates", test_blake3_incremental_updates},
     {"test_blake3_vectors_random_splits", test_blake3_vectors_random_splits},
     {"test_blake3_random_splits", test_blake3_random_splits},
+    {"test_blake3_backend_vectors", test_blake3_backend_vectors},
+    {"test_blake3_subtree_matches_sequential",
+     test_blake3_subtree_matches_sequential},
+    {"test_blake3_backend_differential", test_blake3_backend_differential},
+    {"test_blake3_backend_selection", test_blake3_backend_selection},
+    {"test_blake3_backend_lanes", test_blake3_backend_lanes},
     {"test_deflate_round_trip_text", test_deflate_round_trip_text},
     {"test_deflate_round_trip_binary", test_deflate_round_trip_binary},
     {"test_deflate_round_trip_empty", test_deflate_round_trip_empty},
