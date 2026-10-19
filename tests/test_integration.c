@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -158,9 +159,11 @@ static int write_pattern_file(const char *path, size_t total, uint32_t seed)
  *
  * OWNERSHIP: on success *out is owned by the caller and must be freed.
  */
-/* Archive builder defined in test_archive.c. */
+/* Archive builders defined in test_archive.c. */
 size_t test_archive_one_chunk(uint8_t *, size_t, const uint8_t *, size_t,
                               uint64_t, size_t *);
+size_t test_archive_one_chunk_at(uint8_t *, size_t, const char *,
+                                 const uint8_t *, size_t, uint64_t, size_t *);
 
 /* Write len bytes to a new file at path. Returns 0 on success, -1 on error. */
 static int write_bytes_file(const char *path, const uint8_t *buf, size_t len)
@@ -321,14 +324,16 @@ static int compare_tree(const char *a_path, const char *b_path)
 	return -1;
 }
 /*
- * run_program - Fork, optionally redirect, and exec one test command.
+ * run_program_limited - Fork, optionally redirect, and exec one test command;
+ * a nonzero data_limit sets the child's RLIMIT_DATA (bytes) first.
  *
  * SAFETY: ark subcommands are executed in child processes so pledge/Landlock
  * restrictions are discarded when that child exits. See ARCHITECTURE.md
  * sections 6.3 and 10.4.
  */
-static int run_program(char *const argv[], const char *cwd,
-                       const char *stdout_path, const char *stderr_path)
+static int run_program_limited(char *const argv[], const char *cwd,
+                               const char *stdout_path, const char *stderr_path,
+                               rlim_t data_limit)
 {
 	pid_t pid;
 	int status;
@@ -366,6 +371,20 @@ static int run_program(char *const argv[], const char *cwd,
 				(void)close(fd);
 			}
 		}
+		/*
+		 * RLIMIT_DATA covers malloc'd memory on Linux and OpenBSD. It
+		 * is set last: until exec the child is still the (sanitized)
+		 * test process, whose own allocations would exceed a small
+		 * limit.
+		 */
+		if (data_limit != 0) {
+			struct rlimit rl;
+
+			rl.rlim_cur = data_limit;
+			rl.rlim_max = data_limit;
+			if (setrlimit(RLIMIT_DATA, &rl) != 0)
+				_exit(125);
+		}
 		execvp(argv[0], argv);
 		_exit(127);
 	}
@@ -376,6 +395,15 @@ static int run_program(char *const argv[], const char *cwd,
 	if (!WIFEXITED(status))
 		return -1;
 	return WEXITSTATUS(status);
+}
+/*
+ * run_program - Run argv in cwd (NULL = unchanged) with stdout/stderr
+ * redirected; returns the exit status, or -1.
+ */
+static int run_program(char *const argv[], const char *cwd,
+                       const char *stdout_path, const char *stderr_path)
+{
+	return run_program_limited(argv, cwd, stdout_path, stderr_path, 0);
 }
 /*
  * run_ark - Execute the production CLI and require an expected exit code.
@@ -1233,6 +1261,229 @@ int test_integration_generate_reader_no_follow(void)
 	}
 	rc = 0;
 cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
+/*
+ * build_reader - Generate the recovery reader into root/recovery.c and build
+ * it as root/recover with cc -O2. recover_bin receives the binary path.
+ */
+static int build_reader(const char *root, char *recover_bin, size_t cap)
+{
+	char recovery_c[PATH_MAX];
+	char *gen_argv[] = {(char *)g_ark_bin, "generate-reader", recovery_c,
+	                    NULL};
+	char *cc_argv[] = {"cc", "-O2", recovery_c, "-o", recover_bin, NULL};
+
+	if (path_join(recovery_c, sizeof(recovery_c), root, "recovery.c") !=
+	        0 ||
+	    path_join(recover_bin, cap, root, "recover") != 0)
+		return -1;
+	if (run_ark(gen_argv, 0, NULL, NULL) != 0 ||
+	    run_program(cc_argv, NULL, NULL, NULL) != 0)
+		return -1;
+	return 0;
+}
+/*
+ * dir_is_empty - Return 1 when path is a directory with no entries.
+ */
+static int dir_is_empty(const char *path)
+{
+	DIR *d;
+	const struct dirent *e;
+	int empty;
+
+	d = opendir(path);
+	if (d == NULL)
+		return 0;
+	empty = 1;
+	while ((e = readdir(d)) != NULL) {
+		if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+			empty = 0;
+	}
+	(void)closedir(d);
+	return empty;
+}
+/*
+ * test_integration_generate_reader_no_follow_parent - The recovery reader
+ * never follows a symlink in a parent component of a member path. A
+ * hand-built archive holding only "d/f" (no "d" member) fails when "d" in
+ * the destination is a symlink to another directory, which stays empty, and
+ * recovers into a destination without "d" (the parent is created). An
+ * ark-built tree fails when its "sub" directory already exists as a
+ * symlink. See ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_no_follow_parent(void)
+{
+	/* Fixed block: 'A', then length 257 at distance 1, EOB. */
+	static const uint8_t stream[] = {0x73, 0x1c, 0xf1, 0x00, 0x00};
+	char root[PATH_MAX], victim[PATH_MAX], archive[PATH_MAX];
+	char tree_ark[PATH_MAX], src[PATH_MAX], out[PATH_MAX];
+	char path[PATH_MAX], recover_bin[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	char *tree_argv[] = {recover_bin, tree_ark, NULL};
+	uint8_t buf[512];
+	uint8_t *got;
+	size_t got_len;
+	size_t index_len;
+	size_t len;
+	int rc;
+
+	got = NULL;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(victim, sizeof(victim), root, "victim") != 0 ||
+	    path_join(archive, sizeof(archive), root, "parent.ark") != 0 ||
+	    path_join(tree_ark, sizeof(tree_ark), root, "tree.ark") != 0 ||
+	    path_join(src, sizeof(src), root, "src") != 0 ||
+	    mkdir(victim, 0700) != 0)
+		goto cleanup;
+	len = test_archive_one_chunk_at(buf, sizeof(buf), "d/f", stream,
+	                                sizeof(stream), 258U, &index_len);
+	if (len == 0U || write_bytes_file(archive, buf, len) != 0 ||
+	    make_basic_tree(src) != 0 ||
+	    create_archive(tree_ark, src, NULL) != 0)
+		goto cleanup;
+	if (build_reader(root, recover_bin, sizeof(recover_bin)) != 0)
+		goto cleanup;
+
+	/* "d" is a symlink to victim: recovery fails, victim stays empty. */
+	if (path_join(out, sizeof(out), root, "out-link") != 0 ||
+	    mkdir(out, 0700) != 0 ||
+	    path_join(path, sizeof(path), out, "d") != 0 ||
+	    symlink(victim, path) != 0)
+		goto cleanup;
+	if (run_program(recover_argv, out, "/dev/null", "/dev/null") == 0 ||
+	    !dir_is_empty(victim))
+		goto cleanup;
+
+	/* No "d": the reader creates it and writes d/f. */
+	if (path_join(out, sizeof(out), root, "out-new") != 0 ||
+	    mkdir(out, 0700) != 0 ||
+	    run_program(recover_argv, out, "/dev/null", "/dev/null") != 0 ||
+	    path_join(path, sizeof(path), out, "d/f") != 0 ||
+	    read_file_bytes(path, &got, &got_len) != 0 || got_len != 258U ||
+	    got[0] != 'A' || got[257] != 'A')
+		goto cleanup;
+
+	/* ark-built tree, "sub" exists as a symlink to victim: fails. */
+	if (path_join(out, sizeof(out), root, "out-tree") != 0 ||
+	    mkdir(out, 0700) != 0 ||
+	    path_join(path, sizeof(path), out, "sub") != 0 ||
+	    symlink(victim, path) != 0)
+		goto cleanup;
+	if (run_program(tree_argv, out, "/dev/null", "/dev/null") == 0 ||
+	    !dir_is_empty(victim))
+		goto cleanup;
+	rc = 0;
+cleanup:
+	free(got);
+	(void)remove_tree(root);
+	return rc;
+}
+/*
+ * test_integration_generate_reader_member_types - The recovery reader
+ * restores every member type: a directory, a regular file inside it, a
+ * hardlink to that file (the link target is a path in a subdirectory) and a
+ * symlink. See ARCHITECTURE.md sections 13.2, 13.3 and 15.2.
+ */
+int test_integration_generate_reader_member_types(void)
+{
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recover_bin[PATH_MAX], a[PATH_MAX], b[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	struct stat st_a;
+	struct stat st_b;
+	int rc;
+
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(out, sizeof(out), root, "out") != 0 ||
+	    path_join(archive, sizeof(archive), root, "types.ark") != 0 ||
+	    make_member_type_tree(src) != 0 || mkdir(out, 0700) != 0 ||
+	    create_archive(archive, src, NULL) != 0 ||
+	    build_reader(root, recover_bin, sizeof(recover_bin)) != 0 ||
+	    run_program(recover_argv, out, NULL, NULL) != 0)
+		goto cleanup;
+	if (path_join(a, sizeof(a), out, "dir/original.txt") != 0 ||
+	    path_join(b, sizeof(b), out, "hard.txt") != 0 ||
+	    stat(a, &st_a) != 0 || stat(b, &st_b) != 0 ||
+	    st_a.st_ino != st_b.st_ino || st_a.st_dev != st_b.st_dev)
+		goto cleanup;
+	rc = compare_tree(src, out) == 0 ? 0 : 1;
+cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
+/*
+ * test_integration_generate_reader_bounded_memory - The recovery reader reads
+ * the archive in pieces, so a 40 MiB archive (incompressible data, stored
+ * chunks) recovers with its data size limited to 32 MiB, which the old
+ * whole-file read could not. See ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_bounded_memory(void)
+{
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char file[PATH_MAX], recover_bin[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	struct stat st;
+	uint8_t *block;
+	uint32_t x;
+	size_t i;
+	int fd;
+	int rc;
+
+	block = NULL;
+	fd = -1;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(out, sizeof(out), root, "out") != 0 ||
+	    path_join(archive, sizeof(archive), root, "big.ark") != 0 ||
+	    path_join(file, sizeof(file), src, "random.bin") != 0 ||
+	    mkdir(src, 0700) != 0 || mkdir(out, 0700) != 0)
+		goto cleanup;
+	/* 40 x 1 MiB of xorshift bytes, each MiB differing in its first word.
+	 */
+	block = (uint8_t *)malloc(1048576U);
+	if (block == NULL)
+		goto cleanup;
+	x = 0x2545f491U;
+	for (i = 0; i < 1048576U; i++) {
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		block[i] = (uint8_t)x;
+	}
+	fd = open(file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd == -1)
+		goto cleanup;
+	for (i = 0; i < 40U; i++) {
+		block[0] = (uint8_t)i;
+		if (write(fd, block, 1048576U) != 1048576)
+			goto cleanup;
+	}
+	if (close(fd) != 0) {
+		fd = -1;
+		goto cleanup;
+	}
+	fd = -1;
+	if (create_archive(archive, src, NULL) != 0 ||
+	    stat(archive, &st) != 0 || st.st_size < 40 * 1048576)
+		goto cleanup;
+	if (build_reader(root, recover_bin, sizeof(recover_bin)) != 0 ||
+	    run_program_limited(recover_argv, out, NULL, NULL,
+	                        (rlim_t)32 * 1048576) != 0)
+		goto cleanup;
+	rc = compare_tree(src, out) == 0 ? 0 : 1;
+cleanup:
+	if (fd != -1)
+		(void)close(fd);
+	free(block);
 	(void)remove_tree(root);
 	return rc;
 }

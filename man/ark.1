@@ -131,6 +131,9 @@ Write a standalone C11 recovery reader.
 It builds with any C11 compiler on a POSIX.1-2008 system, including a strict
 .Fl std=c11
 build.
+The reader extracts into the current directory, never follows a symbolic
+link in a member's path, and needs memory for the archive index plus about
+2 MiB, whatever the archive size.
 If
 .Ar output.c
 is omitted, the output path is

@@ -2467,10 +2467,26 @@ universal applicability.
 The generated file is approximately 2,200-2,700 lines of C11. It compiles
 with any C11 compiler on a POSIX.1-2008 system:
 `cc -O2 recovery.c -o recover && ./recover archive.ark`. The reader needs
-POSIX.1-2008 for its file operations (`open` with `O_NOFOLLOW` and
-`O_CLOEXEC`, `mkdir`, `symlink`, `link`, `strdup`), so the generated source
-defines `_POSIX_C_SOURCE 200809L` before its first `#include`; a strict
-`cc -std=c11 -Wall -Wextra -Wpedantic` build then needs no extra flags.
+POSIX.1-2008 for its file operations (`openat`, `mkdirat`, `symlinkat`,
+`linkat`, `unlinkat`, `fstatat`, `pread`, `O_NOFOLLOW`, `O_DIRECTORY`,
+`O_CLOEXEC`), so the generated source defines `_POSIX_C_SOURCE 200809L`
+before its first `#include`; a strict `cc -std=c11 -Wall -Wextra -Wpedantic`
+build then needs no extra flags. It also defines `_FILE_OFFSET_BITS 64`, so
+32-bit systems read archives over 2 GiB with a 64-bit `off_t`.
+
+**Reader extraction and memory.** The reader extracts into the current
+directory, held as a directory fd. For each member it opens the parent
+directories one component at a time with `openat(O_DIRECTORY | O_NOFOLLOW)`,
+creating missing ones with mode 0700, and creates the member relative to its
+parent's fd (`openat`, `mkdirat`, `symlinkat`, `linkat`; a hardlink's target
+is resolved the same way). A symlink, or anything that is not a directory, in
+a parent component therefore fails the recovery instead of being followed;
+an existing directory is reused only when it is a real directory; a regular
+file is opened with `O_NOFOLLOW`. The archive is read with `pread` in
+pieces: the header, the footer, the index, then one compressed chunk at a
+time (at most 1,048,662 bytes, `ark_deflate_bound` of a 1 MiB chunk, as
+`ark extract` enforces). Memory is the index plus about 2 MiB of chunk
+buffers, independent of the archive size.
 
 **Endian neutrality.** The ark format is strictly little-endian throughout.
 The generated `recovery.c` must parse all multi-byte integer fields using

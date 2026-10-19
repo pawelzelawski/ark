@@ -252,6 +252,9 @@ int test_integration_generate_reader(void);
 int test_integration_generate_reader_strict_c11(void);
 int test_integration_generate_reader_rejects_legacy_258(void);
 int test_integration_generate_reader_no_follow(void);
+int test_integration_generate_reader_no_follow_parent(void);
+int test_integration_generate_reader_member_types(void);
+int test_integration_generate_reader_bounded_memory(void);
 int test_integration_deterministic(void);
 int test_integration_large_archive(void);
 int test_ring_normal_produce_consume(void);
@@ -673,6 +676,12 @@ static const test_case_t g_tests[] = {
      test_integration_generate_reader_rejects_legacy_258},
     {"test_integration_generate_reader_no_follow",
      test_integration_generate_reader_no_follow},
+    {"test_integration_generate_reader_no_follow_parent",
+     test_integration_generate_reader_no_follow_parent},
+    {"test_integration_generate_reader_member_types",
+     test_integration_generate_reader_member_types},
+    {"test_integration_generate_reader_bounded_memory",
+     test_integration_generate_reader_bounded_memory},
     {"test_integration_deterministic", test_integration_deterministic},
     {"test_integration_large_archive", test_integration_large_archive},
 };

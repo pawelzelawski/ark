@@ -642,6 +642,9 @@ test. These tests are the final gate before a phase is declared complete.
 | `test_integration_generate_reader_strict_c11` | generate-reader output builds with `-std=c11 -Wall -Wextra -Wpedantic -Werror` using `cc` (required) and `clang`/`gcc` when installed; each build recovers the test tree |
 | `test_integration_generate_reader_rejects_legacy_258` | The recovery reader fails on a hand-built archive whose chunk codes length 258 as 284 + 31 and recovers the same archive with 284 + 30 (258 bytes of `A`) |
 | `test_integration_generate_reader_no_follow` | Recovery reader refuses to write through a pre-existing symlink at a regular-file member path (empty and non-empty); symlink target unchanged |
+| `test_integration_generate_reader_no_follow_parent` | Recovery reader never follows a symlink in a parent component: a hand-built archive holding only `d/f` fails when `d` is a symlink to another directory (which stays empty) and recovers, creating `d`, when `d` is missing; an ark-built tree fails when its `sub` directory exists as a symlink |
+| `test_integration_generate_reader_member_types` | Recovery reader restores a directory, a file inside it, a hardlink to that file (same inode) and a symlink; the tree equals the source |
+| `test_integration_generate_reader_bounded_memory` | A 40 MiB archive of incompressible data recovers with the reader's `RLIMIT_DATA` at 32 MiB (pieces read with `pread`, not the whole file) and equals the source |
 | `test_integration_deterministic` | Same source content archived twice; archives are bit-identical |
 | `test_integration_large_archive` | Archive containing 1000 files of mixed sizes; create, verify, extract; all clean |
 

@@ -17,12 +17,15 @@
  */
 
 /*
- * The reader uses POSIX.1-2008 interfaces (strdup, symlink, link, O_NOFOLLOW,
- * O_CLOEXEC). A strict C11 build (cc -std=c11) hides them unless the source
- * requests them, so the feature-test macro must precede every #include.
+ * The reader uses POSIX.1-2008 interfaces (openat and the other *at calls,
+ * pread, O_NOFOLLOW, O_DIRECTORY, O_CLOEXEC). A strict C11 build
+ * (cc -std=c11) hides them unless the source requests them, so the
+ * feature-test macro must precede every #include. _FILE_OFFSET_BITS asks
+ * 32-bit systems for a 64-bit off_t, so archives over 2 GiB stay readable.
  * ARCHITECTURE.md section 15.2.
  */
 #define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,6 +38,12 @@
 #include <unistd.h>
 
 #define REC_CHUNK_SIZE 1048576U
+/*
+ * Largest compressed chunk ark writes: the Deflate bound of one 1 MiB chunk
+ * (1 MiB + 5 bytes per 65,535-byte stored block + 1). Larger chunk sizes in
+ * an index are rejected, so one buffer of this size holds any chunk.
+ */
+#define REC_MAX_COMP_CHUNK (REC_CHUNK_SIZE + 17U * 5U + 1U)
 #define REC_HASH_LEN 32U
 #define REC_HEADER_SIZE 16U
 #define REC_FOOTER_SIZE 64U
@@ -1102,35 +1111,57 @@ static int path_is_safe(const char *path)
 	return 1;
 }
 
-static int mkdirs_for_path(const char *path)
+/*
+ * Open the directory that holds path's last component, walking from root_fd
+ * one component at a time with O_DIRECTORY | O_NOFOLLOW: a parent that is a
+ * symlink or not a directory fails instead of being followed, so nothing is
+ * created outside the extraction directory. With create, missing parents are
+ * made with mode 0700. path must have passed path_is_safe(). Returns a new fd
+ * that the caller closes, or -1; *leaf points into path at the last
+ * component. ARCHITECTURE.md section 15.2.
+ */
+static int open_parent_dir(int root_fd, const char *path, int create,
+                           const char **leaf)
 {
-	char *tmp;
-	char *p;
+	char comp[REC_MAX_PATH + 1U];
+	const char *start;
+	const char *slash;
+	int fd;
 
-	/* OWNERSHIP: tmp is released before return on all paths. */
-	tmp = strdup(path);
-	if (tmp == NULL)
+	fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd == -1)
 		return -1;
-	for (p = tmp + 1; *p != '\0'; p++) {
-		struct stat st;
+	start = path;
+	while ((slash = strchr(start, '/')) != NULL) {
+		size_t len;
+		int next;
 
-		if (*p != '/')
-			continue;
-		*p = '\0';
-		if (mkdir(tmp, 0700) != 0) {
-			if (errno != EEXIST) {
-				free(tmp);
-				return -1;
-			}
-			if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) {
-				free(tmp);
-				return -1;
-			}
+		len = (size_t)(slash - start);
+		if (len == 0U || len > REC_MAX_PATH) {
+			(void)close(fd);
+			return -1;
 		}
-		*p = '/';
+		memcpy(comp, start, len);
+		comp[len] = '\0';
+		next = openat(fd, comp,
+		              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (next == -1 && errno == ENOENT && create) {
+			if (mkdirat(fd, comp, 0700) != 0 && errno != EEXIST) {
+				(void)close(fd);
+				return -1;
+			}
+			next = openat(fd, comp,
+			              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+			                  O_CLOEXEC);
+		}
+		(void)close(fd);
+		if (next == -1)
+			return -1;
+		fd = next;
+		start = slash + 1;
 	}
-	free(tmp);
-	return 0;
+	*leaf = start;
+	return fd;
 }
 
 static int write_full_fd(int fd, const uint8_t *buf, size_t len)
@@ -1188,52 +1219,38 @@ static void compute_empty_digest(uint8_t hash_alg, uint8_t out[REC_HASH_LEN])
 	hash_final(hash_alg, &sctx, &bctx, out);
 }
 
-static int read_whole_file(const char *path, uint8_t **out, size_t *out_len)
+/*
+ * Read exactly len bytes at offset off of fd (pread, retried on EINTR and
+ * short reads). Fails on an offset off_t cannot hold and on end of file.
+ */
+static int read_full_at(int fd, uint8_t *buf, size_t len, uint64_t off)
 {
-	FILE *fp;
-	long size_long;
-	size_t size;
-	uint8_t *buf;
+	uint64_t off_max;
 
-	fp = fopen(path, "rb");
-	if (fp == NULL)
+	/* Largest off_t: 2^(bits - 1) - 1 (off_t is a signed integer type). */
+	off_max = ((uint64_t)1 << (sizeof(off_t) * 8U - 1U)) - 1U;
+	if (off > off_max || (uint64_t)len > off_max - off)
 		return -1;
-	if (fseek(fp, 0, SEEK_END) != 0) {
-		fclose(fp);
-		return -1;
+	while (len > 0U) {
+		ssize_t n;
+
+		n = pread(fd, buf, len, (off_t)off);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		buf += (size_t)n;
+		len -= (size_t)n;
+		off += (uint64_t)n;
 	}
-	size_long = ftell(fp);
-	if (size_long < 0) {
-		fclose(fp);
-		return -1;
-	}
-	size = (size_t)size_long;
-	if (fseek(fp, 0, SEEK_SET) != 0) {
-		fclose(fp);
-		return -1;
-	}
-	/* OWNERSHIP: caller frees returned file buffer. */
-	buf = (uint8_t *)malloc(size == 0U ? 1U : size);
-	if (buf == NULL) {
-		fclose(fp);
-		return -1;
-	}
-	if (size > 0U && fread(buf, 1, size, fp) != size) {
-		free(buf);
-		fclose(fp);
-		return -1;
-	}
-	fclose(fp);
-	*out = buf;
-	*out_len = size;
 	return 0;
 }
 
-static int parse_header(const uint8_t *file, size_t file_size,
-                        uint8_t *hash_alg)
+static int parse_header(const uint8_t file[REC_HEADER_SIZE], uint8_t *hash_alg)
 {
-	if (file_size < REC_HEADER_SIZE)
-		return -1;
 	if (file[0] != 'a' || file[1] != 'r' || file[2] != 'k' ||
 	    file[3] != '!' || file[4] != '\n')
 		return -1;
@@ -1252,15 +1269,10 @@ static int parse_header(const uint8_t *file, size_t file_size,
 	return 0;
 }
 
-static int parse_footer(const uint8_t *file, size_t file_size,
+static int parse_footer(const uint8_t f[REC_FOOTER_SIZE], uint64_t file_size,
                         uint64_t *index_offset, uint64_t *index_size,
                         uint32_t *member_count, const uint8_t **index_hash)
 {
-	const uint8_t *f;
-
-	if (file_size < REC_HEADER_SIZE + REC_FOOTER_SIZE)
-		return -1;
-	f = file + file_size - REC_FOOTER_SIZE;
 	if (le32(f + 52U) != 0x4b52410aU)
 		return -1;
 	if (f[56] != 0U || f[57] != 0U || f[58] != 0U || f[59] != 0U ||
@@ -1274,12 +1286,11 @@ static int parse_footer(const uint8_t *file, size_t file_size,
 
 	if (*index_offset < REC_HEADER_SIZE)
 		return -1;
-	if (*index_offset > (uint64_t)(file_size - REC_FOOTER_SIZE))
+	if (*index_offset > file_size - REC_FOOTER_SIZE)
 		return -1;
 	if (UINT64_MAX - *index_offset < *index_size)
 		return -1;
-	if (*index_offset + *index_size !=
-	    (uint64_t)(file_size - REC_FOOTER_SIZE))
+	if (*index_offset + *index_size != file_size - REC_FOOTER_SIZE)
 		return -1;
 	return 0;
 }
@@ -1397,69 +1408,70 @@ fail:
 	return -1;
 }
 
-static int extract_regular(const uint8_t *file, size_t file_size,
-                           uint64_t index_offset, uint8_t hash_alg,
-                           const rec_member_t *m)
+/*
+ * Buffers for one compressed chunk and its decompressed output; the reader
+ * holds no more of the archive body than this at a time.
+ */
+typedef struct {
+	uint8_t *comp;
+	uint8_t *out;
+} rec_bufs_t;
+
+/*
+ * Write regular member m (size_original > 0) as leaf in parent_fd, reading
+ * its chunks from the archive one at a time.
+ */
+static int extract_regular(int archive_fd, uint64_t index_offset,
+                           uint8_t hash_alg, const rec_member_t *m,
+                           int parent_fd, const char *leaf,
+                           const rec_bufs_t *bufs)
 {
 	rec_sha256_ctx_t sctx;
 	rec_blake3_ctx_t bctx;
 	uint8_t digest[REC_HASH_LEN];
-	uint8_t *out_buf;
 	uint64_t chunk_off;
 	uint32_t i;
 	int fd;
 	int rc;
 
-	if (mkdirs_for_path(m->path) != 0)
-		return -1;
 	/*
 	 * SAFETY: O_NOFOLLOW so a symlink already at the member path is not
 	 * followed; open fails instead of writing outside the destination.
 	 * See ARCHITECTURE.md section 14.2.
 	 */
-	fd = open(m->path,
-	          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+	fd =
+	    openat(parent_fd, leaf,
+	           O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (fd == -1)
 		return -1;
 
 	hash_init(hash_alg, &sctx, &bctx);
-	/* OWNERSHIP: out_buf is freed before return on all paths. */
-	out_buf = (uint8_t *)malloc(REC_CHUNK_SIZE);
-	if (out_buf == NULL) {
-		close(fd);
-		return -1;
-	}
-
 	chunk_off = m->data_offset;
 	rc = -1;
 	for (i = 0U; i < m->chunk_count; i++) {
 		uint32_t csz;
-		const uint8_t *comp;
 		ssize_t out_len;
 		size_t expected;
 
 		csz = m->chunk_sizes[i];
-		if (csz == 0U)
+		if (csz == 0U || csz > REC_MAX_COMP_CHUNK)
 			goto out;
 		if (chunk_off > index_offset)
 			goto out;
-		if (chunk_off + csz > index_offset)
+		if ((uint64_t)csz > index_offset - chunk_off)
 			goto out;
-		if (chunk_off + csz > file_size)
+		if (read_full_at(archive_fd, bufs->comp, csz, chunk_off) != 0)
 			goto out;
-		comp = file + chunk_off;
 
 		/* Hash verification is over compressed bytes as stored on disk.
 		 */
-		hash_update(hash_alg, &sctx, &bctx, comp, csz);
-		out_len =
-		    rec_deflate_decompress(comp, csz, out_buf, REC_CHUNK_SIZE);
+		hash_update(hash_alg, &sctx, &bctx, bufs->comp, csz);
+		out_len = rec_deflate_decompress(bufs->comp, csz, bufs->out,
+		                                 REC_CHUNK_SIZE);
 		if (out_len < 0)
 			goto out;
 
-		if (m->chunk_count == 0U)
-			expected = 0U;
-		else if (i + 1U < m->chunk_count)
+		if (i + 1U < m->chunk_count)
 			expected = REC_CHUNK_SIZE;
 		else {
 			expected = (size_t)(m->size_original % REC_CHUNK_SIZE);
@@ -1468,7 +1480,7 @@ static int extract_regular(const uint8_t *file, size_t file_size,
 		}
 		if ((size_t)out_len != expected)
 			goto out;
-		if (write_full_fd(fd, out_buf, (size_t)out_len) != 0)
+		if (write_full_fd(fd, bufs->out, (size_t)out_len) != 0)
 			goto out;
 		chunk_off += csz;
 	}
@@ -1479,97 +1491,149 @@ static int extract_regular(const uint8_t *file, size_t file_size,
 	rc = 0;
 
 out:
-	free(out_buf);
 	if (close(fd) != 0)
 		rc = -1;
 	return rc;
 }
 
-static int extract_members(const uint8_t *file, size_t file_size,
-                           uint64_t index_offset, uint8_t hash_alg,
-                           const uint8_t empty_digest[REC_HASH_LEN],
-                           rec_member_t *members, uint32_t member_count)
+/*
+ * Create member m below root_fd: its parents through open_parent_dir(), the
+ * member itself relative to its parent directory. A hardlink's target is
+ * resolved the same way, without creating anything.
+ */
+static int extract_member(int archive_fd, uint64_t index_offset,
+                          uint8_t hash_alg, const rec_member_t *m, int root_fd,
+                          const rec_bufs_t *bufs)
 {
+	const char *leaf;
+	int parent_fd;
+	int rc;
+
+	parent_fd = open_parent_dir(root_fd, m->path, 1, &leaf);
+	if (parent_fd == -1)
+		return -1;
+	rc = -1;
+	switch (m->type) {
+	case REC_TYPE_DIR: {
+		struct stat st;
+
+		if (mkdirat(parent_fd, leaf, 0700) != 0) {
+			/* An existing directory is reused, never a symlink. */
+			if (errno != EEXIST ||
+			    fstatat(parent_fd, leaf, &st,
+			            AT_SYMLINK_NOFOLLOW) != 0 ||
+			    !S_ISDIR(st.st_mode))
+				break;
+		}
+		rc = 0;
+		break;
+	}
+	case REC_TYPE_SYMLINK:
+		(void)unlinkat(parent_fd, leaf, 0);
+		if (symlinkat(m->link, parent_fd, leaf) == 0)
+			rc = 0;
+		break;
+	case REC_TYPE_HARDLINK: {
+		const char *target_leaf;
+		int target_fd;
+
+		target_fd = open_parent_dir(root_fd, m->link, 0, &target_leaf);
+		if (target_fd == -1)
+			break;
+		(void)unlinkat(parent_fd, leaf, 0);
+		if (linkat(target_fd, target_leaf, parent_fd, leaf, 0) == 0)
+			rc = 0;
+		(void)close(target_fd);
+		break;
+	}
+	case REC_TYPE_FILE:
+		if (m->size_original == 0U) {
+			int fd;
+
+			/* SAFETY: O_NOFOLLOW as in extract_regular. */
+			fd = openat(parent_fd, leaf,
+			            O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW |
+			                O_CLOEXEC,
+			            0600);
+			if (fd != -1 && close(fd) == 0)
+				rc = 0;
+			break;
+		}
+		rc = extract_regular(archive_fd, index_offset, hash_alg, m,
+		                     parent_fd, leaf, bufs);
+		break;
+	default:
+		break;
+	}
+	(void)close(parent_fd);
+	return rc;
+}
+
+static int extract_members(int archive_fd, uint64_t index_offset,
+                           uint8_t hash_alg,
+                           const uint8_t empty_digest[REC_HASH_LEN],
+                           const rec_member_t *members, uint32_t member_count)
+{
+	rec_bufs_t bufs;
 	uint32_t i;
+	int root_fd;
+	int rc;
+
+	/* The extraction directory is the current one, held as an fd. */
+	root_fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (root_fd == -1)
+		return -1;
+	/* OWNERSHIP: both buffers are freed before return. */
+	bufs.comp = (uint8_t *)malloc(REC_MAX_COMP_CHUNK);
+	bufs.out = (uint8_t *)malloc(REC_CHUNK_SIZE);
+	rc = -1;
+	if (bufs.comp == NULL || bufs.out == NULL)
+		goto out;
 
 	for (i = 0U; i < member_count; i++) {
-		rec_member_t *m;
+		const rec_member_t *m;
 
 		m = &members[i];
 		if (!path_is_safe(m->path))
-			return -1;
+			goto out;
 		if (m->link != NULL && !path_is_safe(m->link))
-			return -1;
+			goto out;
 
 		if (m->type == REC_TYPE_DIR || m->type == REC_TYPE_SYMLINK ||
 		    m->type == REC_TYPE_HARDLINK ||
 		    (m->type == REC_TYPE_FILE && m->size_original == 0U)) {
 			if (memcmp(m->hash, empty_digest, REC_HASH_LEN) != 0)
-				return -1;
+				goto out;
 		}
-
-		switch (m->type) {
-		case REC_TYPE_DIR:
-			if (mkdirs_for_path(m->path) != 0)
-				return -1;
-			if (mkdir(m->path, 0700) != 0 && errno != EEXIST)
-				return -1;
-			break;
-		case REC_TYPE_SYMLINK:
-			if (mkdirs_for_path(m->path) != 0)
-				return -1;
-			(void)unlink(m->path);
-			if (symlink(m->link, m->path) != 0)
-				return -1;
-			break;
-		case REC_TYPE_HARDLINK:
-			if (mkdirs_for_path(m->path) != 0)
-				return -1;
-			(void)unlink(m->path);
-			if (link(m->link, m->path) != 0)
-				return -1;
-			break;
-		case REC_TYPE_FILE:
-			if (m->size_original == 0U) {
-				int fd;
-
-				if (mkdirs_for_path(m->path) != 0)
-					return -1;
-				/* SAFETY: O_NOFOLLOW as in extract_regular. */
-				fd = open(m->path,
-				          O_WRONLY | O_CREAT | O_TRUNC |
-				              O_NOFOLLOW | O_CLOEXEC,
-				          0600);
-				if (fd == -1)
-					return -1;
-				if (close(fd) != 0)
-					return -1;
-				break;
-			}
-			if (extract_regular(file, file_size, index_offset,
-			                    hash_alg, m) != 0)
-				return -1;
-			break;
-		default:
-			return -1;
-		}
+		if (extract_member(archive_fd, index_offset, hash_alg, m,
+		                   root_fd, &bufs) != 0)
+			goto out;
 	}
-	return 0;
+	rc = 0;
+
+out:
+	free(bufs.comp);
+	free(bufs.out);
+	(void)close(root_fd);
+	return rc;
 }
 
 int main(int argc, char **argv)
 {
-	uint8_t *file;
-	size_t file_size;
+	uint8_t header[REC_HEADER_SIZE];
+	uint8_t footer[REC_FOOTER_SIZE];
+	struct stat st;
+	uint64_t file_size;
 	uint8_t hash_alg;
 	uint64_t index_offset;
 	uint64_t index_size_u64;
 	uint32_t member_count;
 	const uint8_t *footer_index_hash;
-	const uint8_t *index;
+	uint8_t *index;
 	size_t index_size;
 	rec_member_t *members;
 	uint8_t empty_digest[REC_HASH_LEN];
+	int archive_fd;
 	int rc;
 
 	if (argc != 2) {
@@ -1577,31 +1641,46 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	file = NULL;
-	file_size = 0U;
+	index = NULL;
 	members = NULL;
 	member_count = 0U;
 	rc = 1;
 
-	if (read_whole_file(argv[1], &file, &file_size) != 0) {
+	/*
+	 * The archive is read in pieces (header, footer, index, then one
+	 * chunk at a time), so memory use does not grow with its size.
+	 */
+	archive_fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+	if (archive_fd == -1 || fstat(archive_fd, &st) != 0 || st.st_size < 0) {
 		fprintf(stderr, "recover: failed to read %s\n", argv[1]);
 		goto out;
 	}
-	if (parse_header(file, file_size, &hash_alg) != 0) {
+	file_size = (uint64_t)st.st_size;
+	if (file_size < REC_HEADER_SIZE + REC_FOOTER_SIZE ||
+	    read_full_at(archive_fd, header, sizeof(header), 0U) != 0 ||
+	    parse_header(header, &hash_alg) != 0) {
 		fprintf(stderr, "recover: invalid ark header\n");
 		goto out;
 	}
-	if (parse_footer(file, file_size, &index_offset, &index_size_u64,
+	if (read_full_at(archive_fd, footer, sizeof(footer),
+	                 file_size - REC_FOOTER_SIZE) != 0 ||
+	    parse_footer(footer, file_size, &index_offset, &index_size_u64,
 	                 &member_count, &footer_index_hash) != 0) {
 		fprintf(stderr, "recover: invalid ark footer\n");
 		goto out;
 	}
-	if (index_size_u64 > (uint64_t)SIZE_MAX) {
+	if (index_size_u64 > (uint64_t)SIZE_MAX - 1U) {
 		fprintf(stderr, "recover: index too large\n");
 		goto out;
 	}
 	index_size = (size_t)index_size_u64;
-	index = file + (size_t)index_offset;
+	/* OWNERSHIP: index is freed at out. */
+	index = (uint8_t *)malloc(index_size == 0U ? 1U : index_size);
+	if (index == NULL ||
+	    read_full_at(archive_fd, index, index_size, index_offset) != 0) {
+		fprintf(stderr, "recover: failed to read the index\n");
+		goto out;
+	}
 
 	if (verify_index_hash(hash_alg, index, index_size, footer_index_hash) !=
 	    0) {
@@ -1614,8 +1693,8 @@ int main(int argc, char **argv)
 	}
 
 	compute_empty_digest(hash_alg, empty_digest);
-	if (extract_members(file, file_size, index_offset, hash_alg,
-	                    empty_digest, members, member_count) != 0) {
+	if (extract_members(archive_fd, index_offset, hash_alg, empty_digest,
+	                    members, member_count) != 0) {
 		fprintf(stderr, "recover: extraction failed\n");
 		goto out;
 	}
@@ -1625,6 +1704,8 @@ int main(int argc, char **argv)
 
 out:
 	members_free(members, member_count);
-	free(file);
+	free(index);
+	if (archive_fd != -1)
+		(void)close(archive_fd);
 	return rc;
 }

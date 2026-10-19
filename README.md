@@ -126,8 +126,11 @@ cc -O2 recovery.c -o recover
 ```
 
 The generated file includes a Deflate decompressor, BLAKE3 and SHA-256
-implementations, archive read logic, and a minimal extraction program. See
-`ARCHITECTURE.md` section 15 for the full recovery model.
+implementations, archive read logic, and a minimal extraction program. It
+extracts into the current directory, never follows a symbolic link in a
+member's path, and needs memory for the archive index plus about 2 MiB,
+whatever the archive size. See `ARCHITECTURE.md` section 15 for the full
+recovery model.
 
 ## Format overview
 

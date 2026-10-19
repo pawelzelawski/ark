@@ -2241,15 +2241,16 @@ int test_read_chunk_compressed_size_mismatch(void)
 }
 
 /*
- * test_archive_one_chunk - Serialize a valid one-member archive: regular file
- * "a" of size_original bytes stored as the single chunk `chunk`, with BLAKE3
+ * test_archive_one_chunk_at - Serialize a valid one-member archive: regular
+ * file `path` (no other members, so no ancestor directories) of
+ * size_original bytes stored as the single chunk `chunk`, with BLAKE3
  * member and index hashes. Writes header, chunk, index and footer into buf;
  * reports the index size and returns the archive length, or 0 when buf is
  * too small. Shared with test_integration.c.
  */
-size_t test_archive_one_chunk(uint8_t *buf, size_t cap, const uint8_t *chunk,
-                              size_t chunk_len, uint64_t size_original,
-                              size_t *index_len)
+size_t test_archive_one_chunk_at(uint8_t *buf, size_t cap, const char *path,
+                                 const uint8_t *chunk, size_t chunk_len,
+                                 uint64_t size_original, size_t *index_len)
 {
 	read_entry_t e;
 	uint8_t index[256];
@@ -2258,7 +2259,7 @@ size_t test_archive_one_chunk(uint8_t *buf, size_t cap, const uint8_t *chunk,
 	size_t off;
 
 	csz[0] = (uint32_t)chunk_len;
-	entry_base(&e, 0x01U, "a");
+	entry_base(&e, 0x01U, path);
 	e.size_original = size_original;
 	e.size_compressed = chunk_len;
 	e.data_offset = 16U;
@@ -2278,6 +2279,16 @@ size_t test_archive_one_chunk(uint8_t *buf, size_t cap, const uint8_t *chunk,
 	off += *index_len;
 	build_footer(buf + off, 16U + chunk_len, *index_len, 1U, digest);
 	return off + 64U;
+}
+
+/* test_archive_one_chunk_at() for member "a". Shared with test_integration.c.
+ */
+size_t test_archive_one_chunk(uint8_t *buf, size_t cap, const uint8_t *chunk,
+                              size_t chunk_len, uint64_t size_original,
+                              size_t *index_len)
+{
+	return test_archive_one_chunk_at(buf, cap, "a", chunk, chunk_len,
+	                                 size_original, index_len);
 }
 
 /*
