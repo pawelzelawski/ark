@@ -306,3 +306,45 @@ in 0.13 s instead of 0.48 s and extracts in 0.45 s instead of 0.73 s; the
 255 MB corpus archive (decode-bound) verifies in 0.98 s instead of 1.03 s
 and extracts in 0.53 s instead of 0.59 s. The NEON path is tested under
 qemu-aarch64 and on CI's arm64 runners but not measured.
+
+**Create pipeline across files** (ark only; Improvements 21). The I/O thread
+reads and submits the chunks of the next files while earlier ones are still
+compressed, so a tree of small files keeps every worker busy; the ring holds
+two slots per worker. Release builds, best of 3, interleaved with the
+previous binary, archives byte-identical. i7-7500U (2C/4T, 4 workers):
+`/usr/include` copy (121 MB, 7,645 files) 3.15 s at 103 % CPU -> 1.59 s at
+266 %; 40,000 empty files 0.39 -> 0.40 s; 255 MB corpus file 4.85 ->
+4.70 s. Ryzen 7 4800H (8C/16T, 16 workers, best of 5): `/usr/include` copy
+(93 MB, 5,502 files) 2.54 s -> 0.54 s at 491 %; a 256 MiB random file
+0.85 -> 0.80 s. One ring slot per worker gave 1.82-1.97 s here (0.70 s on
+the Ryzen), four slots 1.56-1.71 s (0.49 s) for about 2 MiB more memory per
+worker.
+
+**Extract decode-ahead across members** (ark only; Improvements 22). The
+I/O thread reads, hashes and submits the chunks of the members after the
+one it is writing, up to one per ring slot, while it still creates and
+writes members strictly in index order. Extract into tmpfs, release builds,
+best of 5, interleaved with the previous binary, extracted trees identical.
+i7-7500U (4 workers), each step measured on its own:
+
+| Extract | Before | Decode-ahead | + `pread` per chunk | + parent-directory cache |
+|---|---|---|---|---|
+| `/usr/include` copy (121 MB, 7,645 files) | 0.78 s 96 % CPU | 0.39 s | 0.40 s | 0.38 s 190 % |
+| 40,000 empty files | 0.74 s | 0.74 s | 0.75 s | 0.60 s |
+| 255 MB corpus file | 0.54 s | 0.53 s | 0.54 s | 0.53 s |
+| 256 MiB random file | 0.45 s | 0.45 s | 0.44 s | 0.46 s |
+
+Ring depth for decode-ahead alone, `/usr/include` copy: one slot per worker
+0.43 s, two 0.39 s, four 0.38 s; two are kept (the ring already had them).
+Ryzen 7 4800H (8C/16T, 16 workers, extract into tmpfs, best of 5, all four
+steps together): `/usr/include` copy (93 MB, 5,502 files) 0.55 s at 97 % CPU
+-> 0.23 s at 220 %; 40,000 empty files 0.80 -> 0.63 s; a 256 MiB file
+0.28 -> 0.28 s; one or four ring slots per worker give the same times.
+Verify is unchanged (`/usr/include` copy 0.22 s, the 256 MiB file 0.48 s).
+`pread` replaces a `lseek` + `read` pair per chunk (also in verify) without
+a measurable change. The parent-directory cache skips the `fstatat` of every
+ancestor below the last directory confirmed or created in this run, which
+is most of the per-member cost for trees of empty files. After these
+changes the I/O thread's per-member system calls (open, write, metadata,
+close) bound trees of small files; single large files were already
+parallel and are unchanged.

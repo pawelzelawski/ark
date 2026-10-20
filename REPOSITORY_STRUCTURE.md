@@ -267,6 +267,7 @@ src/
 │                       #
 │                       # Wrapped syscalls:
 │                       #   ARK_READ        → read
+│                       #   ARK_PREAD       → pread
 │                       #   ARK_WRITE       → write
 │                       #   ARK_OPEN        → open
 │                       #   ARK_CLOSE       → close
@@ -315,6 +316,16 @@ src/
                         #   create_pipe_submit()  - hand one chunk to the pool
                         #   create_pipe_flush()   - write all queued chunks and
                         #                           members, in order
+                        #
+                        # Extract decode-ahead (chunks of later members in
+                        # flight, members written in index order):
+                        #   extract_pipe_read_one()   - read, hash and submit
+                        #                               the next chunk
+                        #   extract_pipe_take()       - wait for the chunk being
+                        #                               written; report a held
+                        #                               reader failure
+                        #   extract_pipe_member_end() - report a held member
+                        #                               hash failure
                         #
                         # Ring buffer:
                         #   ring_buf_init()       - initialise fixed-size ring buffer
@@ -452,6 +463,9 @@ tests/
 │                           # Create pipeline: archive bytes equal across
 │                           #   worker counts; read, write and worker faults
 │                           #   with chunks of several files in flight.
+│                           # Extract decode-ahead: same tree for every
+│                           #   worker count; failures found ahead reported
+│                           #   in archive order; parent-directory cache.
 │                           # TSan required at phase boundary.
 │                           # See TESTING.md §4.
 │
@@ -704,6 +718,9 @@ Checks: >
 | `create_pipe_add` | `src/main.c` | Internal; queue a create member in order |
 | `create_pipe_submit` | `src/main.c` | Internal; submit one create chunk |
 | `create_pipe_flush` | `src/main.c` | Internal; write all queued chunks and members |
+| `extract_pipe_read_one` | `src/main.c` | Internal; read, hash and submit the next extract chunk |
+| `extract_pipe_take` | `src/main.c` | Internal; wait for the chunk being written, in order |
+| `extract_pipe_member_end` | `src/main.c` | Internal; report a held member hash failure |
 | `cleanup_track` | `src/main.c` | Internal; register created object |
 | `cleanup_created` | `src/main.c` | Internal; remove all tracked objects |
 | `sandbox_apply` | `src/main.c` | Internal; pledge/Landlock per subcommand |

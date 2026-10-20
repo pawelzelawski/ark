@@ -2423,6 +2423,116 @@ int test_extract_chunk_trailing_bytes(void)
 	return rc;
 }
 
+/*
+ * extract_built_archive - Write len bytes of archive buf to dir/t.ark and
+ * extract it into dir/out with four workers. Returns 0 when extraction
+ * fails with code and leaves dir/out empty, 1 otherwise.
+ */
+static int extract_built_archive(const char *dir, const uint8_t *buf,
+                                 size_t len, ark_err_t code)
+{
+	char arc[64];
+	char out_dir[64];
+	char member[80];
+	ark_error_t err;
+	FILE *f;
+	int rc;
+
+	(void)snprintf(arc, sizeof(arc), "%s/t.ark", dir);
+	(void)snprintf(out_dir, sizeof(out_dir), "%s/out", dir);
+	(void)snprintf(member, sizeof(member), "%s/a", out_dir);
+	f = fopen(arc, "wb");
+	if (f == NULL)
+		return 1;
+	rc = fwrite(buf, 1U, len, f) == len ? 0 : 1;
+	if (fclose(f) != 0 || rc != 0 || mkdir(out_dir, 0700) != 0) {
+		(void)unlink(arc);
+		return 1;
+	}
+	memset(&err, 0, sizeof(err));
+	if (ark_test_extract_archive(arc, out_dir, 0, NULL, 4, &err) != -1 ||
+	    err.code != code || access(member, F_OK) == 0)
+		rc = 1;
+	(void)unlink(member);
+	(void)rmdir(out_dir);
+	(void)unlink(arc);
+	return rc;
+}
+
+/*
+ * A chunk that decodes cleanly to fewer or more bytes than the member's
+ * size_original says fails extraction with ARK_ERR_FMT_DATA (ARCHITECTURE.md
+ * section 6.3); the member hash covers the chunk, so only the length check
+ * can reject it.
+ */
+int test_extract_chunk_length_mismatch(void)
+{
+	static const uint64_t sizes[] = {2U, 4U};
+	char dir[] = "/tmp/ark-xlen.XXXXXX";
+	uint8_t src[] = {0x61U, 0x62U, 0x63U};
+	uint8_t comp[128];
+	uint8_t buf[512];
+	ssize_t clen;
+	size_t index_len;
+	size_t i;
+	int rc = 0;
+
+	if (mkdtemp(dir) == NULL)
+		return 1;
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
+	for (i = 0U; rc == 0 && i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		size_t len;
+
+		len = clen > 0 ? test_archive_one_chunk(buf, sizeof(buf), comp,
+		                                        (size_t)clen, sizes[i],
+		                                        &index_len)
+		               : 0U;
+		if (len == 0U ||
+		    extract_built_archive(dir, buf, len, ARK_ERR_FMT_DATA) != 0)
+			rc = 1;
+	}
+	(void)rmdir(dir);
+	return rc;
+}
+
+/*
+ * A chunk one byte larger than ark_deflate_bound(ARK_CHUNK_SIZE) is
+ * rejected with ARK_ERR_FMT_INDEX before it is read into the chunk buffer
+ * (which has exactly that bound); the index itself does not limit chunk
+ * sizes.
+ */
+int test_extract_chunk_over_bound(void)
+{
+	char dir[] = "/tmp/ark-xbound.XXXXXX";
+	uint8_t *chunk;
+	uint8_t *buf;
+	size_t chunk_len;
+	size_t cap;
+	size_t index_len;
+	int rc = 1;
+
+	if (mkdtemp(dir) == NULL)
+		return 1;
+	chunk_len = ark_deflate_bound(ARK_CHUNK_SIZE) + 1U;
+	cap = chunk_len + 1024U;
+	chunk = (uint8_t *)calloc(chunk_len, 1U);
+	buf = (uint8_t *)malloc(cap);
+	if (chunk != NULL && buf != NULL) {
+		size_t len;
+
+		len = test_archive_one_chunk(buf, cap, chunk, chunk_len,
+		                             ARK_CHUNK_SIZE, &index_len);
+		if (len != 0U && extract_built_archive(dir, buf, len,
+		                                       ARK_ERR_FMT_INDEX) == 0)
+			rc = 0;
+	}
+	free(buf);
+	free(chunk);
+	(void)rmdir(dir);
+	return rc;
+}
+
 int test_read_empty_file_chunk_count_zero(void)
 {
 	read_entry_t e;

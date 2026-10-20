@@ -591,6 +591,24 @@ set the cancellation flag, join all workers, and proceed to cleanup. The I/O
 thread owns all `ARK_ERR_FMT_DATA` generation for decompression; worker threads
 signal failure only by writing an abort sentinel to their ring buffer slot.
 
+**Decode-ahead across members (extract).** The I/O thread has a reader side
+and a writer side. The reader reads each chunk with `pread`, feeds it to the
+member hash (§14.3) and submits it, walking the selected regular members in
+index order and filling every free ring slot, so chunks of the members after
+the one being written are decoded while it is written; a tree of files under
+1 MiB keeps every worker busy. The writer creates members, writes their
+chunks and restores their metadata strictly in index order, one member and
+one open output file at a time, exactly as without decode-ahead (§14.4).
+A failure the reader finds ahead (an archive read error, a chunk size over
+the bound, a member hash mismatch) is held at its position and reported when
+the writer reaches it: after the chunks before it are written, or for a hash
+mismatch after the member's last chunk. An earlier failure (a worker abort,
+a length mismatch, an output error) is therefore still reported first, and the
+error and the cleaned-up objects are the same for every worker count. The
+writer checks a member's ancestor directories (§14.4) only below the last
+directory it confirmed or created in this run: ark never replaces a
+directory, so a confirmed directory stays one.
+
 **Output ordering.** Compressed chunks are always written to the archive
 in input order regardless of completion order. Worker threads write
 completed chunks into the ring buffer indexed by chunk sequence number.
@@ -599,7 +617,7 @@ when the next expected chunk is not yet complete. The ring has two slots per
 worker (`ARK_RING_SLOTS_PER_WORKER`): chunks finished while the I/O thread is
 reading wait there instead of stalling their worker. Create keeps at most one
 chunk per ring slot in flight, so a worker never waits for a slot the I/O
-thread has not drained; extract keeps one chunk per worker in flight. The
+thread has not drained; extract does the same. The
 create pending queue holds one member per in-flight chunk plus 64
 (`ARK_CREATE_PENDING_EXTRA`); when it is full the I/O thread first writes the
 oldest chunk, which always belongs to the queue head. This bounds the
@@ -2296,6 +2314,10 @@ On first hash mismatch:
 - Clean up all files and directories already extracted in this run
 - Report the offending member path and exit with code 4 (`ARK_ERR_HASH_MEMBER`)
 
+With decode-ahead (§6.3) the reader may hash a member while an earlier one is
+still being written; the mismatch is still reported where it stands in
+archive order, after the member's chunks are written.
+
 A per-member hash mismatch always indicates post-creation corruption or
 tampering of the archive file. It is never a creation-time bug.
 
@@ -2344,7 +2366,8 @@ The reader extracts members sequentially in index order. A conforming archive
 always contains parent directories before their children (enforced by the
 writer's depth-first pre-order traversal; see §13.1). The reader does not
 reorder, lookahead, or create parent directories implicitly during full
-extraction.
+extraction. Decoding the data of later members ahead (§6.3) changes none of
+this: filesystem objects are still created in index order.
 
 If a member is encountered whose parent directory does not yet exist during
 full extraction, the archive is malformed. The reader reports

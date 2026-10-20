@@ -449,7 +449,8 @@ int test_fault_extract_seek(void)
 
 int test_fault_extract_read_chunk(void)
 {
-	return expect_extract_fault(ARK_FAULT_READ, 4, 0, 0, ARK_ERR_IO_READ);
+	/* Chunks are read with pread; header, footer and index with read. */
+	return expect_extract_fault(ARK_FAULT_PREAD, 1, 0, 0, ARK_ERR_IO_READ);
 }
 
 int test_fault_extract_open_output(void)

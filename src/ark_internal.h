@@ -54,6 +54,7 @@ enum ark_fault_which {
 	ARK_FAULT_PTHREAD_CREATE,
 	ARK_FAULT_PTHREAD_MUTEX_INIT,
 	ARK_FAULT_PTHREAD_COND_INIT,
+	ARK_FAULT_PREAD,
 };
 
 typedef struct ark_fault {
@@ -66,6 +67,7 @@ typedef struct ark_fault {
 	int openat_calls;
 	int close_calls;
 	int lseek_calls;
+	int pread_calls;
 	int fstat_calls;
 	int fstatat_calls;
 	int lstat_calls;
@@ -102,6 +104,9 @@ typedef struct ark_fault {
 	 */
 	int cond_wait_delay_ms;
 	int cond_wait_entered;
+	/* pread_max > 0 makes ARK_PREAD return at most that many bytes per
+	 * call (short reads). */
+	int pread_max;
 } ark_fault_t;
 
 extern ark_fault_t ark_fault;
@@ -115,6 +120,7 @@ int ark_stub_open(const char *path, int flags, ...);
 int ark_stub_openat(int fd, const char *path, int flags, ...);
 int ark_stub_close(int fd);
 off_t ark_stub_lseek(int fd, off_t offset, int whence);
+ssize_t ark_stub_pread(int fd, void *buf, size_t count, off_t offset);
 int ark_stub_fstat(int fd, struct stat *sb);
 int ark_stub_fstatat(int fd, const char *path, struct stat *sb, int flags);
 int ark_stub_lstat(const char *path, struct stat *sb);
@@ -156,6 +162,7 @@ int ark_stub_pthread_cond_init(pthread_cond_t *cond,
 #define ARK_OPENAT ark_stub_openat
 #define ARK_CLOSE ark_stub_close
 #define ARK_LSEEK ark_stub_lseek
+#define ARK_PREAD ark_stub_pread
 #define ARK_FSTAT ark_stub_fstat
 #define ARK_FSTATAT ark_stub_fstatat
 #define ARK_LSTAT ark_stub_lstat
@@ -193,6 +200,7 @@ int ark_stub_pthread_cond_init(pthread_cond_t *cond,
 #define ARK_OPENAT openat
 #define ARK_CLOSE close
 #define ARK_LSEEK lseek
+#define ARK_PREAD pread
 #define ARK_FSTAT fstat
 #define ARK_FSTATAT fstatat
 #define ARK_LSTAT lstat

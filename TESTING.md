@@ -384,6 +384,8 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_read_chunk_compressed_size_mismatch` | Supplied compressed byte count does not match index chunk size; `ARK_ERR_FMT_DATA` |
 | `test_read_chunk_trailing_bytes` | Hand-built archive whose chunk is a Deflate stream plus one byte (chunk size and hashes cover it): `ARK_ERR_FMT_DATA` "bytes after deflate stream"; without the byte the chunk decodes |
 | `test_extract_chunk_trailing_bytes` | Same archives through extract (worker pool path): the exact one extracts, the padded one fails with `ARK_ERR_FMT_DATA` and leaves no file |
+| `test_extract_chunk_length_mismatch` | One-chunk archive whose valid stream decodes to 3 bytes while the index says 2 or 4 (hash covers the chunk): extract with 4 workers fails with `ARK_ERR_FMT_DATA`, no file left |
+| `test_extract_chunk_over_bound` | One chunk of `ark_deflate_bound(ARK_CHUNK_SIZE) + 1` bytes (the index accepts it): extract fails with `ARK_ERR_FMT_INDEX` before reading it into the bound-sized chunk buffer, no file left |
 | `test_read_empty_file_chunk_count_zero` | Regular file with chunk_count=0; `ark_read_member_meta` reports correctly |
 | `test_read_find_member` | Path lookup returns each member's position (out-of-order members); near-miss paths and prefixes not found; -1 before `ark_read_index` and for NULL arguments |
 | `test_read_index_many_members` | 20,000 members in reverse name order parse; lookups return the right positions |
@@ -463,6 +465,15 @@ complete.
 | `test_create_pipeline_read_fault` | A source read fails while chunks of earlier files are in flight: `ARK_ERR_IO_READ` with `EIO`; no archive and no temporary file left |
 | `test_create_pipeline_write_fault` | An archive chunk write fails mid-tree: `ARK_ERR_IO_WRITE` with `EIO`; nothing left |
 | `test_create_pipeline_worker_fault` | A compress worker aborts chunk 3 (1 worker, symlinks queued behind it) and chunk 60 (4 workers): the worker's error is reported; nothing left |
+
+### 4.6 Extract Decode-Ahead
+
+| Test case | What is verified |
+|---|---|
+| `test_extract_pipeline_matches_across_workers` | The create-pipeline tree (archive made by one worker) extracts with 1, 2, 3, 4 and 16 workers: every file's bytes, mode and mtime, link targets, the hardlink and the empty file match the source; `--member d.link` extracts the hardlink and its target under an implicit `c.dir` and nothing else |
+| `test_extract_pipeline_errors_in_order` | Archive of a four-chunk file then a stored one-chunk file; with 1, 2, 4 and 16 workers: a read failure of the second file's chunk is reported after the first file's four chunks are written; a hash mismatch of the second file (one stored byte flipped) after its chunk is written; a decompress worker failure in the first file wins over either (`ARK_CLI_FAULT_EXTRACT_WORKER`); output writes before the error counted; output directory empty afterwards |
+| `test_extract_pipeline_short_reads` | Every chunk read arrives in pieces of at most 4,093 bytes (`ark_fault.pread_max`): the tree still matches the source, with more than twice the `pread` calls of whole reads |
+| `test_extract_known_dir_prefix` | Parent-directory cache rule: only whole leading components shared with the last confirmed directory are skipped (`a/b` covers `a/b/c`, but only `a` of `a/bc/d`) |
 
 ---
 
@@ -555,7 +566,7 @@ extract sequences. Each test verifies:
 | `test_fault_extract_read_header` | `ARK_READ` fails reading header | `ARK_ERR_IO_READ` |
 | `test_fault_extract_read_footer` | `ARK_READ` fails reading footer | `ARK_ERR_IO_READ` |
 | `test_fault_extract_read_index` | `ARK_READ` fails reading index block | `ARK_ERR_IO_READ` |
-| `test_fault_extract_read_chunk` | `ARK_READ` fails reading compressed chunk | `ARK_ERR_IO_READ` |
+| `test_fault_extract_read_chunk` | `ARK_PREAD` fails reading compressed chunk | `ARK_ERR_IO_READ` |
 | `test_fault_extract_open_output` | `ARK_OPEN` fails creating output file | `ARK_ERR_IO_OPEN` |
 | `test_fault_extract_write_output` | `ARK_WRITE` fails writing decompressed data | `ARK_ERR_IO_WRITE` |
 | `test_fault_extract_mkdir` | `ARK_MKDIR` fails creating directory member | `ARK_ERR_IO_MKDIR` |
@@ -757,6 +768,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | Worker error stored before sentinel; I/O thread reads it | `test_thread.c` | ARCHITECTURE.md §6.3 |
 | Quiescence before cleanup: join completes, then filesystem ops | `test_thread.c` | ARCHITECTURE.md §14.3 |
 | Create pipeline across files: archive bytes independent of worker count; failures with chunks in flight leave nothing | `test_thread.c` | ARCHITECTURE.md §6.3 |
+| Extract decode-ahead: extracted tree independent of worker count; failures found ahead reported in archive order; output left empty | `test_thread.c` | ARCHITECTURE.md §6.3, §14.3 |
 | lchown before chmod on all metadata restoration paths | `test_extract.c` | ARCHITECTURE.md §14.5 |
 | chmod skipped for symlink members | `test_extract.c` | ARCHITECTURE.md §14.5 |
 | utimensat with AT_SYMLINK_NOFOLLOW for symlinks | `test_extract.c` | ARCHITECTURE.md §14.5 |

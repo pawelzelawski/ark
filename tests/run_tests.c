@@ -86,6 +86,8 @@ int test_read_chunk_length_mismatch(void);
 int test_read_chunk_compressed_size_mismatch(void);
 int test_read_chunk_trailing_bytes(void);
 int test_extract_chunk_trailing_bytes(void);
+int test_extract_chunk_length_mismatch(void);
+int test_extract_chunk_over_bound(void);
 int test_read_empty_file_chunk_count_zero(void);
 int test_blake3_vectors_all(void);
 int test_blake3_empty(void);
@@ -288,6 +290,10 @@ int test_create_pipeline_matches_across_workers(void);
 int test_create_pipeline_read_fault(void);
 int test_create_pipeline_write_fault(void);
 int test_create_pipeline_worker_fault(void);
+int test_extract_pipeline_matches_across_workers(void);
+int test_extract_pipeline_errors_in_order(void);
+int test_extract_pipeline_short_reads(void);
+int test_extract_known_dir_prefix(void);
 
 int test_sha256_empty(void);
 int test_sha256_abc(void);
@@ -550,6 +556,8 @@ static const test_case_t g_tests[] = {
      test_read_chunk_compressed_size_mismatch},
     {"test_read_chunk_trailing_bytes", test_read_chunk_trailing_bytes},
     {"test_extract_chunk_trailing_bytes", test_extract_chunk_trailing_bytes},
+    {"test_extract_chunk_length_mismatch", test_extract_chunk_length_mismatch},
+    {"test_extract_chunk_over_bound", test_extract_chunk_over_bound},
     {"test_read_empty_file_chunk_count_zero",
      test_read_empty_file_chunk_count_zero},
     {"test_fault_archive_header_dst_cap_undersize",
@@ -666,6 +674,12 @@ static const test_case_t g_tests[] = {
     {"test_create_pipeline_read_fault", test_create_pipeline_read_fault},
     {"test_create_pipeline_write_fault", test_create_pipeline_write_fault},
     {"test_create_pipeline_worker_fault", test_create_pipeline_worker_fault},
+    {"test_extract_pipeline_matches_across_workers",
+     test_extract_pipeline_matches_across_workers},
+    {"test_extract_pipeline_errors_in_order",
+     test_extract_pipeline_errors_in_order},
+    {"test_extract_pipeline_short_reads", test_extract_pipeline_short_reads},
+    {"test_extract_known_dir_prefix", test_extract_known_dir_prefix},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_single_file", test_integration_single_file},
     {"test_integration_directory_tree", test_integration_directory_tree},

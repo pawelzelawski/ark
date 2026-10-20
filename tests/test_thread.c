@@ -52,13 +52,15 @@ int ark_test_create_archive(const char *, const char **, size_t, int,
                             ark_hash_alg_t, int, ark_error_t *);
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
+size_t ark_test_known_dir_prefix(const char *, const char *);
 void ark_test_cli_fault_reset(void);
 void ark_test_cli_fault_inject(int, int, ark_err_t, int);
 
 /* Command fault points of main.c used here (same values as test_fault.c). */
 enum {
 	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE = 2,
-	ARK_CLI_FAULT_CREATE_WORKER = 6
+	ARK_CLI_FAULT_CREATE_WORKER = 6,
+	ARK_CLI_FAULT_EXTRACT_WORKER = 7
 };
 
 typedef struct {
@@ -1308,10 +1310,26 @@ static int same_file_bytes(const char *a, const char *b)
 }
 
 /*
- * check_pipeline_extract - Extract archive into out and compare it with src.
+ * same_file_meta - Whether two regular files have the same mode bits and
+ * modification time (ark restores both, ARCHITECTURE.md section 14.5).
+ */
+static int same_file_meta(const char *a, const char *b)
+{
+	struct stat st_a;
+	struct stat st_b;
+
+	return stat(a, &st_a) == 0 && stat(b, &st_b) == 0 &&
+	       (st_a.st_mode & 07777) == (st_b.st_mode & 07777) &&
+	       st_a.st_mtim.tv_sec == st_b.st_mtim.tv_sec &&
+	       st_a.st_mtim.tv_nsec == st_b.st_mtim.tv_nsec;
+}
+
+/*
+ * check_pipeline_extract - Extract archive into out with n_workers and
+ * compare it with src.
  */
 static int check_pipeline_extract(const char *archive, const char *src,
-                                  const char *out)
+                                  const char *out, int n_workers)
 {
 	ark_error_t err = {0};
 	char a[1024];
@@ -1323,7 +1341,8 @@ static int check_pipeline_extract(const char *archive, const char *src,
 	unsigned int i;
 
 	if (mkdir(out, 0755) != 0 ||
-	    ark_test_extract_archive(archive, out, 0, NULL, 2, &err) != 0)
+	    ark_test_extract_archive(archive, out, 0, NULL, n_workers, &err) !=
+	        0)
 		return -1;
 	if (path_join(a, sizeof(a), src, "a.big") != 0 ||
 	    path_join(b, sizeof(b), out, "a.big") != 0 ||
@@ -1343,7 +1362,7 @@ static int check_pipeline_extract(const char *archive, const char *src,
 		(void)snprintf(name, sizeof(name), "c.dir/f%03u", i);
 		if (path_join(a, sizeof(a), src, name) != 0 ||
 		    path_join(b, sizeof(b), out, name) != 0 ||
-		    !same_file_bytes(a, b))
+		    !same_file_bytes(a, b) || !same_file_meta(a, b))
 			return -1;
 	}
 	if (path_join(a, sizeof(a), out, "c.dir/f001") != 0 ||
@@ -1410,7 +1429,7 @@ int test_create_pipeline_matches_across_workers(void)
 		                                workers[i]) != 0)
 			goto done;
 	}
-	if (check_pipeline_extract(out_one, src, out_dir) != 0)
+	if (check_pipeline_extract(out_one, src, out_dir, 2) != 0)
 		goto done;
 	rc = 0;
 
@@ -1493,4 +1512,362 @@ int test_create_pipeline_worker_fault(void)
 		return 1;
 	return expect_pipeline_fault(1000 + ARK_CLI_FAULT_CREATE_WORKER, 60, 4,
 	                             ARK_ERR_IO_ALLOC, ENOMEM);
+}
+
+/*
+ * dir_is_empty - Whether directory path exists and holds no entries.
+ */
+static int dir_is_empty(const char *path)
+{
+	DIR *dir;
+	const struct dirent *de;
+	int empty = 1;
+
+	dir = opendir(path);
+	if (dir == NULL)
+		return 0;
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") != 0 &&
+		    strcmp(de->d_name, "..") != 0)
+			empty = 0;
+	}
+	(void)closedir(dir);
+	return empty;
+}
+
+int test_extract_pipeline_matches_across_workers(void)
+{
+	char root[] = "/tmp/ark-thread-xpipe-XXXXXX";
+	static const int workers[] = {1, 2, 3, 4, 16};
+	char src[1024];
+	char archive[1024];
+	char out[1024];
+	char a[1024];
+	char b[1024];
+	char name[64];
+	const char *sources[1];
+	const char *tmp;
+	ark_error_t err = {0};
+	struct stat st;
+	unsigned int k;
+	size_t i;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_pipeline_tree(tmp, src, sizeof(src)) != 0 ||
+	    path_join(archive, sizeof(archive), tmp, "x.ark") != 0)
+		goto done;
+	sources[0] = src;
+	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
+	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+		goto done;
+	/*
+	 * ARCHITECTURE.md section 6.3: chunks of later members are decoded
+	 * ahead, members are still created and written in index order, so
+	 * every worker count extracts the same tree.
+	 */
+	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
+		(void)snprintf(name, sizeof(name), "out%zu", i);
+		if (path_join(out, sizeof(out), tmp, name) != 0 ||
+		    check_pipeline_extract(archive, src, out, workers[i]) != 0)
+			goto done;
+	}
+	/*
+	 * Selective: d.link selects its target c.dir/f001 (created under an
+	 * implicit c.dir); the reader skips the chunks of a.big and of the
+	 * other c.dir files.
+	 */
+	if (path_join(out, sizeof(out), tmp, "sel") != 0 ||
+	    mkdir(out, 0755) != 0 ||
+	    ark_test_extract_archive(archive, out, 0, "d.link", 4, &err) != 0)
+		goto done;
+	if (path_join(a, sizeof(a), src, "c.dir/f001") != 0 ||
+	    path_join(b, sizeof(b), out, "d.link") != 0 ||
+	    !same_file_bytes(a, b))
+		goto done;
+	for (k = 0U; k < 3U; k++) {
+		static const char *const absent[] = {"a.big", "c.dir/f000",
+		                                     "c.dir/f002"};
+
+		if (path_join(b, sizeof(b), out, absent[k]) != 0 ||
+		    lstat(b, &st) == 0 || errno != ENOENT)
+			goto done;
+	}
+	rc = 0;
+
+done:
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+/*
+ * write_random_file - Write total pseudo-random bytes (incompressible: ark
+ * stores them verbatim in stored blocks).
+ */
+static int write_random_file(const char *path, size_t total, uint32_t seed)
+{
+	uint8_t block[4096];
+	uint32_t x;
+	size_t done;
+	int fd;
+
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if (fd < 0)
+		return -1;
+	x = seed | 1U;
+	done = 0U;
+	while (done < total) {
+		size_t n;
+		size_t i;
+
+		n = total - done < sizeof(block) ? total - done : sizeof(block);
+		for (i = 0U; i < n; i++) {
+			x ^= x << 13;
+			x ^= x >> 17;
+			x ^= x << 5;
+			block[i] = (uint8_t)(x >> 24);
+		}
+		if (write_full_fd(fd, block, n) != 0) {
+			(void)close(fd);
+			return -1;
+		}
+		done += n;
+	}
+	return close(fd);
+}
+
+/*
+ * corrupt_copy_of - Flip one archive byte inside a stored copy of needle.
+ */
+static int corrupt_copy_of(const char *archive, const uint8_t *needle,
+                           size_t needle_len)
+{
+	uint8_t *bytes = NULL;
+	size_t len = 0U;
+	size_t i;
+	int rc = -1;
+
+	if (read_file_bytes(archive, &bytes, &len) != 0)
+		return -1;
+	for (i = 0U; i + needle_len <= len; i++) {
+		if (memcmp(bytes + i, needle, needle_len) == 0)
+			break;
+	}
+	if (i + needle_len <= len) {
+		int fd;
+
+		bytes[i + needle_len / 2U] ^= 0x01U;
+		fd = open(archive, O_WRONLY | O_TRUNC);
+		if (fd >= 0) {
+			rc = write_full_fd(fd, bytes, len);
+			if (close(fd) != 0)
+				rc = -1;
+		}
+	}
+	free(bytes);
+	return rc;
+}
+
+/*
+ * make_ahead_archive - Archive of a.big (four chunks) then z.rand (one stored
+ * chunk). With hash_bad, one byte of z.rand's stored data is flipped: it
+ * still decodes to the right length, but its member hash no longer matches.
+ */
+static int make_ahead_archive(const char *tmp, int hash_bad, char *archive,
+                              size_t archive_sz)
+{
+	char src[1024];
+	char path[1024];
+	uint8_t *rand_bytes = NULL;
+	size_t rand_len = 0U;
+	const char *sources[1];
+	ark_error_t err = {0};
+	int rc = -1;
+
+	if (path_join(src, sizeof(src), tmp, "src") != 0 ||
+	    mkdir(src, 0755) != 0 ||
+	    path_join(path, sizeof(path), src, "a.big") != 0 ||
+	    write_seeded_file(path, ARK_CHUNK_SIZE * 3U + 7U, 77U) != 0 ||
+	    path_join(path, sizeof(path), src, "z.rand") != 0 ||
+	    write_random_file(path, 65536U, 4242U) != 0 ||
+	    path_join(archive, archive_sz, tmp, "ahead.ark") != 0)
+		return -1;
+	sources[0] = src;
+	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
+	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+		return -1;
+	if (!hash_bad)
+		return 0;
+	if (read_file_bytes(path, &rand_bytes, &rand_len) == 0 &&
+	    rand_len > 2048U)
+		rc = corrupt_copy_of(archive, rand_bytes + 1024U, 64U);
+	free(rand_bytes);
+	return rc;
+}
+
+/*
+ * expect_ahead_fault - Extract the ahead archive with faults and check the
+ * reported error, the output writes made before it and an empty output.
+ *
+ * pread_fail is the failing chunk read (0: none); worker_fail the 1-based
+ * chunk sequence a decompress worker fails (0: none, reported as
+ * ARK_ERR_IO_ALLOC / ENOMEM).
+ */
+static int expect_ahead_fault(const char *tmp, const char *archive,
+                              int n_workers, int pread_fail, int worker_fail,
+                              ark_err_t code, int errno_value, int writes)
+{
+	char out[1024];
+	char name[64];
+	ark_error_t err = {0};
+	int extract_rc;
+	int write_calls;
+
+	(void)snprintf(name, sizeof(name), "out-%d-%d-%d", n_workers,
+	               pread_fail, worker_fail);
+	if (path_join(out, sizeof(out), tmp, name) != 0 ||
+	    mkdir(out, 0755) != 0)
+		return -1;
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (pread_fail > 0)
+		fault_inject(ARK_FAULT_PREAD, pread_fail, EIO);
+	if (worker_fail > 0)
+		ark_test_cli_fault_inject(ARK_CLI_FAULT_EXTRACT_WORKER,
+		                          worker_fail, ARK_ERR_IO_ALLOC,
+		                          ENOMEM);
+	extract_rc =
+	    ark_test_extract_archive(archive, out, 0, NULL, n_workers, &err);
+	write_calls = ark_fault.write_calls;
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (extract_rc == 0 || err.code != code ||
+	    err.sys_errno != errno_value || write_calls != writes ||
+	    !dir_is_empty(out))
+		return -1;
+	return 0;
+}
+
+int test_extract_pipeline_errors_in_order(void)
+{
+	char root[] = "/tmp/ark-thread-xahead-XXXXXX";
+	static const int workers[] = {1, 2, 4, 16};
+	char good_dir[1024];
+	char bad_dir[1024];
+	char good[1024];
+	char bad[1024];
+	const char *tmp;
+	size_t i;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (path_join(good_dir, sizeof(good_dir), tmp, "good") != 0 ||
+	    mkdir(good_dir, 0755) != 0 ||
+	    path_join(bad_dir, sizeof(bad_dir), tmp, "bad") != 0 ||
+	    mkdir(bad_dir, 0755) != 0 ||
+	    make_ahead_archive(good_dir, 0, good, sizeof(good)) != 0 ||
+	    make_ahead_archive(bad_dir, 1, bad, sizeof(bad)) != 0)
+		goto done;
+	/*
+	 * ARCHITECTURE.md section 6.3: the reader finds z.rand's read error or
+	 * hash mismatch while a.big is still being written, but the failure is
+	 * reported where it happened in archive order: after a.big's four
+	 * chunks (and, for the hash, after z.rand's own chunk), unless a.big
+	 * fails first. The result is the same for every worker count.
+	 */
+	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
+		int n = workers[i];
+
+		if (expect_ahead_fault(good_dir, good, n, 5, 0, ARK_ERR_IO_READ,
+		                       EIO, 4) != 0 ||
+		    expect_ahead_fault(bad_dir, bad, n, 0, 0,
+		                       ARK_ERR_HASH_MEMBER, 0, 5) != 0 ||
+		    expect_ahead_fault(bad_dir, bad, n, 0, 2, ARK_ERR_IO_ALLOC,
+		                       ENOMEM, 1) != 0 ||
+		    expect_ahead_fault(good_dir, good, n, 5, 4,
+		                       ARK_ERR_IO_ALLOC, ENOMEM, 3) != 0 ||
+		    expect_ahead_fault(good_dir, good, n, 0, 5,
+		                       ARK_ERR_IO_ALLOC, ENOMEM, 4) != 0)
+			goto done;
+	}
+	rc = 0;
+
+done:
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+int test_extract_pipeline_short_reads(void)
+{
+	char root[] = "/tmp/ark-thread-xshort-XXXXXX";
+	char src[1024];
+	char archive[1024];
+	char out[1024];
+	char out_whole[1024];
+	const char *sources[1];
+	const char *tmp;
+	ark_error_t err = {0};
+	int whole_calls;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_pipeline_tree(tmp, src, sizeof(src)) != 0 ||
+	    path_join(archive, sizeof(archive), tmp, "x.ark") != 0 ||
+	    path_join(out, sizeof(out), tmp, "out") != 0 ||
+	    path_join(out_whole, sizeof(out_whole), tmp, "whole") != 0)
+		goto done;
+	sources[0] = src;
+	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
+	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+		goto done;
+	/* One pread per chunk, then every chunk in pieces of <= 4093 bytes. */
+	fault_reset();
+	if (check_pipeline_extract(archive, src, out_whole, 4) != 0)
+		goto done;
+	whole_calls = ark_fault.pread_calls;
+	fault_reset();
+	ark_fault.pread_max = 4093;
+	if (check_pipeline_extract(archive, src, out, 4) != 0 ||
+	    ark_fault.pread_calls <= 2 * whole_calls)
+		goto done;
+	rc = 0;
+
+done:
+	fault_reset();
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+int test_extract_known_dir_prefix(void)
+{
+	static const struct {
+		const char *known;
+		const char *path;
+		size_t want;
+	} cases[] = {
+	    {"", "a/b/c", 0U},      {"a", "a/b", 1U},
+	    {"a", "ab/c", 0U},      {"a/b", "a/b/c", 3U},
+	    {"a/b", "a/bc/d", 1U},  {"a/b", "a/b", 1U},
+	    {"a/b/c", "a/b/d", 3U}, {"a/b/c", "a/b/c/d/e", 5U},
+	    {"x/y", "a/b/c", 0U},   {"a/b", "c", 0U},
+	};
+	size_t i;
+
+	for (i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		if (ark_test_known_dir_prefix(cases[i].known, cases[i].path) !=
+		    cases[i].want)
+			return 1;
+	}
+	return 0;
 }

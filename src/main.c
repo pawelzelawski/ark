@@ -160,6 +160,36 @@ typedef struct {
 	size_t write_cap;
 } create_pipe_t;
 
+/*
+ * extract_pipe_t - Extract-side decode-ahead across members.
+ *
+ * The reader side reads, hashes and submits the chunks of the selected
+ * regular members in index order, ahead of the writer; the writer creates
+ * members and writes their chunks strictly in index order. A reader failure
+ * is held at its position (r_member, r_chunk; r_chunk == chunk_count for the
+ * member hash) and reported when the writer reaches that position. See
+ * ARCHITECTURE.md sections 6.3 and 14.3.
+ */
+typedef struct {
+	ark_read_ctx_t *rctx;
+	ark_pool_t *pool;
+	const unsigned char *selected;
+	size_t member_count;
+	int archive_fd;
+	uint8_t *comp_buf;
+	size_t comp_cap;
+	uint32_t r_member;
+	uint32_t r_chunk;
+	uint64_t r_off;
+	int r_begun;
+	int r_failed;
+	ark_error_t r_err;
+	uint64_t submit_seq;
+	uint64_t drain_seq;
+	size_t in_flight;
+	size_t max_in_flight;
+} extract_pipe_t;
+
 typedef struct {
 	char root[PATH_MAX];
 	dev_t root_dev;
@@ -186,7 +216,8 @@ enum ark_cli_fault_which {
 	ARK_CLI_FAULT_CREATE_COMMIT,
 	ARK_CLI_FAULT_CREATE_MARK_MODIFIED,
 	ARK_CLI_FAULT_CLEANUP_GROW,
-	ARK_CLI_FAULT_CREATE_WORKER
+	ARK_CLI_FAULT_CREATE_WORKER,
+	ARK_CLI_FAULT_EXTRACT_WORKER
 };
 
 static ark_cli_fault_t ark_cli_fault;
@@ -1134,16 +1165,16 @@ static void pool_shutdown(ark_pool_t *pool)
  */
 #ifdef ARK_TEST
 /*
- * ark_test_cli_fault_worker - Whether a compress worker fails chunk seq.
+ * ark_test_cli_fault_worker - Whether a which-kind worker fails chunk seq.
  *
+ * which is ARK_CLI_FAULT_CREATE_WORKER or ARK_CLI_FAULT_EXTRACT_WORKER;
  * fail_on_call_n is the 1-based sequence number of the failing chunk. Workers
  * only read the fault: it is set before the pool starts and reset after the
  * pool is joined, so no counter is shared between threads.
  */
-static int ark_test_cli_fault_worker(uint64_t seq, ark_error_t *err)
+static int ark_test_cli_fault_worker(int which, uint64_t seq, ark_error_t *err)
 {
-	if (ark_cli_fault.which != ARK_CLI_FAULT_CREATE_WORKER ||
-	    ark_cli_fault.fail_on_call_n <= 0 ||
+	if (ark_cli_fault.which != which || ark_cli_fault.fail_on_call_n <= 0 ||
 	    seq + 1U != (uint64_t)ark_cli_fault.fail_on_call_n)
 		return 0;
 	return fail_error(err, ark_cli_fault.code,
@@ -1212,8 +1243,9 @@ static void *worker_compress(void *arg)
 		{
 			ark_error_t fault_err = {0};
 
-			if (ark_test_cli_fault_worker(work.seq, &fault_err) !=
-			    0) {
+			if (ark_test_cli_fault_worker(
+			        ARK_CLI_FAULT_CREATE_WORKER, work.seq,
+			        &fault_err) != 0) {
 				error_store_once(&pool->shared_err, &fault_err);
 				(void)ring_buf_abort(pool->ring, work.seq,
 				                     fault_err.code, NULL);
@@ -1335,6 +1367,20 @@ static void *worker_decompress(void *arg)
 			break;
 		}
 
+#ifdef ARK_TEST
+		{
+			ark_error_t fault_err = {0};
+
+			if (ark_test_cli_fault_worker(
+			        ARK_CLI_FAULT_EXTRACT_WORKER, work.seq,
+			        &fault_err) != 0) {
+				error_store_once(&pool->shared_err, &fault_err);
+				(void)ring_buf_abort(pool->ring, work.seq,
+				                     fault_err.code, NULL);
+				break;
+			}
+		}
+#endif
 		out = work.dst;
 
 		if (ark_deflate_dec_oneshot(work.src, work.src_len, &used, out,
@@ -1429,7 +1475,14 @@ static int chevron_error_fail(ark_error_t *, const chevron_error_t *,
                               const char *, const char *);
 static int exit_code_from_err(ark_err_t);
 static int read_full(int, void *, size_t, const char *, ark_error_t *);
+static int read_chunk_at(int, void *, size_t, uint64_t, const char *,
+                         ark_error_t *);
 static int write_full(int, const void *, size_t, const char *, ark_error_t *);
+static int extract_pipe_read_one(extract_pipe_t *, ark_error_t *);
+static int extract_pipe_take(extract_pipe_t *, const ark_member_meta_t *,
+                             uint32_t, uint8_t **, size_t *, ark_error_t *);
+static void extract_pipe_release(extract_pipe_t *);
+static int extract_pipe_member_end(extract_pipe_t *, uint32_t, ark_error_t *);
 static uint64_t le64_decode(const uint8_t *);
 static int read_archive_index(int, const char *, ark_read_ctx_t *, uint8_t **,
                               size_t *, ark_error_t *);
@@ -1447,8 +1500,9 @@ static void cleanup_free(cleanup_tracker_t *);
 static int dir_deferred_push(dir_deferred_meta_t *, const ark_member_meta_t *,
                              ark_error_t *);
 static void dir_deferred_free(dir_deferred_meta_t *);
+static size_t known_dir_prefix(const char *, const char *);
 static int ensure_parent_dirs(const ark_member_meta_t *, int, int,
-                              cleanup_tracker_t *, ark_error_t *);
+                              cleanup_tracker_t *, char *, ark_error_t *);
 static void decode_mtime(uint64_t, struct timespec[2]);
 static int restore_regular_meta(int, const ark_member_meta_t *, ark_error_t *);
 static void restore_symlink_meta(int, const ark_member_meta_t *);
@@ -1477,6 +1531,7 @@ void ark_test_cli_fault_reset(void);
 void ark_test_cli_fault_inject(int, int, ark_err_t, int);
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
+size_t ark_test_known_dir_prefix(const char *, const char *);
 void ark_test_force_owner_restore(int);
 static int ark_test_cli_fault_should_fail(int, ark_error_t *, const char *);
 static int ark_test_cli_fault_should_mark_modified(void);
@@ -1957,6 +2012,43 @@ static int read_full(int fd, void *buf, size_t len, const char *path,
 }
 
 /*
+ * read_chunk_at - Read one archive chunk of len bytes at offset off.
+ *
+ * Uses pread: one system call per chunk and no shared file offset.
+ */
+static int read_chunk_at(int fd, void *buf, size_t len, uint64_t off,
+                         const char *path, ark_error_t *err)
+{
+	uint64_t off_max;
+	uint8_t *p;
+
+	off_max = ((uint64_t)1 << (sizeof(off_t) * 8U - 1U)) - 1U;
+	p = (uint8_t *)buf;
+	while (len > 0U) {
+		ssize_t n;
+
+		if (off > off_max)
+			return fail_error(err, ARK_ERR_IO_SEEK,
+			                  "archive offset out of range", path,
+			                  0);
+		n = ARK_PREAD(fd, p, len, (off_t)off);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return fail_error(err, ARK_ERR_IO_READ,
+			                  "archive read failed", path, errno);
+		}
+		if (n == 0)
+			return fail_error(err, ARK_ERR_FMT_TRUNCATED,
+			                  "archive truncated", path, 0);
+		p += (size_t)n;
+		len -= (size_t)n;
+		off += (uint64_t)n;
+	}
+	return 0;
+}
+
+/*
  * write_full - Write exactly len bytes unless a hard write error occurs.
  */
 static int write_full(int fd, const void *buf, size_t len, const char *path,
@@ -2422,21 +2514,51 @@ static void dir_deferred_free(dir_deferred_meta_t *list)
 }
 
 /*
+ * known_dir_prefix - Length of the leading directories of path in known_dir.
+ *
+ * known_dir names a directory confirmed in this run, with all its ancestors.
+ * Returns the offset of the '/' in path that ends the longest common prefix
+ * of whole components, or 0 when they share none.
+ */
+static size_t known_dir_prefix(const char *known_dir, const char *path)
+{
+	size_t last;
+	size_t i;
+
+	last = 0U;
+	for (i = 0U; known_dir[i] != '\0' && known_dir[i] == path[i]; i++) {
+		if (path[i] == '/')
+			last = i;
+	}
+	if (i > 0U && known_dir[i] == '\0' && path[i] == '/')
+		return i;
+	return last;
+}
+
+/*
  * ensure_parent_dirs - Handle parent dir precondition for a member path.
  *
  * ARCHITECTURE.md section 14.4: full extraction rejects missing parents as
  * format error; selective extraction may create missing parents with mode 0700.
+ *
+ * known_dir (1024 bytes like member paths, may be empty) names a directory
+ * this run has already confirmed or created, ancestors included; its
+ * components are not checked again. On success it becomes the member's
+ * parent. ark never replaces a directory (§14.2), so a confirmed directory
+ * stays one.
  */
 static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
                               int selective, cleanup_tracker_t *tracker,
-                              ark_error_t *err)
+                              char *known_dir, ark_error_t *err)
 {
 	char path[1024];
 	char *slash;
+	size_t skip;
 
 	copy_msg(path, sizeof(path), meta->path);
-	for (slash = strchr(path, '/'); slash != NULL;
-	     slash = strchr(slash + 1, '/')) {
+	skip = known_dir_prefix(known_dir, path);
+	for (slash = strchr(path + skip + (skip > 0U ? 1U : 0U), '/');
+	     slash != NULL; slash = strchr(slash + 1, '/')) {
 		struct stat st;
 
 		*slash = '\0';
@@ -2471,6 +2593,11 @@ static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
 		 */
 		cleanup_track(tracker, path, 1);
 		*slash = '/';
+	}
+	slash = strrchr(path, '/');
+	if (slash != NULL) {
+		*slash = '\0';
+		copy_msg(known_dir, sizeof(path), path);
 	}
 	return 0;
 }
@@ -2942,15 +3069,8 @@ static int cmd_verify(const ark_args_t *args, ark_error_t *err)
 				                 meta->path, 0);
 				goto cleanup;
 			}
-			if (ARK_LSEEK(archive_fd, (off_t)chunk_off, SEEK_SET) ==
-			    (off_t)-1) {
-				(void)fail_error(err, ARK_ERR_IO_SEEK,
-				                 "archive seek failed",
-				                 meta->path, errno);
-				goto cleanup;
-			}
-			if (read_full(archive_fd, comp_buf, csz, meta->path,
-			              err) != 0)
+			if (read_chunk_at(archive_fd, comp_buf, csz, chunk_off,
+			                  meta->path, err) != 0)
 				goto cleanup;
 			/*
 			 * SAFETY: verification hashes compressed bytes in
@@ -3027,6 +3147,200 @@ static int cmd_generate_reader(const ark_args_t *args, ark_error_t *err)
 }
 
 /*
+ * extract_pipe_read_one - Advance the reader by one chunk or one member end.
+ *
+ * Reads, hashes and submits the next chunk, or finishes the member hash after
+ * its last chunk. Unselected and non-regular members are skipped. A failed
+ * read, bound check or hash is held in r_err and stops the reader.
+ *
+ * Returns 1 after a step, 0 when the reader is done, holds a failure or has
+ * no ring slot for its next chunk, -1 on an error reported at once.
+ */
+static int extract_pipe_read_one(extract_pipe_t *p, ark_error_t *err)
+{
+	const ark_member_meta_t *meta;
+	size_t csz;
+
+	meta = NULL;
+	while (!p->r_failed && p->r_member < p->member_count) {
+		meta = ark_read_member_meta(p->rctx, p->r_member);
+		if (p->selected[p->r_member] != 0U && meta->type == 0x01)
+			break;
+		p->r_member++;
+	}
+	if (p->r_failed || p->r_member >= p->member_count || meta == NULL)
+		return 0;
+	if (!p->r_begun) {
+		if (ark_read_verify_member_begin(p->rctx, meta, &p->r_err) !=
+		    0) {
+			p->r_failed = 1;
+			return 0;
+		}
+		p->r_begun = 1;
+		p->r_chunk = 0U;
+		p->r_off = meta->data_offset;
+	}
+	if (p->r_chunk == meta->chunk_count) {
+		if (ark_read_verify_member_final(p->rctx, meta, &p->r_err) !=
+		    0) {
+			p->r_failed = 1;
+			return 0;
+		}
+		p->r_begun = 0;
+		p->r_chunk = 0U;
+		p->r_member++;
+		return 1;
+	}
+	if (p->in_flight >= p->max_in_flight)
+		return 0;
+
+	csz = (size_t)meta->chunk_sizes[p->r_chunk];
+	if (csz > p->comp_cap) {
+		(void)fail_error(&p->r_err, ARK_ERR_FMT_INDEX,
+		                 "chunk size exceeds bound", meta->path, 0);
+		p->r_failed = 1;
+		return 0;
+	}
+	if (UINT64_MAX - p->r_off < (uint64_t)csz) {
+		(void)fail_error(&p->r_err, ARK_ERR_FMT_INDEX,
+		                 "chunk offset overflow", meta->path, 0);
+		p->r_failed = 1;
+		return 0;
+	}
+	if (read_chunk_at(p->archive_fd, p->comp_buf, csz, p->r_off, meta->path,
+	                  &p->r_err) != 0 ||
+	    ark_read_verify_member_update(p->rctx, meta, p->r_chunk,
+	                                  p->comp_buf, csz, &p->r_err) != 0) {
+		p->r_failed = 1;
+		return 0;
+	}
+	if (pool_submit(p->pool, p->submit_seq, p->comp_buf, csz) != 0) {
+		if (!shared_err_get(&p->pool->shared_err, err))
+			(void)fail_error(err, ARK_ERR_FMT_DATA,
+			                 "extract worker submit failed",
+			                 meta->path, 0);
+		return -1;
+	}
+	p->submit_seq++;
+	p->in_flight++;
+	p->r_chunk++;
+	p->r_off += (uint64_t)csz;
+	return 1;
+}
+
+/*
+ * extract_pipe_take - Wait for chunk `chunk` of the member being written.
+ *
+ * Lets the reader fill every free ring slot first, then waits for the oldest
+ * in-flight chunk, which is the requested one: both sides walk the same
+ * members and chunks in index order. With nothing in flight the reader holds
+ * a failure at exactly this chunk, which is reported now. On success *data
+ * borrows the ring slot until extract_pipe_release.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
+                             uint32_t chunk, uint8_t **data, size_t *len,
+                             ark_error_t *err)
+{
+	ark_err_t worker_err;
+	size_t expected_len;
+	int is_abort;
+	int rc;
+
+	do {
+		rc = extract_pipe_read_one(p, err);
+		if (rc < 0)
+			return -1;
+	} while (rc > 0);
+	if (p->in_flight == 0U) {
+		if (p->r_failed) {
+			*err = p->r_err;
+			return -1;
+		}
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "extract pipeline out of sequence",
+		                  meta->path, 0);
+	}
+
+	*data = NULL;
+	*len = 0U;
+	is_abort = 0;
+	worker_err = ARK_OK;
+	if (ring_buf_read(p->pool->ring, p->drain_seq, data, len, &is_abort,
+	                  &worker_err, err) != 0)
+		return -1;
+	if (is_abort) {
+		if (!shared_err_get(&p->pool->shared_err, err))
+			(void)fail_error(
+			    err,
+			    worker_err != ARK_OK ? worker_err
+			                         : ARK_ERR_FMT_DATA,
+			    "extract worker aborted", meta->path, 0);
+		extract_pipe_release(p);
+		return -1;
+	}
+
+	if (chunk + 1U < meta->chunk_count)
+		expected_len = ARK_CHUNK_SIZE;
+	else {
+		expected_len =
+		    (size_t)(meta->size_original % (uint64_t)ARK_CHUNK_SIZE);
+		if (expected_len == 0U)
+			expected_len = ARK_CHUNK_SIZE;
+	}
+	if (*len != expected_len) {
+		(void)fail_error(err, ARK_ERR_FMT_DATA,
+		                 "decompressed chunk length mismatch",
+		                 meta->path, 0);
+		extract_pipe_release(p);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * extract_pipe_release - Return the oldest in-flight chunk's ring slot.
+ */
+static void extract_pipe_release(extract_pipe_t *p)
+{
+	ring_buf_release(p->pool->ring, p->drain_seq);
+	p->drain_seq++;
+	p->in_flight--;
+}
+
+/*
+ * extract_pipe_member_end - Report the member hash once all chunks are written.
+ *
+ * Moves the reader past member i (its hash is finished after its last chunk
+ * was read) and reports a failure held at member i: its hash, or for a
+ * member without chunks any reader failure.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int extract_pipe_member_end(extract_pipe_t *p, uint32_t i,
+                                   ark_error_t *err)
+{
+	while (!p->r_failed && p->r_member <= i) {
+		int rc;
+
+		rc = extract_pipe_read_one(p, err);
+		if (rc < 0)
+			return -1;
+		if (rc == 0)
+			break;
+	}
+	if (p->r_failed && p->r_member == i) {
+		*err = p->r_err;
+		return -1;
+	}
+	if (!p->r_failed && p->r_member <= i)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "extract pipeline out of sequence", "", 0);
+	return 0;
+}
+
+/*
  * cmd_extract - Validate archive and extract selected members in index order.
  *
  * Uses worker-pool decompression with I/O-thread ordered drain from the ring
@@ -3040,14 +3354,14 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	ark_read_ctx_t *rctx;
 	cleanup_tracker_t tracker = {0};
 	dir_deferred_meta_t deferred_dirs = {0};
+	extract_pipe_t pipe = {0};
+	char known_dir[1024];
 	uint8_t *index_buf;
 	unsigned char *selected;
 	uint8_t *comp_buf;
-	uint8_t *out_buf;
 	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
-	size_t max_in_flight;
 	int archive_fd;
 	int out_fd;
 	int rc;
@@ -3056,15 +3370,14 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	index_buf = NULL;
 	selected = NULL;
 	comp_buf = NULL;
-	out_buf = NULL;
 	archive_fd = -1;
 	out_fd = -1;
 	rc = -1;
+	known_dir[0] = '\0';
 	if (pool == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "extract worker pool is required", "", 0);
-	max_in_flight = (size_t)pool->n_workers;
-	if (max_in_flight == 0U) {
+	if (pool->n_workers <= 0) {
 		(void)fail_error(err, ARK_ERR_USAGE,
 		                 "extract worker pool has zero workers", "", 0);
 		goto cleanup;
@@ -3095,13 +3408,26 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 		goto cleanup;
 
 	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
-	/* OWNERSHIP: command cleanup frees comp_buf and any drained out_buf. */
+	/* OWNERSHIP: command cleanup frees comp_buf. */
 	comp_buf = (uint8_t *)malloc(comp_cap);
 	if (comp_buf == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "chunk buffer allocation failed", "", 0);
 		goto cleanup;
 	}
+	/*
+	 * At most one chunk per ring slot is in flight, so a worker never
+	 * waits for a slot the I/O thread has not drained. See ARCHITECTURE.md
+	 * section 6.3.
+	 */
+	pipe.rctx = rctx;
+	pipe.pool = pool;
+	pipe.selected = selected;
+	pipe.member_count = member_count;
+	pipe.archive_fd = archive_fd;
+	pipe.comp_buf = comp_buf;
+	pipe.comp_cap = comp_cap;
+	pipe.max_in_flight = pool->ring->n_slots;
 
 	for (uint32_t i = 0U; i < member_count; i++) {
 		const ark_member_meta_t *meta;
@@ -3114,7 +3440,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 		meta = ark_read_member_meta(rctx, i);
 		selective = (args->member_count > 0U);
 		if (ensure_parent_dirs(meta, dest_fd, selective, &tracker,
-		                       err) != 0)
+		                       known_dir, err) != 0)
 			goto cleanup;
 
 		exists = (ARK_FSTATAT(dest_fd, meta->path, &st,
@@ -3159,6 +3485,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 			}
 			if (dir_deferred_push(&deferred_dirs, meta, err) != 0)
 				goto cleanup;
+			/* Its children skip the checks of its path. */
+			copy_msg(known_dir, sizeof(known_dir), meta->path);
 			break;
 		case 0x03:
 			if (exists) {
@@ -3229,10 +3557,6 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 			break;
 		case 0x01: {
 			uint32_t chunk;
-			uint64_t submit_seq;
-			uint64_t drain_seq;
-			uint64_t chunk_off;
-			size_t in_flight;
 
 			if (exists) {
 				if (S_ISDIR(st.st_mode)) {
@@ -3275,174 +3599,27 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 			}
 			cleanup_track(&tracker, meta->path, 0);
 
-			if (ark_read_verify_member_begin(rctx, meta, err) != 0)
-				goto cleanup;
-			chunk_off = meta->data_offset;
-			submit_seq = 0U;
-			drain_seq = 0U;
-			in_flight = 0U;
+			/*
+			 * SAFETY: chunks are written in index order; the reader
+			 * has hashed each one before submitting it. See
+			 * ARCHITECTURE.md sections 6.3 and 14.3.
+			 */
 			for (chunk = 0U; chunk < meta->chunk_count; chunk++) {
-				size_t csz;
+				uint8_t *out_buf = NULL;
+				size_t out_len = 0U;
+				int wrc;
 
-				csz = (size_t)meta->chunk_sizes[chunk];
-				if (csz > comp_cap) {
-					(void)fail_error(
-					    err, ARK_ERR_FMT_INDEX,
-					    "chunk size exceeds bound",
-					    meta->path, 0);
+				if (extract_pipe_take(&pipe, meta, chunk,
+				                      &out_buf, &out_len,
+				                      err) != 0)
 					goto cleanup;
-				}
-				if (ARK_LSEEK(archive_fd, (off_t)chunk_off,
-				              SEEK_SET) == (off_t)-1) {
-					(void)fail_error(err, ARK_ERR_IO_SEEK,
-					                 "archive seek failed",
-					                 meta->path, errno);
+				wrc = write_full(out_fd, out_buf, out_len,
+				                 meta->path, err);
+				extract_pipe_release(&pipe);
+				if (wrc != 0)
 					goto cleanup;
-				}
-				if (read_full(archive_fd, comp_buf, csz,
-				              meta->path, err) != 0)
-					goto cleanup;
-				if (ark_read_verify_member_update(
-				        rctx, meta, chunk, comp_buf, csz,
-				        err) != 0)
-					goto cleanup;
-				if (pool_submit(pool, submit_seq, comp_buf,
-				                csz) != 0) {
-					if (!shared_err_get(&pool->shared_err,
-					                    err))
-						(void)fail_error(
-						    err, ARK_ERR_FMT_DATA,
-						    "extract worker submit "
-						    "failed",
-						    meta->path, 0);
-					goto cleanup;
-				}
-				submit_seq++;
-				in_flight++;
-				chunk_off += (uint64_t)csz;
-
-				while (in_flight >= max_in_flight) {
-					int is_abort;
-					ark_err_t worker_err;
-					size_t out_len;
-					size_t expected_len;
-
-					out_buf = NULL;
-					if (ring_buf_read(
-					        pool->ring, drain_seq, &out_buf,
-					        &out_len, &is_abort,
-					        &worker_err, err) != 0)
-						goto cleanup;
-					if (is_abort) {
-						if (!shared_err_get(
-						        &pool->shared_err, err))
-							(void)fail_error(
-							    err,
-							    worker_err != ARK_OK
-							        ? worker_err
-							        : ARK_ERR_FMT_DATA,
-							    "extract worker "
-							    "aborted",
-							    meta->path, 0);
-						ring_buf_release(pool->ring,
-						                 drain_seq);
-						out_buf = NULL;
-						goto cleanup;
-					}
-
-					if ((uint32_t)(drain_seq + 1U) <
-					    meta->chunk_count)
-						expected_len = ARK_CHUNK_SIZE;
-					else {
-						expected_len =
-						    (size_t)(meta->size_original %
-						             (uint64_t)
-						                 ARK_CHUNK_SIZE);
-						if (expected_len == 0U)
-							expected_len =
-							    ARK_CHUNK_SIZE;
-					}
-					if (out_len != expected_len) {
-						(void)fail_error(
-						    err, ARK_ERR_FMT_DATA,
-						    "decompressed chunk length "
-						    "mismatch",
-						    meta->path, 0);
-						ring_buf_release(pool->ring,
-						                 drain_seq);
-						out_buf = NULL;
-						goto cleanup;
-					}
-					if (write_full(out_fd, out_buf, out_len,
-					               meta->path, err) != 0) {
-						ring_buf_release(pool->ring,
-						                 drain_seq);
-						out_buf = NULL;
-						goto cleanup;
-					}
-					ring_buf_release(pool->ring, drain_seq);
-					out_buf = NULL;
-					drain_seq++;
-					in_flight--;
-				}
 			}
-			while (in_flight > 0U) {
-				int is_abort;
-				ark_err_t worker_err;
-				size_t out_len;
-				size_t expected_len;
-
-				out_buf = NULL;
-				if (ring_buf_read(pool->ring, drain_seq,
-				                  &out_buf, &out_len, &is_abort,
-				                  &worker_err, err) != 0)
-					goto cleanup;
-				if (is_abort) {
-					if (!shared_err_get(&pool->shared_err,
-					                    err))
-						(void)fail_error(
-						    err,
-						    worker_err != ARK_OK
-						        ? worker_err
-						        : ARK_ERR_FMT_DATA,
-						    "extract worker aborted",
-						    meta->path, 0);
-					ring_buf_release(pool->ring, drain_seq);
-					out_buf = NULL;
-					goto cleanup;
-				}
-
-				if ((uint32_t)(drain_seq + 1U) <
-				    meta->chunk_count)
-					expected_len = ARK_CHUNK_SIZE;
-				else {
-					expected_len =
-					    (size_t)(meta->size_original %
-					             (uint64_t)ARK_CHUNK_SIZE);
-					if (expected_len == 0U)
-						expected_len = ARK_CHUNK_SIZE;
-				}
-				if (out_len != expected_len) {
-					(void)fail_error(err, ARK_ERR_FMT_DATA,
-					                 "decompressed chunk "
-					                 "length mismatch",
-					                 meta->path, 0);
-					ring_buf_release(pool->ring, drain_seq);
-					out_buf = NULL;
-					goto cleanup;
-				}
-				if (write_full(out_fd, out_buf, out_len,
-				               meta->path, err) != 0) {
-					ring_buf_release(pool->ring, drain_seq);
-					out_buf = NULL;
-					goto cleanup;
-				}
-				ring_buf_release(pool->ring, drain_seq);
-				out_buf = NULL;
-				drain_seq++;
-				in_flight--;
-			}
-			if (ark_read_verify_member_final(rctx, meta, err) != 0)
+			if (extract_pipe_member_end(&pipe, i, err) != 0)
 				goto cleanup;
 			if (restore_regular_meta(out_fd, meta, err) != 0)
 				goto cleanup;
@@ -5715,6 +5892,12 @@ int ark_test_extract_archive(const char *archive_path, const char *output_path,
 		                "output directory close failed", output_path,
 		                errno);
 	return rc;
+}
+
+/* ARK_TEST only: expose the extract parent-directory cache prefix rule. */
+size_t ark_test_known_dir_prefix(const char *known_dir, const char *path)
+{
+	return known_dir_prefix(known_dir, path);
 }
 
 /* ARK_TEST only: expose current cancellation flag for thread tests. */

@@ -113,6 +113,18 @@ off_t ark_stub_lseek(int fd, off_t offset, int whence)
 	return (lseek(fd, offset, whence));
 }
 
+ssize_t ark_stub_pread(int fd, void *buf, size_t count, off_t offset)
+{
+	ark_fault.pread_calls++;
+	if (fault_should_fail(ARK_FAULT_PREAD, ark_fault.pread_calls)) {
+		errno = ark_fault.errno_value;
+		return (-1);
+	}
+	if (ark_fault.pread_max > 0 && count > (size_t)ark_fault.pread_max)
+		count = (size_t)ark_fault.pread_max;
+	return (pread(fd, buf, count, offset));
+}
+
 int ark_stub_fstat(int fd, struct stat *sb)
 {
 	ark_fault.fstat_calls++;
