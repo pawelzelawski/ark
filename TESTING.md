@@ -453,6 +453,17 @@ complete.
 | `test_ring_init_sync_failure_cleans_up` | Ring mutex or condition initialisation fails; `ARK_ERR_IO_ALLOC`; slot payloads freed |
 | `test_pool_init_sync_failure_cleans_up` | Each pool and ring mutex/condition initialisation fails in turn; `ARK_ERR_IO_ALLOC`; no leak |
 
+### 4.5 Create Pipeline
+
+| Test case | What is verified |
+|---|---|
+| `test_create_deterministic_single_worker` | Two single-worker creates of one tree give identical archives |
+| `test_create_deterministic_multi_worker_matches_single` | A 4-worker create gives the single-worker archive bytes |
+| `test_create_pipeline_matches_across_workers` | Tree with a four-chunk file followed by 150 symlinks (more than the pending queue holds), 200 files of mixed sizes (empty, small, two chunks) with distinct contents, a hardlink and an empty file: 2, 3, 4 and 16 workers give the single-worker archive bytes; extracting it reproduces every file, link target and the hardlink |
+| `test_create_pipeline_read_fault` | A source read fails while chunks of earlier files are in flight: `ARK_ERR_IO_READ` with `EIO`; no archive and no temporary file left |
+| `test_create_pipeline_write_fault` | An archive chunk write fails mid-tree: `ARK_ERR_IO_WRITE` with `EIO`; nothing left |
+| `test_create_pipeline_worker_fault` | A compress worker aborts chunk 3 (1 worker, symlinks queued behind it) and chunk 60 (4 workers): the worker's error is reported; nothing left |
+
 ---
 
 ## 5. Extraction Test Catalogue (`test_extract.c`)
@@ -745,6 +756,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | Ring buffer abort sentinel unblocks I/O thread | `test_thread.c` | ARCHITECTURE.md §6.3 |
 | Worker error stored before sentinel; I/O thread reads it | `test_thread.c` | ARCHITECTURE.md §6.3 |
 | Quiescence before cleanup: join completes, then filesystem ops | `test_thread.c` | ARCHITECTURE.md §14.3 |
+| Create pipeline across files: archive bytes independent of worker count; failures with chunks in flight leave nothing | `test_thread.c` | ARCHITECTURE.md §6.3 |
 | lchown before chmod on all metadata restoration paths | `test_extract.c` | ARCHITECTURE.md §14.5 |
 | chmod skipped for symlink members | `test_extract.c` | ARCHITECTURE.md §14.5 |
 | utimensat with AT_SYMLINK_NOFOLLOW for symlinks | `test_extract.c` | ARCHITECTURE.md §14.5 |

@@ -284,6 +284,10 @@ int test_no_resource_leak_on_cancel(void);
 int test_no_cleanup_race(void);
 int test_create_deterministic_single_worker(void);
 int test_create_deterministic_multi_worker_matches_single(void);
+int test_create_pipeline_matches_across_workers(void);
+int test_create_pipeline_read_fault(void);
+int test_create_pipeline_write_fault(void);
+int test_create_pipeline_worker_fault(void);
 
 int test_sha256_empty(void);
 int test_sha256_abc(void);
@@ -657,6 +661,11 @@ static const test_case_t g_tests[] = {
      test_create_deterministic_single_worker},
     {"test_create_deterministic_multi_worker_matches_single",
      test_create_deterministic_multi_worker_matches_single},
+    {"test_create_pipeline_matches_across_workers",
+     test_create_pipeline_matches_across_workers},
+    {"test_create_pipeline_read_fault", test_create_pipeline_read_fault},
+    {"test_create_pipeline_write_fault", test_create_pipeline_write_fault},
+    {"test_create_pipeline_worker_fault", test_create_pipeline_worker_fault},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_single_file", test_integration_single_file},
     {"test_integration_directory_tree", test_integration_directory_tree},

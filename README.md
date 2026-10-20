@@ -12,7 +12,8 @@ index hash, sandboxed operations, and atomic writes via vendored
 
 - Single `.ark` archive format with built-in Deflate compression
 - Per-member and index integrity verification
-- Parallel create and extract using fixed 1MB chunks
+- Parallel create and extract using fixed 1MB chunks; create keeps chunks of
+  several files in flight, so trees of small files compress in parallel too
 - Crash-safe archive writes via vendored
   [libchevron](https://github.com/pawelzelawski/libchevron)
 - Mandatory sandboxing: Landlock/seccomp-bpf on Linux, `pledge(2)` and

@@ -50,6 +50,16 @@ unsigned int pool_get_abort_event(const ark_pool_t *);
 void pool_inject_worker_error(ark_pool_t *, ark_err_t, int);
 int ark_test_create_archive(const char *, const char **, size_t, int,
                             ark_hash_alg_t, int, ark_error_t *);
+int ark_test_extract_archive(const char *, const char *, int, const char *, int,
+                             ark_error_t *);
+void ark_test_cli_fault_reset(void);
+void ark_test_cli_fault_inject(int, int, ark_err_t, int);
+
+/* Command fault points of main.c used here (same values as test_fault.c). */
+enum {
+	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE = 2,
+	ARK_CLI_FAULT_CREATE_WORKER = 6
+};
 
 typedef struct {
 	ring_buf_t *ring;
@@ -1180,4 +1190,307 @@ int test_create_deterministic_multi_worker_matches_single(void)
 	if (remove_tree(tmp) != 0)
 		return 1;
 	return rc;
+}
+
+/*
+ * write_seeded_file - Write total bytes of compressible data that differ per
+ * seed, so a chunk written for the wrong member changes the archive.
+ */
+static int write_seeded_file(const char *path, size_t total, uint32_t seed)
+{
+	uint8_t block[4096];
+	uint32_t x;
+	size_t done;
+	int fd;
+
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if (fd < 0)
+		return -1;
+	x = seed * 2654435761U + 1U;
+	done = 0U;
+	while (done < total) {
+		size_t n;
+		size_t i;
+
+		n = total - done < sizeof(block) ? total - done : sizeof(block);
+		for (i = 0U; i < n; i++) {
+			x = x * 1103515245U + 12345U;
+			block[i] = (uint8_t)('a' + ((x >> 16) & 7U));
+		}
+		if (write_full_fd(fd, block, n) != 0) {
+			(void)close(fd);
+			return -1;
+		}
+		done += n;
+	}
+	return close(fd);
+}
+
+/*
+ * pipeline_file_size - Size of c.dir/fNNN in the pipeline tree: mostly small,
+ * some empty, every 50th two chunks long.
+ */
+static size_t pipeline_file_size(unsigned int i)
+{
+	if (i % 50U == 7U)
+		return ARK_CHUNK_SIZE + 1U + i;
+	if (i % 17U == 0U)
+		return 0U;
+	return (size_t)((i * 977U) % 6000U) + 1U;
+}
+
+/*
+ * prepare_pipeline_tree - Source tree for the cross-file create pipeline.
+ *
+ * Traversal order: a.big (four chunks), 150 symlinks b000-b149 queued behind
+ * its chunks (more than the pending queue holds), c.dir with 200 files of
+ * mixed sizes, d.link (hardlink to c.dir/f001) and the empty e.empty.
+ */
+static int prepare_pipeline_tree(const char *root, char *src_dir, size_t src_sz)
+{
+	char path[1024];
+	char name[64];
+	unsigned int i;
+
+	if (path_join(src_dir, src_sz, root, "src") != 0 ||
+	    mkdir(src_dir, 0755) != 0)
+		return -1;
+	if (path_join(path, sizeof(path), src_dir, "a.big") != 0 ||
+	    write_seeded_file(path, ARK_CHUNK_SIZE * 3U + 5U, 1000U) != 0)
+		return -1;
+	for (i = 0U; i < 150U; i++) {
+		(void)snprintf(name, sizeof(name), "b%03u", i);
+		if (path_join(path, sizeof(path), src_dir, name) != 0 ||
+		    symlink("a.big", path) != 0)
+			return -1;
+	}
+	if (path_join(path, sizeof(path), src_dir, "c.dir") != 0 ||
+	    mkdir(path, 0755) != 0)
+		return -1;
+	for (i = 0U; i < 200U; i++) {
+		(void)snprintf(name, sizeof(name), "c.dir/f%03u", i);
+		if (path_join(path, sizeof(path), src_dir, name) != 0 ||
+		    write_seeded_file(path, pipeline_file_size(i), i) != 0)
+			return -1;
+	}
+	{
+		char target[1024];
+
+		if (path_join(target, sizeof(target), src_dir, "c.dir/f001") !=
+		        0 ||
+		    path_join(path, sizeof(path), src_dir, "d.link") != 0 ||
+		    link(target, path) != 0)
+			return -1;
+	}
+	if (path_join(path, sizeof(path), src_dir, "e.empty") != 0 ||
+	    write_seeded_file(path, 0U, 0U) != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * same_file_bytes - Whether two regular files have identical contents.
+ */
+static int same_file_bytes(const char *a, const char *b)
+{
+	uint8_t *a_bytes = NULL;
+	uint8_t *b_bytes = NULL;
+	size_t a_len = 0U;
+	size_t b_len = 0U;
+	int same;
+
+	same = read_file_bytes(a, &a_bytes, &a_len) == 0 &&
+	       read_file_bytes(b, &b_bytes, &b_len) == 0 && a_len == b_len &&
+	       (a_len == 0U || memcmp(a_bytes, b_bytes, a_len) == 0);
+	free(a_bytes);
+	free(b_bytes);
+	return same;
+}
+
+/*
+ * check_pipeline_extract - Extract archive into out and compare it with src.
+ */
+static int check_pipeline_extract(const char *archive, const char *src,
+                                  const char *out)
+{
+	ark_error_t err = {0};
+	char a[1024];
+	char b[1024];
+	char name[64];
+	char link_buf[64];
+	struct stat st_a;
+	struct stat st_b;
+	unsigned int i;
+
+	if (mkdir(out, 0755) != 0 ||
+	    ark_test_extract_archive(archive, out, 0, NULL, 2, &err) != 0)
+		return -1;
+	if (path_join(a, sizeof(a), src, "a.big") != 0 ||
+	    path_join(b, sizeof(b), out, "a.big") != 0 ||
+	    !same_file_bytes(a, b))
+		return -1;
+	for (i = 0U; i < 150U; i++) {
+		ssize_t n;
+
+		(void)snprintf(name, sizeof(name), "b%03u", i);
+		if (path_join(b, sizeof(b), out, name) != 0)
+			return -1;
+		n = readlink(b, link_buf, sizeof(link_buf));
+		if (n != 5 || memcmp(link_buf, "a.big", 5U) != 0)
+			return -1;
+	}
+	for (i = 0U; i < 200U; i++) {
+		(void)snprintf(name, sizeof(name), "c.dir/f%03u", i);
+		if (path_join(a, sizeof(a), src, name) != 0 ||
+		    path_join(b, sizeof(b), out, name) != 0 ||
+		    !same_file_bytes(a, b))
+			return -1;
+	}
+	if (path_join(a, sizeof(a), out, "c.dir/f001") != 0 ||
+	    path_join(b, sizeof(b), out, "d.link") != 0 ||
+	    stat(a, &st_a) != 0 || stat(b, &st_b) != 0 ||
+	    st_a.st_ino != st_b.st_ino)
+		return -1;
+	if (path_join(b, sizeof(b), out, "e.empty") != 0 ||
+	    stat(b, &st_b) != 0 || !S_ISREG(st_b.st_mode) || st_b.st_size != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * only_entry_is_src - Whether root holds nothing but "src" (no archive and no
+ * temporary file after a failed create).
+ */
+static int only_entry_is_src(const char *root)
+{
+	DIR *dir;
+	const struct dirent *de;
+	int ok = 1;
+
+	dir = opendir(root);
+	if (dir == NULL)
+		return 0;
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") != 0 &&
+		    strcmp(de->d_name, "..") != 0 &&
+		    strcmp(de->d_name, "src") != 0)
+			ok = 0;
+	}
+	(void)closedir(dir);
+	return ok;
+}
+
+int test_create_pipeline_matches_across_workers(void)
+{
+	char root[] = "/tmp/ark-thread-pipe-XXXXXX";
+	static const int workers[] = {2, 3, 4, 16};
+	char src[1024];
+	char out_one[1024];
+	char out_n[1024];
+	char out_dir[1024];
+	const char *tmp;
+	size_t i;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_pipeline_tree(tmp, src, sizeof(src)) != 0 ||
+	    path_join(out_one, sizeof(out_one), tmp, "one.ark") != 0 ||
+	    path_join(out_n, sizeof(out_n), tmp, "n.ark") != 0 ||
+	    path_join(out_dir, sizeof(out_dir), tmp, "out") != 0)
+		goto done;
+	/*
+	 * ARCHITECTURE.md section 6.3: chunks of many files are in flight at
+	 * once and still written in traversal order, so every worker count
+	 * gives the bytes of the single-worker archive.
+	 */
+	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
+		if (create_and_compare_archives(src, out_one, 1, out_n,
+		                                workers[i]) != 0)
+			goto done;
+	}
+	if (check_pipeline_extract(out_one, src, out_dir) != 0)
+		goto done;
+	rc = 0;
+
+done:
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+/*
+ * expect_pipeline_fault - Fail one create of the pipeline tree.
+ *
+ * kind >= 1000 selects a command fault (kind - 1000), otherwise a syscall
+ * fault. The create must fail with code and EIO-style errno, leaving neither
+ * an archive nor a temporary file.
+ */
+static int expect_pipeline_fault(int kind, int fail_on, int n_workers,
+                                 ark_err_t code, int errno_value)
+{
+	char root[] = "/tmp/ark-thread-pipe-XXXXXX";
+	char src[1024];
+	char archive[1024];
+	const char *sources[1];
+	const char *tmp;
+	ark_error_t err = {0};
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_pipeline_tree(tmp, src, sizeof(src)) != 0 ||
+	    path_join(archive, sizeof(archive), tmp, "fail.ark") != 0)
+		goto done;
+	sources[0] = src;
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (kind >= 1000)
+		ark_test_cli_fault_inject(kind - 1000, fail_on, code,
+		                          errno_value);
+	else
+		fault_inject(kind, fail_on, errno_value);
+	if (ark_test_create_archive(archive, sources, 1U, n_workers,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                            &err) == 0)
+		goto done;
+	if (err.code != code || err.sys_errno != errno_value)
+		goto done;
+	if (!only_entry_is_src(tmp))
+		goto done;
+	rc = 0;
+
+done:
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+int test_create_pipeline_read_fault(void)
+{
+	/* Read 30 is in c.dir, with chunks of earlier files in flight. */
+	return expect_pipeline_fault(ARK_FAULT_READ, 30, 4, ARK_ERR_IO_READ,
+	                             EIO);
+}
+
+int test_create_pipeline_write_fault(void)
+{
+	/* Archive write 1 is the header; 40 is a chunk of a c.dir file. */
+	return expect_pipeline_fault(1000 + ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
+	                             40, 4, ARK_ERR_IO_WRITE, EIO);
+}
+
+int test_create_pipeline_worker_fault(void)
+{
+	/* Chunk 3 is in a.big (symlinks queued behind it); chunk 60 is in
+	 * c.dir. */
+	if (expect_pipeline_fault(1000 + ARK_CLI_FAULT_CREATE_WORKER, 3, 1,
+	                          ARK_ERR_IO_ALLOC, ENOMEM) != 0)
+		return 1;
+	return expect_pipeline_fault(1000 + ARK_CLI_FAULT_CREATE_WORKER, 60, 4,
+	                             ARK_ERR_IO_ALLOC, ENOMEM);
 }

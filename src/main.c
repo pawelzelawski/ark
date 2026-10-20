@@ -47,6 +47,11 @@ enum {
 #endif
 
 #define ARK_MAX_WORKERS 16
+/* Result ring slots per worker: chunks finished while the I/O thread is busy
+ * wait in the ring instead of stalling their worker. */
+#define ARK_RING_SLOTS_PER_WORKER 2U
+/* Pending create members beyond one per in-flight chunk. */
+#define ARK_CREATE_PENDING_EXTRA 64U
 
 typedef enum {
 	ARK_CMD_NONE = 0,
@@ -119,19 +124,49 @@ typedef struct {
 typedef struct ark_pool ark_pool_t;
 typedef struct ark_worker_arg ark_worker_arg_t;
 
+/*
+ * create_pending_t - One member waiting for its place in the archive.
+ *
+ * chunks_left counts the member's chunks not yet written; begun is set once
+ * ark_write_member_begin has run for it.
+ */
 typedef struct {
-	char root[PATH_MAX];
-	dev_t root_dev;
+	ark_member_meta_t meta;
+	uint32_t chunks_left;
+	int begun;
+} create_pending_t;
+
+/*
+ * create_pipe_t - Create-side pipeline across files.
+ *
+ * Traversal submits chunks of several files to the pool; members and chunks
+ * are written strictly in traversal order. See ARCHITECTURE.md section 6.3.
+ */
+typedef struct {
 	ark_write_ctx_t *write_ctx;
 	chevron_handle_t *chev_handle;
 	ark_pool_t *pool;
+	const char *archive_path;
+	uint64_t *output_offset;
+	create_pending_t *pending;
+	size_t pending_cap;
+	size_t pending_head;
+	size_t pending_count;
+	uint64_t submit_seq;
+	uint64_t drain_seq;
+	size_t in_flight;
+	size_t max_in_flight;
+	uint8_t *write_buf;
+	size_t write_cap;
+} create_pipe_t;
+
+typedef struct {
+	char root[PATH_MAX];
+	dev_t root_dev;
+	create_pipe_t *pipe;
 	modified_path_list_t *modified_paths;
 	inode_table_t inodes;
 	uint8_t *input_buf;
-	uint8_t *comp_buf;
-	uint8_t *write_buf;
-	size_t comp_cap;
-	uint64_t *output_offset;
 	int permission_error;
 } traverse_ctx_t;
 
@@ -150,7 +185,8 @@ enum ark_cli_fault_which {
 	ARK_CLI_FAULT_CREATE_WRITE_ARCHIVE,
 	ARK_CLI_FAULT_CREATE_COMMIT,
 	ARK_CLI_FAULT_CREATE_MARK_MODIFIED,
-	ARK_CLI_FAULT_CLEANUP_GROW
+	ARK_CLI_FAULT_CLEANUP_GROW,
+	ARK_CLI_FAULT_CREATE_WORKER
 };
 
 static ark_cli_fault_t ark_cli_fault;
@@ -285,7 +321,8 @@ static void ring_buf_free_storage(ring_buf_t *ring, size_t n_data)
 /*
  * ring_buf_init - Allocate a fixed-size ring buffer for worker results.
  *
- * n_slots must be greater than zero and typically matches worker count.
+ * n_slots must be greater than zero; pools use ARK_RING_SLOTS_PER_WORKER
+ * slots per worker.
  *
  * Returns a new ring buffer pointer on success, NULL on error.
  * Failure details are reported through err when err is non-NULL.
@@ -916,9 +953,10 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, int level,
 
 	/*
 	 * ARCHITECTURE.md section 6.3 requires a fixed-size result ring with
-	 * one slot per worker.
+	 * ARK_RING_SLOTS_PER_WORKER slots per worker.
 	 */
-	pool->ring = ring_buf_init((size_t)n_workers, err);
+	pool->ring =
+	    ring_buf_init(ARK_RING_SLOTS_PER_WORKER * (size_t)n_workers, err);
 	if (pool->ring == NULL) {
 		(void)pthread_cond_destroy(&pool->cv_not_full);
 		(void)pthread_cond_destroy(&pool->cv_not_empty);
@@ -1094,6 +1132,26 @@ static void pool_shutdown(ark_pool_t *pool)
  *
  * See ARCHITECTURE.md section 6.3 and CODING_STANDARDS.md section 5.1.
  */
+#ifdef ARK_TEST
+/*
+ * ark_test_cli_fault_worker - Whether a compress worker fails chunk seq.
+ *
+ * fail_on_call_n is the 1-based sequence number of the failing chunk. Workers
+ * only read the fault: it is set before the pool starts and reset after the
+ * pool is joined, so no counter is shared between threads.
+ */
+static int ark_test_cli_fault_worker(uint64_t seq, ark_error_t *err)
+{
+	if (ark_cli_fault.which != ARK_CLI_FAULT_CREATE_WORKER ||
+	    ark_cli_fault.fail_on_call_n <= 0 ||
+	    seq + 1U != (uint64_t)ark_cli_fault.fail_on_call_n)
+		return 0;
+	return fail_error(err, ark_cli_fault.code,
+	                  "ARK_TEST worker fault injected", "",
+	                  ark_cli_fault.errno_value);
+}
+#endif
+
 static void *worker_compress(void *arg)
 {
 	ark_worker_arg_t *warg;
@@ -1150,6 +1208,19 @@ static void *worker_compress(void *arg)
 		                    __ATOMIC_ACQUIRE) != 0) {
 			break;
 		}
+#ifdef ARK_TEST
+		{
+			ark_error_t fault_err = {0};
+
+			if (ark_test_cli_fault_worker(work.seq, &fault_err) !=
+			    0) {
+				error_store_once(&pool->shared_err, &fault_err);
+				(void)ring_buf_abort(pool->ring, work.seq,
+				                     fault_err.code, NULL);
+				break;
+			}
+		}
+#endif
 
 		size_t out_cap;
 		uint8_t *out;
@@ -1309,8 +1380,16 @@ static int cmd_extract(const ark_args_t *, int, ark_pool_t *, ark_error_t *);
 static int cmd_list(const ark_args_t *, ark_error_t *);
 static int cmd_verify(const ark_args_t *, ark_error_t *);
 static int cmd_generate_reader(const ark_args_t *, ark_error_t *);
-static int traverse_dir(const char *, ark_write_ctx_t *, chevron_handle_t *,
-                        ark_pool_t *, uint64_t *, modified_path_list_t *,
+static int create_pipe_init(create_pipe_t *, ark_write_ctx_t *,
+                            chevron_handle_t *, ark_pool_t *, const char *,
+                            uint64_t *, ark_error_t *);
+static void create_pipe_free(create_pipe_t *);
+static int create_pipe_add(create_pipe_t *, const ark_member_meta_t *, uint32_t,
+                           ark_error_t *);
+static int create_pipe_submit(create_pipe_t *, const uint8_t *, size_t,
+                              const char *, ark_error_t *);
+static int create_pipe_flush(create_pipe_t *, ark_error_t *);
+static int traverse_dir(const char *, create_pipe_t *, modified_path_list_t *,
                         ark_error_t *);
 static int traverse_entry(traverse_ctx_t *, const char *, const char *,
                           ark_error_t *);
@@ -1710,6 +1789,7 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 	chevron_handle_t handle = CHEVRON_HANDLE_INIT;
 	chevron_error_t cerr = {0};
 	modified_path_list_t modified = {0};
+	create_pipe_t pipe = {0};
 	uint8_t header[16];
 	uint8_t *index_buf = NULL;
 	uint8_t *footer_buf = NULL;
@@ -1764,11 +1844,16 @@ static int cmd_create(const ark_args_t *args, ark_pool_t *pool,
 		goto cleanup;
 	output_offset = (uint64_t)n;
 
+	if (create_pipe_init(&pipe, wctx, &handle, pool, args->archive_path,
+	                     &output_offset, err) != 0)
+		goto cleanup;
 	for (i = 0U; i < args->create_path_count; i++) {
-		if (traverse_dir(args->create_paths[i], wctx, &handle, pool,
-		                 &output_offset, &modified, err) != 0)
+		if (traverse_dir(args->create_paths[i], &pipe, &modified,
+		                 err) != 0)
 			goto cleanup;
 	}
+	if (create_pipe_flush(&pipe, err) != 0)
+		goto cleanup;
 
 #ifdef ARK_TEST
 	if (ark_test_cli_fault_should_mark_modified()) {
@@ -1833,6 +1918,7 @@ cleanup:
 	 * sections 6.3 and 14.3.
 	 */
 	pool_shutdown(pool);
+	create_pipe_free(&pipe);
 	if (rc != 0 && opened)
 		chevron_abort(&handle);
 	free(footer_buf);
@@ -3907,7 +3993,226 @@ static int member_meta_init(ark_member_meta_t *meta, uint8_t type,
 }
 
 /*
- * emit_nonfile_member - Write a directory, symlink, or hardlink index member.
+ * create_pipe_init - Prepare the create pipeline after the header is written.
+ *
+ * At most one chunk per ring slot is in flight, so a worker never waits for
+ * a slot while the I/O thread waits for that worker. The pending queue holds
+ * every member with chunks in flight plus the members traversed after them.
+ *
+ * OWNERSHIP: pipe owns its queue and write buffer; release with
+ * create_pipe_free.
+ */
+static int create_pipe_init(create_pipe_t *pipe, ark_write_ctx_t *write_ctx,
+                            chevron_handle_t *chev_handle, ark_pool_t *pool,
+                            const char *archive_path, uint64_t *output_offset,
+                            ark_error_t *err)
+{
+	if (pool == NULL || pool->n_workers <= 0)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "create worker pool has zero workers",
+		                  archive_path, 0);
+	*pipe = (create_pipe_t){0};
+	pipe->write_ctx = write_ctx;
+	pipe->chev_handle = chev_handle;
+	pipe->pool = pool;
+	pipe->archive_path = archive_path;
+	pipe->output_offset = output_offset;
+	pipe->max_in_flight = pool->ring->n_slots;
+	pipe->pending_cap = pipe->max_in_flight + ARK_CREATE_PENDING_EXTRA;
+	pipe->write_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+	pipe->pending = calloc(pipe->pending_cap, sizeof(*pipe->pending));
+	pipe->write_buf = malloc(pipe->write_cap);
+	if (pipe->pending == NULL || pipe->write_buf == NULL) {
+		create_pipe_free(pipe);
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "create pipeline allocation failed", "", 0);
+	}
+	return 0;
+}
+
+static void create_pipe_free(create_pipe_t *pipe)
+{
+	free(pipe->write_buf);
+	free(pipe->pending);
+	pipe->write_buf = NULL;
+	pipe->pending = NULL;
+}
+
+/*
+ * create_pipe_retire - Write the queue head members that need no more chunks.
+ *
+ * A member without data (directory, symlink, hardlink, empty file) is begun
+ * and ended here; a regular member whose last chunk was written is ended.
+ * See ARCHITECTURE.md section 16.3.
+ */
+static int create_pipe_retire(create_pipe_t *pipe, ark_error_t *err)
+{
+	create_pending_t *head;
+
+	while (pipe->pending_count > 0U) {
+		head = &pipe->pending[pipe->pending_head];
+		if (head->chunks_left != 0U)
+			break;
+		if (!head->begun && ark_write_member_begin(
+		                        pipe->write_ctx, &head->meta, err) != 0)
+			return -1;
+		if (ark_write_member_end(pipe->write_ctx, err) != 0)
+			return -1;
+		pipe->pending_head =
+		    (pipe->pending_head + 1U) % pipe->pending_cap;
+		pipe->pending_count--;
+	}
+	return 0;
+}
+
+/*
+ * create_pipe_drain_one - Write the oldest in-flight chunk.
+ *
+ * The oldest chunk belongs to the queue head: chunks are submitted in
+ * traversal order and the head always has chunks left. Its data offset is the
+ * archive offset of its first chunk.
+ */
+static int create_pipe_drain_one(create_pipe_t *pipe, ark_error_t *err)
+{
+	create_pending_t *head;
+	uint8_t *slot_data;
+	size_t slot_len;
+	int slot_abort;
+	ark_err_t slot_worker_err;
+	ssize_t written;
+	int rc = -1;
+
+	if (pipe->in_flight == 0U || pipe->pending_count == 0U)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "create pipeline out of sequence", "", 0);
+	head = &pipe->pending[pipe->pending_head];
+	slot_data = NULL;
+	slot_len = 0U;
+	slot_abort = 0;
+	slot_worker_err = ARK_OK;
+	if (ring_buf_read(pipe->pool->ring, pipe->drain_seq, &slot_data,
+	                  &slot_len, &slot_abort, &slot_worker_err, err) != 0)
+		return -1;
+	if (slot_abort) {
+		if (!shared_err_get(&pipe->pool->shared_err, err))
+			(void)fail_error(
+			    err,
+			    slot_worker_err != ARK_OK ? slot_worker_err
+			                              : ARK_ERR_IO_WRITE,
+			    "create worker aborted", head->meta.path, 0);
+		goto done;
+	}
+	if (!head->begun) {
+		if (head->meta.size_original != 0U)
+			head->meta.data_offset = *pipe->output_offset;
+		if (ark_write_member_begin(pipe->write_ctx, &head->meta, err) !=
+		    0)
+			goto done;
+		head->begun = 1;
+	}
+	/*
+	 * SAFETY: ark_write_chunk is called only by the I/O path and ring
+	 * slots are drained strictly in sequence order. See ARCHITECTURE.md
+	 * sections 6.3 and 16.3.
+	 */
+	written = ark_write_chunk(pipe->write_ctx, slot_data, slot_len,
+	                          pipe->write_buf, pipe->write_cap, err);
+	if (written < 0)
+		goto done;
+	if (chevron_write_or_fail(pipe->chev_handle, pipe->write_buf,
+	                          (size_t)written, pipe->archive_path,
+	                          err) != 0)
+		goto done;
+	if (UINT64_MAX - *pipe->output_offset < (uint64_t)written) {
+		(void)fail_error(err, ARK_ERR_USAGE, "archive offset overflow",
+		                 pipe->archive_path, 0);
+		goto done;
+	}
+	*pipe->output_offset += (uint64_t)written;
+	head->chunks_left--;
+	rc = 0;
+
+done:
+	ring_buf_release(pipe->pool->ring, pipe->drain_seq);
+	if (rc != 0)
+		return -1;
+	pipe->drain_seq++;
+	pipe->in_flight--;
+	return create_pipe_retire(pipe, err);
+}
+
+/*
+ * create_pipe_add - Queue one member in traversal order.
+ *
+ * chunks is the member's chunk count; a regular member's chunks follow
+ * through create_pipe_submit. Members with no chunks are written as soon as
+ * all members before them are.
+ */
+static int create_pipe_add(create_pipe_t *pipe, const ark_member_meta_t *meta,
+                           uint32_t chunks, ark_error_t *err)
+{
+	create_pending_t *slot;
+
+	while (pipe->pending_count == pipe->pending_cap) {
+		/* A full queue always has chunks in flight: the head would
+		 * otherwise have been retired. */
+		if (create_pipe_drain_one(pipe, err) != 0)
+			return -1;
+	}
+	slot = &pipe->pending[(pipe->pending_head + pipe->pending_count) %
+	                      pipe->pending_cap];
+	slot->meta = *meta;
+	slot->chunks_left = chunks;
+	slot->begun = 0;
+	pipe->pending_count++;
+	return create_pipe_retire(pipe, err);
+}
+
+/*
+ * create_pipe_submit - Hand one chunk of the newest member to the pool.
+ *
+ * Waits for and writes the oldest chunk while max_in_flight chunks are in
+ * flight. src is copied by pool_submit and may be reused on return.
+ */
+static int create_pipe_submit(create_pipe_t *pipe, const uint8_t *src,
+                              size_t len, const char *path, ark_error_t *err)
+{
+	while (pipe->in_flight >= pipe->max_in_flight) {
+		if (create_pipe_drain_one(pipe, err) != 0)
+			return -1;
+	}
+	if (pool_submit(pipe->pool, pipe->submit_seq, src, len) != 0) {
+		if (!shared_err_get(&pipe->pool->shared_err, err))
+			(void)fail_error(err, ARK_ERR_IO_WRITE,
+			                 "create worker submit failed", path,
+			                 0);
+		return -1;
+	}
+	pipe->submit_seq++;
+	pipe->in_flight++;
+	return 0;
+}
+
+/*
+ * create_pipe_flush - Write every chunk and member still queued.
+ */
+static int create_pipe_flush(create_pipe_t *pipe, ark_error_t *err)
+{
+	while (pipe->in_flight > 0U) {
+		if (create_pipe_drain_one(pipe, err) != 0)
+			return -1;
+	}
+	if (create_pipe_retire(pipe, err) != 0)
+		return -1;
+	if (pipe->pending_count != 0U)
+		return fail_error(
+		    err, ARK_ERR_USAGE, "regular member chunk count mismatch",
+		    pipe->pending[pipe->pending_head].meta.path, 0);
+	return 0;
+}
+
+/*
+ * emit_nonfile_member - Queue a directory, symlink, or hardlink index member.
  *
  * Non-file members have no data body; ark_write_member_end finalizes the hash
  * of the empty byte sequence. See ARCHITECTURE.md sections 5.2 and 16.3.
@@ -3915,9 +4220,7 @@ static int member_meta_init(ark_member_meta_t *meta, uint8_t type,
 static int emit_nonfile_member(traverse_ctx_t *ctx,
                                const ark_member_meta_t *meta, ark_error_t *err)
 {
-	if (ark_write_member_begin(ctx->write_ctx, meta, err) != 0)
-		return -1;
-	return ark_write_member_end(ctx->write_ctx, err);
+	return create_pipe_add(ctx->pipe, meta, 0U, err);
 }
 
 /*
@@ -3942,11 +4245,12 @@ static int chevron_write_or_fail(chevron_handle_t *handle, const void *buf,
 }
 
 /*
- * emit_regular_file - Compress and write one regular-file member.
+ * emit_regular_file - Read one regular file and queue its member and chunks.
  *
- * Single-threaded Phase 5 compression happens directly in traversal. The
- * per-chunk buffers are traversal-owned and allocated before this hot path.
- * See ARCHITECTURE.md sections 13.1 and 16.3.
+ * The file is read on the I/O thread in ARK_CHUNK_SIZE pieces; each piece
+ * goes to the worker pool and is written later, in order, by the create
+ * pipeline. The read buffer is traversal-owned and allocated before this hot
+ * path. See ARCHITECTURE.md sections 6.3, 13.1 and 16.3.
  */
 static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
                              const char *member_path, const struct stat *sb,
@@ -3955,20 +4259,12 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	ark_member_meta_t meta;
 	struct stat meta_sb;
 	ssize_t n;
-	ssize_t written;
 	uint64_t remaining;
-	uint64_t submit_seq;
-	uint64_t drain_seq;
+	uint64_t chunks;
 	size_t want;
 	size_t got;
-	size_t in_flight;
-	size_t max_in_flight;
 	int fd = -1;
 	int rc = -1;
-	uint8_t *slot_data;
-	size_t slot_len;
-	int slot_abort;
-	ark_err_t slot_worker_err;
 
 	if (sb->st_size < 0)
 		return fail_error(err, ARK_ERR_IO_READ, "negative file size",
@@ -3976,8 +4272,11 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 	if (member_meta_init(&meta, 0x01U, member_path, sb, err) != 0)
 		return -1;
 	meta.size_original = (uint64_t)sb->st_size;
-	if (meta.size_original != 0U)
-		meta.data_offset = *ctx->output_offset;
+	chunks = meta.size_original / ARK_CHUNK_SIZE +
+	         (meta.size_original % ARK_CHUNK_SIZE != 0U ? 1U : 0U);
+	if (chunks > UINT32_MAX)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "regular member too large", abs_path, 0);
 
 	/*
 	 * SAFETY: O_NOFOLLOW is required on extraction output
@@ -3995,25 +4294,10 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 		                  "member file open failed", abs_path, errno);
 	}
 
-	if (ark_write_member_begin(ctx->write_ctx, &meta, err) != 0)
+	if (create_pipe_add(ctx->pipe, &meta, (uint32_t)chunks, err) != 0)
 		goto cleanup;
 
-	/*
-	 * SAFETY: input, compression, and write buffers are allocated by
-	 * traverse_dir before entering the per-chunk loop; no hot-path
-	 * allocation.
-	 */
 	remaining = meta.size_original;
-	submit_seq = 0U;
-	drain_seq = 0U;
-	in_flight = 0U;
-	max_in_flight = (size_t)ctx->pool->n_workers;
-	if (max_in_flight == 0U) {
-		rc = fail_error(err, ARK_ERR_USAGE,
-		                "create worker pool has zero workers", abs_path,
-		                0);
-		goto cleanup;
-	}
 	while (remaining > 0U) {
 		want = remaining > (uint64_t)ARK_CHUNK_SIZE
 		           ? (size_t)ARK_CHUNK_SIZE
@@ -4037,109 +4321,10 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			}
 			got += (size_t)n;
 		}
-
-		if (pool_submit(ctx->pool, submit_seq, ctx->input_buf, want) !=
-		    0) {
-			if (!shared_err_get(&ctx->pool->shared_err, err))
-				rc = fail_error(err, ARK_ERR_IO_WRITE,
-				                "create worker submit failed",
-				                abs_path, 0);
+		if (create_pipe_submit(ctx->pipe, ctx->input_buf, want,
+		                       abs_path, err) != 0)
 			goto cleanup;
-		}
-		submit_seq++;
-		in_flight++;
-
-		while (in_flight >= max_in_flight) {
-			slot_data = NULL;
-			if (ring_buf_read(ctx->pool->ring, drain_seq,
-			                  &slot_data, &slot_len, &slot_abort,
-			                  &slot_worker_err, err) != 0)
-				goto cleanup;
-			if (slot_abort) {
-				if (!shared_err_get(&ctx->pool->shared_err,
-				                    err))
-					(void)fail_error(
-					    err,
-					    slot_worker_err != ARK_OK
-					        ? slot_worker_err
-					        : ARK_ERR_IO_WRITE,
-					    "create worker aborted", abs_path,
-					    0);
-				ring_buf_release(ctx->pool->ring, drain_seq);
-				goto cleanup;
-			}
-			/*
-			 * SAFETY: ark_write_chunk is called only by the I/O
-			 * path and ring slots are drained strictly in sequence
-			 * order. See ARCHITECTURE.md sections 6.3 and 16.3.
-			 */
-			written =
-			    ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
-			                    ctx->write_buf, ctx->comp_cap, err);
-			if (written < 0) {
-				ring_buf_release(ctx->pool->ring, drain_seq);
-				goto cleanup;
-			}
-			if (chevron_write_or_fail(
-			        ctx->chev_handle, ctx->write_buf,
-			        (size_t)written, abs_path, err) != 0) {
-				ring_buf_release(ctx->pool->ring, drain_seq);
-				goto cleanup;
-			}
-			if (UINT64_MAX - *ctx->output_offset <
-			    (uint64_t)written) {
-				ring_buf_release(ctx->pool->ring, drain_seq);
-				rc = fail_error(err, ARK_ERR_USAGE,
-				                "archive offset overflow",
-				                abs_path, 0);
-				goto cleanup;
-			}
-			*ctx->output_offset += (uint64_t)written;
-			ring_buf_release(ctx->pool->ring, drain_seq);
-			drain_seq++;
-			in_flight--;
-		}
 		remaining -= want;
-	}
-	while (in_flight > 0U) {
-		slot_data = NULL;
-		if (ring_buf_read(ctx->pool->ring, drain_seq, &slot_data,
-		                  &slot_len, &slot_abort, &slot_worker_err,
-		                  err) != 0)
-			goto cleanup;
-		if (slot_abort) {
-			if (!shared_err_get(&ctx->pool->shared_err, err))
-				(void)fail_error(err,
-				                 slot_worker_err != ARK_OK
-				                     ? slot_worker_err
-				                     : ARK_ERR_IO_WRITE,
-				                 "create worker aborted",
-				                 abs_path, 0);
-			ring_buf_release(ctx->pool->ring, drain_seq);
-			goto cleanup;
-		}
-		written = ark_write_chunk(ctx->write_ctx, slot_data, slot_len,
-		                          ctx->write_buf, ctx->comp_cap, err);
-		if (written < 0) {
-			ring_buf_release(ctx->pool->ring, drain_seq);
-			goto cleanup;
-		}
-		if (chevron_write_or_fail(ctx->chev_handle, ctx->write_buf,
-		                          (size_t)written, abs_path,
-		                          err) != 0) {
-			ring_buf_release(ctx->pool->ring, drain_seq);
-			goto cleanup;
-		}
-		if (UINT64_MAX - *ctx->output_offset < (uint64_t)written) {
-			ring_buf_release(ctx->pool->ring, drain_seq);
-			rc = fail_error(err, ARK_ERR_USAGE,
-			                "archive offset overflow", abs_path, 0);
-			goto cleanup;
-		}
-		*ctx->output_offset += (uint64_t)written;
-		ring_buf_release(ctx->pool->ring, drain_seq);
-		drain_seq++;
-		in_flight--;
 	}
 
 	/*
@@ -4162,9 +4347,6 @@ static int emit_regular_file(traverse_ctx_t *ctx, const char *abs_path,
 			goto cleanup;
 		}
 	}
-
-	if (ark_write_member_end(ctx->write_ctx, err) != 0)
-		goto cleanup;
 	rc = 0;
 
 cleanup:
@@ -4491,13 +4673,11 @@ static int traverse_entry(traverse_ctx_t *ctx, const char *abs_path,
  * from all descendant member paths, and walks directories depth-first in
  * deterministic byte order. Returns 0 on success or -1 with err populated.
  *
- * Preconditions: write_ctx is initialized, header has been written, and
- * chev_handle is an active libchevron streaming handle. See ARCHITECTURE.md
- * sections 13.1, 13.2, 13.6, and 16.3.
+ * Preconditions: the header has been written and pipe is initialized; members
+ * may still be queued in pipe on return. See ARCHITECTURE.md sections 13.1,
+ * 13.2, 13.6, and 16.3.
  */
-static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
-                        chevron_handle_t *chev_handle, ark_pool_t *pool,
-                        uint64_t *output_offset,
+static int traverse_dir(const char *src_path, create_pipe_t *pipe,
                         modified_path_list_t *modified_paths, ark_error_t *err)
 {
 	traverse_ctx_t ctx;
@@ -4506,14 +4686,10 @@ static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 	int rc = -1;
 
 	ctx = (traverse_ctx_t){0};
-	ctx.write_ctx = write_ctx;
-	ctx.chev_handle = chev_handle;
-	ctx.pool = pool;
-	ctx.output_offset = output_offset;
+	ctx.pipe = pipe;
 	ctx.modified_paths = modified_paths;
 
-	if (src_path == NULL || write_ctx == NULL || chev_handle == NULL ||
-	    pool == NULL || output_offset == NULL || modified_paths == NULL)
+	if (src_path == NULL || pipe == NULL || modified_paths == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
 		                  "invalid traversal argument", "", 0);
 	if (ARK_REALPATH(src_path, ctx.root) == NULL)
@@ -4527,13 +4703,9 @@ static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 
 	if (inode_table_init(&ctx.inodes, err) != 0)
 		goto cleanup;
-	/* OWNERSHIP: traversal owns chunk buffers and frees them at cleanup. */
+	/* OWNERSHIP: traversal owns the read buffer and frees it at cleanup. */
 	ctx.input_buf = malloc(ARK_CHUNK_SIZE);
-	ctx.comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
-	ctx.comp_buf = malloc(ctx.comp_cap);
-	ctx.write_buf = malloc(ctx.comp_cap);
-	if (ctx.input_buf == NULL || ctx.comp_buf == NULL ||
-	    ctx.write_buf == NULL) {
+	if (ctx.input_buf == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "traversal buffer allocation failed", "", 0);
 		goto cleanup;
@@ -4561,8 +4733,6 @@ static int traverse_dir(const char *src_path, ark_write_ctx_t *write_ctx,
 	rc = 0;
 
 cleanup:
-	free(ctx.write_buf);
-	free(ctx.comp_buf);
 	free(ctx.input_buf);
 	inode_table_free(&ctx.inodes);
 	return rc;

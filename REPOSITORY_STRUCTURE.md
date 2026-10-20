@@ -309,6 +309,13 @@ src/
                         #   traverse_dir()        - depth-first directory walk
                         #   traverse_entry()      - process one directory entry
                         #
+                        # Create pipeline (chunks of several files in flight):
+                        #   create_pipe_add()     - queue a member in traversal
+                        #                           order
+                        #   create_pipe_submit()  - hand one chunk to the pool
+                        #   create_pipe_flush()   - write all queued chunks and
+                        #                           members, in order
+                        #
                         # Ring buffer:
                         #   ring_buf_init()       - initialise fixed-size ring buffer
                         #   ring_buf_write()      - worker: write compressed result
@@ -442,8 +449,11 @@ tests/
 │                           #   reads error and proceeds to cancel+join.
 │                           # Cancellation: flag set, workers exit cleanly,
 │                           #   join completes, no resource leak.
+│                           # Create pipeline: archive bytes equal across
+│                           #   worker counts; read, write and worker faults
+│                           #   with chunks of several files in flight.
 │                           # TSan required at phase boundary.
-│                           # See TESTING.md §3.5.
+│                           # See TESTING.md §4.
 │
 ├── test_extract.c          # Extraction correctness tests.
 │                           # Path validation: all sixteen §8.3 checks,
@@ -691,6 +701,9 @@ Checks: >
 | `ring_buf_free` | `src/main.c` | Internal; release ring buffer |
 | `traverse_dir` | `src/main.c` | Internal; depth-first directory walk |
 | `traverse_entry` | `src/main.c` | Internal; process one directory entry |
+| `create_pipe_add` | `src/main.c` | Internal; queue a create member in order |
+| `create_pipe_submit` | `src/main.c` | Internal; submit one create chunk |
+| `create_pipe_flush` | `src/main.c` | Internal; write all queued chunks and members |
 | `cleanup_track` | `src/main.c` | Internal; register created object |
 | `cleanup_created` | `src/main.c` | Internal; remove all tracked objects |
 | `sandbox_apply` | `src/main.c` | Internal; pledge/Landlock per subcommand |

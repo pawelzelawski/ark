@@ -559,6 +559,19 @@ called from worker threads. This model keeps all shared context mutation
 inside the single I/O thread and keeps parallelism entirely within
 `main.c`.
 
+**Pipelining across files (create).** The I/O thread submits each chunk as
+soon as it has read it and does not wait for a file's chunks before reading
+the next file, so chunks of several files are in flight at once; a tree of
+files under 1 MiB (one chunk each) keeps every worker busy. Members enter a
+pending queue in traversal order. A regular member is begun
+(`ark_write_member_begin`, with `data_offset` set to the archive offset of its
+first chunk) when that chunk is drained and ended after its last chunk.
+Members without data (directories, symlinks, hardlinks, empty files) are begun
+and ended as soon as every member before them is complete. The index order,
+the offsets and therefore the archive bytes are the same for every worker
+count. The change check of §13.4 runs when a file has been read, before its
+last chunk is necessarily written.
+
 **Decompression threading model (extract).** The extract path is symmetric
 with the create path. Worker threads call `ark_deflate_dec_oneshot` directly
 from `deflate.h`. Workers never call `ark_read_chunk`. `ark_read_ctx_t` is
@@ -582,10 +595,16 @@ signal failure only by writing an abort sentinel to their ring buffer slot.
 in input order regardless of completion order. Worker threads write
 completed chunks into the ring buffer indexed by chunk sequence number.
 The I/O thread drains the ring buffer in sequence order, blocking
-when the next expected chunk is not yet complete. This bounds the
-reordering buffer to a fixed number of in-flight chunks (one per worker
-thread) and prevents unbounded memory growth regardless of archive size
-or member count.
+when the next expected chunk is not yet complete. The ring has two slots per
+worker (`ARK_RING_SLOTS_PER_WORKER`): chunks finished while the I/O thread is
+reading wait there instead of stalling their worker. Create keeps at most one
+chunk per ring slot in flight, so a worker never waits for a slot the I/O
+thread has not drained; extract keeps one chunk per worker in flight. The
+create pending queue holds one member per in-flight chunk plus 64
+(`ARK_CREATE_PENDING_EXTRA`); when it is full the I/O thread first writes the
+oldest chunk, which always belongs to the queue head. This bounds the
+reordering buffer to a fixed number of in-flight chunks and members and
+prevents unbounded memory growth regardless of archive size or member count.
 
 **Cancellation.** The thread pool must support a cancellation signal. On
 any fatal error during a parallel operation (create or extract), the I/O
@@ -1980,7 +1999,10 @@ goals.
 ### 13.4 Files Modified During Archiving
 
 After reading each file, the writer `fstat`s the fd and compares `mtime`
-and `st_size` against values recorded before reading began.
+and `st_size` against values recorded before reading began. With pipelining
+(§6.3) this happens when the file's last chunk has been read, possibly before
+it has been compressed and written; the outcome is the same, since no archive
+is committed while a change is recorded.
 
 If a modification is detected:
 1. A warning is emitted immediately to stderr identifying the offending path
