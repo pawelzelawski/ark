@@ -122,15 +122,19 @@ recovery reader and extract the archive:
 
 ```sh
 cc -O2 recovery.c -o recover
-./recover archive.ark
+mkdir out && cd out && ../recover ../archive.ark
 ```
 
-The generated file includes a Deflate decompressor, BLAKE3 and SHA-256
-implementations, archive read logic, and a minimal extraction program. It
-extracts into the current directory, never follows a symbolic link in a
-member's path, and needs memory for the archive index plus about 2 MiB,
-whatever the archive size. See `ARCHITECTURE.md` section 15 for the full
-recovery model.
+The generated file opens with a description of the whole format, enough to
+recover the data by hand, and includes a Deflate decompressor, BLAKE3 and
+SHA-256 implementations, archive read logic, and an extraction program. It
+checks the archive exactly as `ark` does before writing anything (exit
+status 2 if the archive is rejected), extracts into the current directory
+without replacing existing files or following a symbolic link in a member's
+path, restores mode and mtime, and needs memory for the archive index plus
+about 2 MiB, whatever the archive size. If a member is damaged, recovery
+stops there and keeps the members already recovered. See `ARCHITECTURE.md`
+section 15 for the full recovery model.
 
 ## Format overview
 

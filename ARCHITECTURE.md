@@ -1879,9 +1879,10 @@ ark generate-reader [output.c]
 - `output.c` - path to write the recovery reader source; defaults to
   `recovery.c` in the current working directory if not specified
 - Produces a single self-contained C11 source file containing: Deflate
-  decompressor, both BLAKE3 and SHA-256 implementations, archive read path,
-  minimal extraction main(), and a large comment block covering format
-  description, field layout, compilation instructions, and recovery procedure
+  decompressor, both BLAKE3 and SHA-256 implementations, archive read path
+  with the §8.3 checks, extraction main(), and a large comment block
+  covering format description, field layout, compilation instructions,
+  recovery procedure and design rationale (§15.2)
 - No flags beyond the optional output path argument
 
 ### 12.3 Default Behaviour
@@ -2455,8 +2456,8 @@ The generated file contains:
 - Deflate decompressor (read path only; no compressor)
 - BLAKE3 implementation (sequential mode)
 - SHA-256 implementation
-- Archive read path (no write path)
-- Minimal extraction `main()` with no external dependencies beyond libc
+- Archive read path with the index checks of §8.3 (no write path)
+- Extraction `main()` with no external dependencies beyond libc
 
 Both hash implementations are always included regardless of which algorithm
 a specific archive uses. This produces one recovery file that handles all
@@ -2464,29 +2465,59 @@ ark archives, regardless of the hash algorithm selected at creation time.
 The ~200-250 line cost of including both is accepted in exchange for
 universal applicability.
 
-The generated file is approximately 2,200-2,700 lines of C11. It compiles
-with any C11 compiler on a POSIX.1-2008 system:
-`cc -O2 recovery.c -o recover && ./recover archive.ark`. The reader needs
-POSIX.1-2008 for its file operations (`openat`, `mkdirat`, `symlinkat`,
-`linkat`, `unlinkat`, `fstatat`, `pread`, `O_NOFOLLOW`, `O_DIRECTORY`,
+The generated file is about 2,300 lines of C11, including the 160-line
+format description. It compiles with any C11 compiler on a POSIX.1-2008
+system: `cc -O2 recovery.c -o recover && ./recover archive.ark`. The reader
+needs POSIX.1-2008 for its file operations (`openat`, `mkdirat`,
+`symlinkat`, `linkat`, `unlinkat`, `fstatat`, `fchmod`, `fchown`,
+`fchownat`, `futimens`, `utimensat`, `pread`, `O_NOFOLLOW`, `O_DIRECTORY`,
 `O_CLOEXEC`), so the generated source defines `_POSIX_C_SOURCE 200809L`
 before its first `#include`; a strict `cc -std=c11 -Wall -Wextra -Wpedantic`
 build then needs no extra flags. It also defines `_FILE_OFFSET_BITS 64`, so
 32-bit systems read archives over 2 GiB with a 64-bit `off_t`.
 
-**Reader extraction and memory.** The reader extracts into the current
-directory, held as a directory fd. For each member it opens the parent
-directories one component at a time with `openat(O_DIRECTORY | O_NOFOLLOW)`,
-creating missing ones with mode 0700, and creates the member relative to its
-parent's fd (`openat`, `mkdirat`, `symlinkat`, `linkat`; a hardlink's target
-is resolved the same way). A symlink, or anything that is not a directory, in
-a parent component therefore fails the recovery instead of being followed;
-an existing directory is reused only when it is a real directory; a regular
-file is opened with `O_NOFOLLOW`. The archive is read with `pread` in
-pieces: the header, the footer, the index, then one compressed chunk at a
-time (at most 1,048,662 bytes, `ark_deflate_bound` of a 1 MiB chunk, as
-`ark extract` enforces). Memory is the index plus about 2 MiB of chunk
-buffers, independent of the archive size.
+**Reader validation.** Before any filesystem change the reader applies the
+footer checks that `main.c` makes before `ark_read_init` and checks 1-9 and
+11-16 of §8.3 (check 10 belongs to selective extraction, which the reader
+does not offer; check 9 implies it), with ark's verdict: an archive that ark
+rejects makes the reader exit with status 2 and write nothing. While
+extracting it checks each chunk as ark does (valid Deflate under the §7.4
+rules, nothing after the final block, exact length) and each file's hash.
+The integration test `test_integration_generate_reader_index_differential`
+runs the same indexes through both readers: one structured case per check
+and a flip of every byte of a reference index.
+
+**Reader extraction.** The reader extracts into the current directory, held
+as a directory fd. For each member it opens the parent directories one
+component at a time with `openat(O_DIRECTORY | O_NOFOLLOW)` and creates the
+member relative to its parent's fd (`openat`, `mkdirat`, `symlinkat`,
+`linkat`; a hardlink's target is resolved the same way). Every parent is an
+earlier directory member (check 9), so it already exists; a symlink, or
+anything that is not a directory, in a parent component fails the recovery
+instead of being followed. Existing objects are handled like `ark extract`
+without `--overwrite`: an existing real directory is reused for a directory
+member; any other object already at a member path fails that member (a
+regular file is opened with `O_CREAT | O_EXCL | O_NOFOLLOW`), and nothing is
+ever replaced or written through. Metadata follows §14.5: a regular file
+gets owner (root only, before the mode), mode masked to 0777 and mtime on
+its open fd, and a failure there fails the member; a symlink gets its own
+owner and mtime, best effort; directories get theirs after all members, in
+reverse index order, with failures reported as warnings.
+
+**Reader failure policy.** Unlike `ark extract` (§14.3, which removes
+everything it created), the reader keeps what it has recovered: the first
+failing member stops the run with exit status 1, members extracted before it
+stay (each one complete and verified), and the failing member's file, which
+the reader created itself, is removed. Directory metadata is then not
+applied, so the partial tree stays accessible. The reader's purpose is to
+salvage data from archives that may be damaged; ark's all-or-nothing rule
+protects the caller of a normal extraction instead.
+
+**Reader memory.** The archive is read with `pread` in pieces: the header,
+the footer, the index, then one compressed chunk at a time (at most
+1,048,662 bytes, `ark_deflate_bound` of a 1 MiB chunk, as `ark extract`
+enforces). Memory is the index plus about 2 MiB of chunk buffers,
+independent of the archive size.
 
 **Endian neutrality.** The ark format is strictly little-endian throughout.
 The generated `recovery.c` must parse all multi-byte integer fields using
@@ -2508,38 +2539,35 @@ platform-specific headers. The recovery reader must be compilable and
 correct on any architecture, including future big-endian systems, without
 modification.
 
-### 15.3 Build-Time Amalgamation
+### 15.3 Reader Source
 
-The recovery reader is produced at build time by an amalgamation script
-(`tools/make_recovery.sh`) that:
-- Takes the decompressor half of `deflate.c`, `blake3.c`, `sha256.c`, the
-  read path of `archive.c`, and `recover_main.c`
-- Inlines all internal `#include` references
-- Strips the compressor from `deflate.c` and the write path from `archive.c`
-- Prepends the comment block
-- Produces a single `recovery.c` amalgamation
+The recovery reader is one hand-maintained source file,
+`src/recovery_template.c`, not an amalgamation of the library sources
+(decided in the v1.2 round; earlier versions of this section described a
+`tools/make_recovery.sh` amalgamation script that was never written). It
+carries its own copies of what it needs: a one-shot, table-driven Deflate
+decoder, sequential BLAKE3 and SHA-256 in portable C, the archive read path
+with the §8.3 checks, and the extraction `main()`. The copies stay simple on
+purpose: the file must build alone with any C11 compiler decades from now,
+and its speed does not matter. The library's speed work (single-pass
+compressor, streaming, hardware and SIMD hash backends) does not reach it.
 
-The amalgamation is then converted to a C byte array using `xxd -i`, producing
-`recovery_blob.h` containing `static const unsigned char ark_recovery_src[]`
-and its length. This header is compiled into the ark binary as a static
-constant. `ark generate-reader` at runtime writes this byte array to the
-output file.
+The Makefile turns the file into a byte array
+(`build/recovery_template_data.h`, made with `od` and `awk`, included by
+`main.c` only), and `ark generate-reader` writes those bytes out unchanged.
+ark never compiles or runs the reader itself; the tests do.
 
-A `make recovery.c` build target produces the amalgamation for inspection.
-The modular sources are always the ground truth. The amalgamation and the
-embedded blob are derived artifacts and are never edited directly.
+**Keeping the copies in step.** The template is a second implementation of
+the read side of the format, so every change to what ark accepts is made in
+both places: the decoder's strictness rules (§7.4, e.g. code 284 with extra
+value 31, distances, incomplete codes, bytes after the final block), the
+index checks (§8.3) and the hash algorithms. The integration tests hold the
+two together: the index differential test (§15.2), recovery of ark-built
+trees of every member type, hand-built fixtures for the decoder rules, and
+the strict C11 build with every compiler available.
 
-**deflate.c internal boundary.** The amalgamation script strips the
-compressor from `deflate.c` and retains only the decompressor. This requires
-that all symbols, tables, and constants used exclusively by the decompressor
-are not defined only within the compressor section. The implementation must
-maintain a clean internal boundary between compressor and decompressor code
-within `deflate.c`, such that the decompressor-only subset compiles and
-links correctly as a standalone unit. This is a hard implementation
-requirement, not a style preference.
-
-**Size overhead:** approximately 60-70KB of C source text embedded in the
-ark binary. This is negligible for a systems tool.
+**Size overhead:** about 64 KB of C source text embedded in the ark binary,
+negligible for a systems tool.
 
 ### 15.4 Preservation Guidance
 
@@ -2577,9 +2605,8 @@ is entirely visible in `main.c`. Auditability: `archive.c` is a pure format
 component readable in isolation. Performance: parallelism is owned and visible
 in `main.c` where I/O and threading decisions belong together.
 
-`archive.c` is included in the `ark generate-reader` amalgamation (read path
-only). Its zero-I/O discipline makes this inclusion clean: the recovery
-reader's `main()` owns all I/O without entanglement from `archive.c`.
+The recovery reader (§15.3) does not include `archive.c`; it carries its own
+read path with the same checks, and its `main()` owns all of its I/O.
 
 **Context state after error.** When any `ark_write_*` or `ark_read_*`
 function returns -1, the context is in an indeterminate state. The only
@@ -2988,8 +3015,6 @@ all v1 format invariants. In particular, the following must not change:
 - public Deflate API contract in `deflate.h` (see §7.4); it changes only by
   an explicit design decision recorded there (the caller-owned encoder of
   the v1.2 round is one), never as a side effect of an optimisation
-- decompressor/compiler boundary required by recovery amalgamation
-  (`deflate.c` decompressor subset remains standalone; see §15.3)
 
 Within those constraints, the implementation may improve Huffman code-length
 assignment quality, dynamic-header coding efficiency, parsing-pass count,

@@ -241,9 +241,13 @@ src/
 │                       #   binary directly; embedded as a byte array via
 │                       #   the Makefile build step (see §6).
 │                       #
-│                       # Implements: footer parsing, index parsing and
-│                       #   hash verification, member extraction to stdout.
-│                       # Uses only libc. No platform dependencies.
+│                       # Opens with a description of the whole format.
+│                       # Implements: header/footer parsing, index hash
+│                       #   verification and the index checks of
+│                       #   ARCHITECTURE.md §8.3 (same verdict as ark), its
+│                       #   own Deflate decoder, BLAKE3 and SHA-256, and
+│                       #   extraction into the current directory.
+│                       # Uses only libc and POSIX.1-2008.
 │                       # Byte-by-byte little-endian field reads throughout
 │                       #   (no host-endian struct casts). Compilable on any
 │                       #   host byte order. See ARCHITECTURE.md §15.
@@ -486,7 +490,8 @@ tests/
                             #   mixed member types, hardlinks and symlinks,
                             #   round-trip hash identity, --overwrite,
                             #   selective extraction via --member,
-                            #   generate-reader output compiles and runs.
+                            #   generate-reader output compiles and runs, and
+                            #   its index checks match ark_read_index.
                             # See TESTING.md §6.
 ```
 
@@ -547,17 +552,20 @@ the SIMD lane tests).
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates
-`build/recovery_template_data.h` at build time using a portable awk one-liner
-that wraps the file content as a `static const unsigned char` array. This
-header is included by `main.c` only. The awk step requires no tools beyond
-what is present on any POSIX system.
+`build/recovery_template_data.h` at build time with `od` and `awk`, which
+wrap the file content as a `static const unsigned char` array. This header is
+included by `main.c` only. The step needs no tools beyond what is present on
+any POSIX system.
 
 ```makefile
-build/recovery_template_data.h: src/recovery_template.c
-	awk 'BEGIN { print "static const unsigned char recovery_template[] = {" }
-	     { for (i=1; i<=length($0); i++) printf "0x%02x,", ord(substr($0,i,1))
-	       printf "0x0a," }
-	     END { print "0x00 };" }' $< > $@
+$(RECOVERY_HEADER): src/recovery_template.c
+	@mkdir -p $(BUILD_DIR)
+	{ \
+		echo "static const unsigned char recovery_template[] = {"; \
+		od -An -v -tx1 src/recovery_template.c | \
+		awk '{ for (i = 1; i <= NF; i++) printf "0x%s,", $$i; print "" }'; \
+		echo "0x00};"; \
+	} > $(RECOVERY_HEADER)
 ```
 
 `make install` installs exactly two artefacts:

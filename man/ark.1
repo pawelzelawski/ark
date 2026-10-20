@@ -130,10 +130,16 @@ Print each member path as it is verified.
 Write a standalone C11 recovery reader.
 It builds with any C11 compiler on a POSIX.1-2008 system, including a strict
 .Fl std=c11
-build.
-The reader extracts into the current directory, never follows a symbolic
-link in a member's path, and needs memory for the archive index plus about
-2 MiB, whatever the archive size.
+build, and its opening comment describes the whole archive format.
+The reader checks an archive as
+.Nm
+does before writing anything and exits with status 2 if it rejects it.
+It extracts into the current directory without replacing existing files or
+following a symbolic link in a member's path, restores mode and mtime, and
+needs memory for the archive index plus about 2 MiB, whatever the archive
+size.
+If a member is damaged, recovery stops with status 1 and keeps the members
+already recovered.
 If
 .Ar output.c
 is omitted, the output path is

@@ -6,6 +6,8 @@
  * process-wide sandbox state from ARCHITECTURE.md sections 6.3 and 10.4 cannot
  * leak into the test harness.
  */
+#include "archive.h"
+#include "blake3.h"
 #include "deflate.h"
 #include <dirent.h>
 #include <errno.h>
@@ -164,6 +166,8 @@ size_t test_archive_one_chunk(uint8_t *, size_t, const uint8_t *, size_t,
                               uint64_t, size_t *);
 size_t test_archive_one_chunk_at(uint8_t *, size_t, const char *,
                                  const uint8_t *, size_t, uint64_t, size_t *);
+/* Defined in test_deflate.c. */
+ssize_t test_deflate_compress(const uint8_t *, size_t, uint8_t *, size_t, int);
 
 /* Write len bytes to a new file at path. Returns 0 on success, -1 on error. */
 static int write_bytes_file(const char *path, const uint8_t *buf, size_t len)
@@ -1306,12 +1310,12 @@ static int dir_is_empty(const char *path)
 }
 /*
  * test_integration_generate_reader_no_follow_parent - The recovery reader
- * never follows a symlink in a parent component of a member path. A
- * hand-built archive holding only "d/f" (no "d" member) fails when "d" in
- * the destination is a symlink to another directory, which stays empty, and
- * recovers into a destination without "d" (the parent is created). An
- * ark-built tree fails when its "sub" directory already exists as a
- * symlink. See ARCHITECTURE.md section 15.2.
+ * never follows a symlink in a parent component of a member path, and never
+ * creates parents itself. A hand-built archive holding only "d/f" (no "d"
+ * member) is rejected before any write (exit 2), whether "d" in the
+ * destination is a symlink to another directory, which stays empty, or
+ * missing. An ark-built tree fails when its "sub" directory already exists
+ * as a symlink. See ARCHITECTURE.md sections 8.3 (check 9) and 15.2.
  */
 int test_integration_generate_reader_no_follow_parent(void)
 {
@@ -1323,13 +1327,10 @@ int test_integration_generate_reader_no_follow_parent(void)
 	char *recover_argv[] = {recover_bin, archive, NULL};
 	char *tree_argv[] = {recover_bin, tree_ark, NULL};
 	uint8_t buf[512];
-	uint8_t *got;
-	size_t got_len;
 	size_t index_len;
 	size_t len;
 	int rc;
 
-	got = NULL;
 	if (make_temp_root(root, sizeof(root)) != 0)
 		return 1;
 	rc = 1;
@@ -1348,23 +1349,21 @@ int test_integration_generate_reader_no_follow_parent(void)
 	if (build_reader(root, recover_bin, sizeof(recover_bin)) != 0)
 		goto cleanup;
 
-	/* "d" is a symlink to victim: recovery fails, victim stays empty. */
+	/* "d" is a symlink to victim: rejected, victim stays empty. */
 	if (path_join(out, sizeof(out), root, "out-link") != 0 ||
 	    mkdir(out, 0700) != 0 ||
 	    path_join(path, sizeof(path), out, "d") != 0 ||
 	    symlink(victim, path) != 0)
 		goto cleanup;
-	if (run_program(recover_argv, out, "/dev/null", "/dev/null") == 0 ||
+	if (run_program(recover_argv, out, "/dev/null", "/dev/null") != 2 ||
 	    !dir_is_empty(victim))
 		goto cleanup;
 
-	/* No "d": the reader creates it and writes d/f. */
+	/* No "d": still rejected, nothing created. */
 	if (path_join(out, sizeof(out), root, "out-new") != 0 ||
 	    mkdir(out, 0700) != 0 ||
-	    run_program(recover_argv, out, "/dev/null", "/dev/null") != 0 ||
-	    path_join(path, sizeof(path), out, "d/f") != 0 ||
-	    read_file_bytes(path, &got, &got_len) != 0 || got_len != 258U ||
-	    got[0] != 'A' || got[257] != 'A')
+	    run_program(recover_argv, out, "/dev/null", "/dev/null") != 2 ||
+	    !dir_is_empty(out))
 		goto cleanup;
 
 	/* ark-built tree, "sub" exists as a symlink to victim: fails. */
@@ -1373,12 +1372,11 @@ int test_integration_generate_reader_no_follow_parent(void)
 	    path_join(path, sizeof(path), out, "sub") != 0 ||
 	    symlink(victim, path) != 0)
 		goto cleanup;
-	if (run_program(tree_argv, out, "/dev/null", "/dev/null") == 0 ||
+	if (run_program(tree_argv, out, "/dev/null", "/dev/null") != 1 ||
 	    !dir_is_empty(victim))
 		goto cleanup;
 	rc = 0;
 cleanup:
-	free(got);
 	(void)remove_tree(root);
 	return rc;
 }
@@ -1484,6 +1482,835 @@ cleanup:
 	if (fd != -1)
 		(void)close(fd);
 	free(block);
+	(void)remove_tree(root);
+	return rc;
+}
+/*
+ * Hand-built archives for the recovery reader's index checks: entries as in
+ * ARCHITECTURE.md section 5.2, with explicit path and link lengths so a
+ * case can hold NUL bytes or invalid UTF-8.
+ */
+#define RD_MAX_ENTRIES 12U
+typedef struct {
+	uint8_t type;
+	uint32_t mode;
+	uint64_t mtime;
+	uint64_t size_original;
+	uint64_t size_compressed;
+	uint64_t data_offset;
+	uint8_t hash[32];
+	const char *path;
+	size_t path_len;
+	const char *link;
+	size_t link_len;
+	uint32_t chunk_count;
+	uint32_t chunk_sizes[2];
+} rd_entry_t;
+typedef struct {
+	rd_entry_t e[RD_MAX_ENTRIES];
+	uint32_t n;
+	uint32_t member_count; /* footer value; n unless a case changes it */
+	int extra_index_byte;
+	uint8_t body[256];
+	size_t body_len;
+} rd_archive_t;
+
+static void rd_put16(uint8_t *p, uint64_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+static void rd_put32(uint8_t *p, uint64_t v)
+{
+	rd_put16(p, v);
+	rd_put16(p + 2, v >> 16);
+}
+static void rd_put64(uint8_t *p, uint64_t v)
+{
+	rd_put32(p, v);
+	rd_put32(p + 4, v >> 32);
+}
+
+/*
+ * rd_build - Serialize a: header (BLAKE3), body, index, footer with the
+ * index hash. Returns the archive length and the index offset/length, or 0
+ * when buf is too small.
+ */
+static size_t rd_build(const rd_archive_t *a, uint8_t *buf, size_t cap,
+                       size_t *index_off, size_t *index_len)
+{
+	size_t off;
+	uint32_t i;
+
+	if (a->body_len > sizeof(a->body) || cap < 16U + a->body_len + 64U)
+		return 0U;
+	memset(buf, 0, 16U);
+	memcpy(buf, "ark!\n\x01\x00\x00\x01\x01", 10U);
+	memcpy(buf + 16U, a->body, a->body_len);
+	off = 16U + a->body_len;
+	*index_off = off;
+	for (i = 0U; i < a->n; i++) {
+		const rd_entry_t *e;
+		uint32_t j;
+
+		e = &a->e[i];
+		if (cap - off <
+		    64U + 79U + e->path_len + 2U + e->link_len + 4U + 8U + 1U)
+			return 0U;
+		buf[off] = e->type;
+		rd_put32(buf + off + 1U, e->mode);
+		rd_put32(buf + off + 5U, 1000U);
+		rd_put32(buf + off + 9U, 1000U);
+		rd_put64(buf + off + 13U, e->mtime);
+		rd_put64(buf + off + 21U, e->size_original);
+		rd_put64(buf + off + 29U, e->size_compressed);
+		rd_put64(buf + off + 37U, e->data_offset);
+		memcpy(buf + off + 45U, e->hash, 32U);
+		rd_put16(buf + off + 77U, e->path_len);
+		off += 79U;
+		memcpy(buf + off, e->path, e->path_len);
+		off += e->path_len;
+		if (e->type == 0x03U || e->type == 0x04U) {
+			rd_put16(buf + off, e->link_len);
+			memcpy(buf + off + 2U, e->link, e->link_len);
+			off += 2U + e->link_len;
+		}
+		rd_put32(buf + off, e->chunk_count);
+		off += 4U;
+		for (j = 0U; j < e->chunk_count && j < 2U; j++) {
+			rd_put32(buf + off, e->chunk_sizes[j]);
+			off += 4U;
+		}
+	}
+	if (a->extra_index_byte)
+		buf[off++] = 0U;
+	*index_len = off - *index_off;
+	memset(buf + off, 0, 64U);
+	rd_put64(buf + off, *index_off);
+	rd_put64(buf + off + 8U, *index_len);
+	ark_blake3(buf + *index_off, *index_len, buf + off + 16U);
+	rd_put32(buf + off + 48U, a->member_count);
+	rd_put32(buf + off + 52U, 0x4b52410aU);
+	return off + 64U;
+}
+
+static void rd_set(rd_entry_t *e, uint8_t type, const char *path,
+                   const char *link)
+{
+	static const uint8_t none = 0U;
+
+	memset(e, 0, sizeof(*e));
+	e->type = type;
+	e->mode = type == 0x02U ? 0755U : 0644U;
+	e->mtime = UINT64_C(1700000000000000000);
+	e->path = path;
+	e->path_len = strlen(path);
+	e->link = link;
+	e->link_len = link != NULL ? strlen(link) : 0U;
+	ark_blake3(&none, 0U, e->hash);
+}
+
+/* Add a regular member holding text as one Deflate chunk. */
+static int rd_add_file(rd_archive_t *a, rd_entry_t *e, const char *path,
+                       const char *text)
+{
+	ssize_t clen;
+	size_t len;
+
+	len = strlen(text);
+	rd_set(e, 0x01U, path, NULL);
+	clen = test_deflate_compress(
+	    (const uint8_t *)text, len, a->body + a->body_len,
+	    sizeof(a->body) - a->body_len, ARK_DEFLATE_LEVEL_DEFAULT);
+	if (clen <= 0)
+		return -1;
+	e->size_original = len;
+	e->size_compressed = (uint64_t)clen;
+	e->data_offset = 16U + a->body_len;
+	e->chunk_count = 1U;
+	e->chunk_sizes[0] = (uint32_t)clen;
+	ark_blake3(a->body + a->body_len, (size_t)clen, e->hash);
+	a->body_len += (size_t)clen;
+	return 0;
+}
+
+/*
+ * rd_base - Every member type and both symlink-target forms ark accepts:
+ *   0 d/  1 d/f  2 d/sub/  3 d/sub/g  4 e (empty)  5 h -> d/f (hardlink)
+ *   6 s -> d/f  7 d/dot -> .  (symlinks)
+ */
+static int rd_base(rd_archive_t *a)
+{
+	memset(a, 0, sizeof(*a));
+	rd_set(&a->e[0], 0x02U, "d", NULL);
+	if (rd_add_file(a, &a->e[1], "d/f", "recovery differential\n") != 0)
+		return -1;
+	rd_set(&a->e[2], 0x02U, "d/sub", NULL);
+	if (rd_add_file(a, &a->e[3], "d/sub/g", "second member, gggggggg\n") !=
+	    0)
+		return -1;
+	rd_set(&a->e[4], 0x01U, "e", NULL);
+	rd_set(&a->e[5], 0x04U, "h", "d/f");
+	rd_set(&a->e[6], 0x03U, "s", "d/f");
+	rd_set(&a->e[7], 0x03U, "d/dot", ".");
+	a->n = 8U;
+	a->member_count = 8U;
+	return 0;
+}
+
+static void rd_set_path(rd_entry_t *e, const char *path, size_t len)
+{
+	e->path = path;
+	e->path_len = len;
+}
+static void rd_set_link(rd_entry_t *e, const char *link, size_t len)
+{
+	e->link = link;
+	e->link_len = len;
+}
+
+/*
+ * rd_hide_byte - Insert one zero byte into the body at body offset at and
+ * move the data of every member behind it, so the byte belongs to no
+ * member: hidden bytes that checks 13 and 15 must find.
+ */
+static void rd_hide_byte(rd_archive_t *a, size_t at)
+{
+	uint32_t i;
+
+	if (a->body_len >= sizeof(a->body) || at > a->body_len)
+		return;
+	memmove(a->body + at + 1U, a->body + at, a->body_len - at);
+	a->body[at] = 0U;
+	a->body_len++;
+	for (i = 0U; i < a->n; i++) {
+		if (a->e[i].chunk_count > 0U && a->e[i].data_offset >= 16U + at)
+			a->e[i].data_offset++;
+	}
+}
+
+/*
+ * rd_mutate - Apply structured case k to the base archive. Returns 1 when
+ * ark must accept the index, 0 when it must reject it, -1 past the last
+ * case. The numbers in comments are ARCHITECTURE.md section 8.3 checks.
+ */
+static int rd_mutate(rd_archive_t *a, int k)
+{
+	static char long_path[1025];
+	rd_entry_t t;
+
+	memset(long_path, 'x', sizeof(long_path) - 1U);
+	long_path[sizeof(long_path) - 1U] = '\0';
+	switch (k) {
+	case 0: /* base archive */
+		return 1;
+	case 1: /* 6: empty components are valid in a symlink target */
+		rd_set_link(&a->e[6], "d//f", 4U);
+		return 1;
+	case 2:
+		rd_set_link(&a->e[6], "./d/f/", 6U);
+		return 1;
+	case 3:
+		rd_set_link(&a->e[6], "d/../f", 6U);
+		return 0;
+	case 4:
+		rd_set_link(&a->e[6], "/etc", 4U);
+		return 0;
+	case 5:
+		rd_set_link(&a->e[6], "d\0f", 3U);
+		return 0;
+	case 6:
+		rd_set_link(&a->e[6], "\xc0\xaf", 2U);
+		return 0;
+	case 7: /* 3: member path grammar */
+		rd_set_path(&a->e[4], "e\0x", 3U);
+		return 0;
+	case 8:
+		rd_set_path(&a->e[4], "e\xed\xa0\x80", 4U);
+		return 0;
+	case 9:
+		rd_set_path(&a->e[4], "/e", 2U);
+		return 0;
+	case 10:
+		rd_set_path(&a->e[4], "d/../e", 6U);
+		return 0;
+	case 11:
+		rd_set_path(&a->e[4], "d/./e", 5U);
+		return 0;
+	case 12:
+		rd_set_path(&a->e[4], "d//e", 4U);
+		return 0;
+	case 13:
+		rd_set_path(&a->e[4], "d/", 2U);
+		return 0;
+	case 14:
+		rd_set_path(&a->e[4], ".", 1U);
+		return 0;
+	case 15: /* 5: 1023 bytes is the limit */
+		rd_set_path(&a->e[4], long_path, 1023U);
+		return 1;
+	case 16:
+		rd_set_path(&a->e[4], long_path, 1024U);
+		return 0;
+	case 17: /* 8 */
+		rd_set_path(&a->e[4], "d/f", 3U);
+		return 0;
+	case 18: /* 9: missing, non-directory and later parents */
+		rd_set_path(&a->e[3], "x/g", 3U);
+		return 0;
+	case 19:
+		rd_set_path(&a->e[3], "d/f/g", 5U);
+		return 0;
+	case 20:
+		t = a->e[2];
+		a->e[2] = a->e[3];
+		a->e[3] = t;
+		return 0;
+	case 21: /* 7 and 14: hardlink targets */
+		rd_set_link(&a->e[5], "d/sub/g", 7U);
+		return 1;
+	case 22:
+		rd_set_link(&a->e[5], "zz", 2U);
+		return 0;
+	case 23:
+		rd_set_link(&a->e[5], "d", 1U);
+		return 0;
+	case 24:
+		rd_set_link(&a->e[5], "d/dot", 5U);
+		return 0;
+	case 25:
+		rd_set_link(&a->e[5], "./d/f", 5U);
+		return 0;
+	case 26:
+		t = a->e[5];
+		a->e[5] = a->e[6];
+		a->e[6] = t;
+		rd_set_link(&a->e[6], "s", 1U);
+		return 0;
+	case 27: /* member types and zero-data size fields */
+		a->e[4].type = 0x05U;
+		return 0;
+	case 28:
+		a->e[4].type = 0x00U;
+		return 0;
+	case 29:
+		a->e[0].size_original = 1U;
+		return 0;
+	case 30:
+		a->e[6].data_offset = 16U;
+		return 0;
+	case 31:
+		a->e[4].chunk_count = 1U;
+		a->e[4].chunk_sizes[0] = 1U;
+		return 0;
+	case 32: /* chunk count from size */
+		a->e[1].chunk_count = 2U;
+		a->e[1].chunk_sizes[0] = a->e[1].chunk_sizes[0] - 1U;
+		a->e[1].chunk_sizes[1] = 1U;
+		return 0;
+	case 33: /* 11 */
+		a->e[1].size_compressed++;
+		return 0;
+	case 34: /* 12, 13, 15: body layout */
+		a->e[1].data_offset = 15U;
+		return 0;
+	case 35:
+		a->e[3].data_offset = a->e[1].data_offset;
+		return 0;
+	case 36: /* bodies swapped: valid layout, data fails later */
+		a->e[3].data_offset = 16U;
+		a->e[1].data_offset = 16U + a->e[3].size_compressed;
+		return 1;
+	case 37:
+		a->e[3].size_compressed--;
+		a->e[3].chunk_sizes[0]--;
+		return 0;
+	case 38: /* 16 */
+		a->e[0].hash[0] ^= 1U;
+		return 0;
+	case 39:
+		a->e[4].hash[31] ^= 0x80U;
+		return 0;
+	case 40: /* footer count and index length */
+		a->member_count = 9U;
+		return 0;
+	case 41:
+		a->member_count = 7U;
+		return 0;
+	case 42:
+		a->member_count = 0xffffffffU;
+		return 0;
+	case 43:
+		a->extra_index_byte = 1;
+		return 0;
+	case 44: /* no members: the body becomes hidden bytes */
+		a->n = 0U;
+		a->member_count = 0U;
+		return 0;
+	case 45: /* metadata only */
+		a->e[1].mode = 0777U;
+		a->e[3].mtime = 0U;
+		return 1;
+	case 46: /* parent turned into an empty file */
+		a->e[2].type = 0x01U;
+		return 0;
+	case 47: /* a NUL would cut the hardlink target to "d/f" */
+		rd_set_link(&a->e[5], "d/f\0x", 5U);
+		return 0;
+	case 48: /* 7: hardlink before its regular-file target */
+		t = a->e[4];
+		a->e[4] = a->e[5];
+		a->e[5] = t;
+		rd_set_link(&a->e[4], "e", 1U);
+		return 0;
+	case 49: /* 15: hidden byte before the first body, after the last */
+		rd_hide_byte(a, 0U);
+		return 0;
+	case 50:
+		rd_hide_byte(a, (size_t)a->e[1].size_compressed);
+		return 0;
+	case 51:
+		rd_hide_byte(a, a->body_len);
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * rd_make_writable - Give every directory below path (path included) mode
+ * 0700, so remove_tree can empty directories whose restored mode is
+ * read-only. Symlinks are not followed.
+ */
+static void rd_make_writable(const char *path)
+{
+	const struct dirent *de;
+	struct stat st;
+	char child[PATH_MAX];
+	DIR *dir;
+
+	if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode) ||
+	    chmod(path, 0700) != 0)
+		return;
+	dir = opendir(path);
+	if (dir == NULL)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") != 0 &&
+		    strcmp(de->d_name, "..") != 0 &&
+		    path_join(child, sizeof(child), path, de->d_name) == 0)
+			rd_make_writable(child);
+	}
+	(void)closedir(dir);
+}
+
+/*
+ * rd_check_case - Run one archive through ark_read_index (with the header
+ * and footer calls before it) and through the recovery reader in a new
+ * directory under root. The reader must exit 2 exactly when ark rejects,
+ * and then leave the directory empty. *ark_ok receives ark's verdict and
+ * *rec_rc the reader's exit status.
+ */
+static int rd_check_case(const char *root, const char *recover_bin,
+                         const uint8_t *buf, size_t len, size_t index_off,
+                         size_t index_len, int *ark_ok, int *rec_rc)
+{
+	ark_read_ctx_storage_t storage;
+	ark_read_ctx_t *ctx;
+	ark_error_t err;
+	char archive[PATH_MAX], out[PATH_MAX];
+	char *argv[] = {(char *)recover_bin, archive, NULL};
+	int rc;
+
+	memset(&storage, 0, sizeof(storage));
+	ctx = (ark_read_ctx_t *)(void *)storage.bytes;
+	*ark_ok = ark_read_header(ctx, buf, 16U, &err) == 0 &&
+	          ark_read_init(ctx, buf + len - 64U, 64U, &err) == 0 &&
+	          ark_read_index(ctx, buf + index_off, index_len, &err) == 0;
+	if (*ark_ok)
+		ark_read_free(ctx);
+	if (path_join(archive, sizeof(archive), root, "case.ark") != 0 ||
+	    path_join(out, sizeof(out), root, "case-out") != 0 ||
+	    write_bytes_file(archive, buf, len) != 0 || mkdir(out, 0700) != 0)
+		return -1;
+	*rec_rc = run_program(argv, out, "/dev/null", "/dev/null");
+	rc = 0;
+	if ((*rec_rc == 2) == (*ark_ok != 0) ||
+	    (*rec_rc == 2 && !dir_is_empty(out)) || *rec_rc < 0 || *rec_rc > 2)
+		rc = -1;
+	rd_make_writable(out);
+	if (remove_tree(out) != 0)
+		rc = -1;
+	return rc;
+}
+
+/*
+ * test_integration_generate_reader_index_differential - The recovery reader
+ * accepts exactly the indexes ark_read_index accepts, and rejects the
+ * others before writing anything (exit 2). Structured cases cover each
+ * ARCHITECTURE.md section 8.3 check with its expected verdict (the base
+ * archive must also recover completely); then every index byte of the base
+ * archive is flipped once (masks 0x01, 0x80, 0x04 in turn), with the index
+ * hash recomputed so that only the checks after check 2 decide. See
+ * ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_index_differential(void)
+{
+	static const uint8_t masks[3] = {0x01U, 0x80U, 0x04U};
+	rd_archive_t a;
+	char root[PATH_MAX], recover_bin[PATH_MAX];
+	uint8_t base[4096];
+	uint8_t buf[4096];
+	size_t base_len;
+	size_t index_off;
+	size_t index_len;
+	size_t p;
+	unsigned int counts[3];
+	int ark_ok;
+	int rec_rc;
+	int expect;
+	int k;
+	int rc;
+
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	/* Reader outcomes: recovered, failed while extracting, rejected. */
+	memset(counts, 0, sizeof(counts));
+	if (build_reader(root, recover_bin, sizeof(recover_bin)) != 0)
+		goto cleanup;
+	for (k = 0;; k++) {
+		size_t len;
+
+		if (rd_base(&a) != 0)
+			goto cleanup;
+		expect = rd_mutate(&a, k);
+		if (expect < 0)
+			break;
+		len = rd_build(&a, buf, sizeof(buf), &index_off, &index_len);
+		if (len == 0U ||
+		    rd_check_case(root, recover_bin, buf, len, index_off,
+		                  index_len, &ark_ok, &rec_rc) != 0 ||
+		    ark_ok != expect || (k == 0 && rec_rc != 0)) {
+			fprintf(stderr, "  index case %d: ark %d, reader %d\n",
+			        k, ark_ok, rec_rc);
+			goto cleanup;
+		}
+		counts[rec_rc]++;
+	}
+	if (rd_base(&a) != 0)
+		goto cleanup;
+	base_len = rd_build(&a, base, sizeof(base), &index_off, &index_len);
+	if (base_len == 0U)
+		goto cleanup;
+	for (p = 0U; p < index_len; p++) {
+		memcpy(buf, base, base_len);
+		buf[index_off + p] ^= masks[p % 3U];
+		ark_blake3(buf + index_off, index_len,
+		           buf + base_len - 64U + 16U);
+		if (rd_check_case(root, recover_bin, buf, base_len, index_off,
+		                  index_len, &ark_ok, &rec_rc) != 0) {
+			fprintf(
+			    stderr,
+			    "  index byte %zu ^ 0x%02x: ark %d, reader %d\n", p,
+			    masks[p % 3U], ark_ok, rec_rc);
+			goto cleanup;
+		}
+		counts[rec_rc]++;
+	}
+	printf("recovery index cases: %u recovered, %u failed in extraction, "
+	       "%u rejected (ark agrees on all)\n",
+	       counts[0], counts[1], counts[2]);
+	rc = 0;
+cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
+
+/*
+ * test_integration_generate_reader_refuses_existing - Like ark without
+ * --overwrite, the recovery reader refuses an object already at a member
+ * path (a regular file in place of a file, a hardlink or a symlink member)
+ * and leaves it unchanged; an existing directory is reused for a directory
+ * member. See ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_refuses_existing(void)
+{
+	static const char *const taken[] = {"dir/original.txt", "hard.txt",
+	                                    "sym.txt"};
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recover_bin[PATH_MAX], path[PATH_MAX], dir[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	uint8_t *got;
+	size_t got_len;
+	size_t i;
+	int rc;
+
+	got = NULL;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(archive, sizeof(archive), root, "types.ark") != 0 ||
+	    make_member_type_tree(src) != 0 ||
+	    create_archive(archive, src, NULL) != 0 ||
+	    build_reader(root, recover_bin, sizeof(recover_bin)) != 0)
+		goto cleanup;
+	for (i = 0U; i < sizeof(taken) / sizeof(taken[0]); i++) {
+		char name[32];
+
+		(void)snprintf(name, sizeof(name), "out%zu", i);
+		if (path_join(out, sizeof(out), root, name) != 0 ||
+		    mkdir(out, 0700) != 0 ||
+		    path_join(dir, sizeof(dir), out, "dir") != 0 ||
+		    mkdir(dir, 0700) != 0 ||
+		    path_join(path, sizeof(path), out, taken[i]) != 0 ||
+		    write_text_file(path, "keep\n") != 0)
+			goto cleanup;
+		if (run_program(recover_argv, out, "/dev/null", "/dev/null") !=
+		        1 ||
+		    read_file_bytes(path, &got, &got_len) != 0 ||
+		    got_len != 5U || memcmp(got, "keep\n", 5U) != 0)
+			goto cleanup;
+		free(got);
+		got = NULL;
+	}
+	/* Only "dir" exists, as a directory: reused, recovery succeeds. */
+	if (path_join(out, sizeof(out), root, "out-dir") != 0 ||
+	    mkdir(out, 0700) != 0 ||
+	    path_join(dir, sizeof(dir), out, "dir") != 0 ||
+	    mkdir(dir, 0700) != 0 ||
+	    run_program(recover_argv, out, NULL, NULL) != 0 ||
+	    compare_tree(src, out) != 0)
+		goto cleanup;
+	rc = 0;
+cleanup:
+	free(got);
+	(void)remove_tree(root);
+	return rc;
+}
+
+/* rd_mode_mtime - 0 when path (not followed) has mode bits and mtime. */
+static int rd_mode_mtime(const char *dir, const char *name, mode_t mode,
+                         time_t mtime)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (path_join(path, sizeof(path), dir, name) != 0 ||
+	    lstat(path, &st) != 0 || st.st_mtime != mtime)
+		return -1;
+	if (!S_ISLNK(st.st_mode) && (st.st_mode & 0777) != mode)
+		return -1;
+	return 0;
+}
+
+/*
+ * test_integration_generate_reader_metadata - The recovery reader restores
+ * mode (0777 bits) and mtime as ark does: files and directories, including
+ * a read-only directory whose file is written before its mode is set, and
+ * the mtime of a symlink itself; directory metadata goes in reverse index
+ * order, so a hand-built directory without its search bit still gets its
+ * subdirectory's metadata restored first. See ARCHITECTURE.md sections 14.5
+ * and 15.2.
+ */
+int test_integration_generate_reader_metadata(void)
+{
+	static const struct {
+		const char *name;
+		mode_t mode;
+		time_t mtime;
+	} want[] = {
+	    {"run.sh", 0750, 1000000000}, {"d/f", 0604, 1100000000},
+	    {"ro/f", 0444, 1200000000},   {"d", 0751, 1300000000},
+	    {"ro", 0555, 1400000000},     {"l", 0, 1500000000},
+	};
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recover_bin[PATH_MAX], path[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	struct timespec times[2];
+	rd_archive_t hand;
+	uint8_t buf[1024];
+	size_t index_off;
+	size_t index_len;
+	size_t len;
+	size_t i;
+	int rc;
+
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(out, sizeof(out), root, "out") != 0 ||
+	    path_join(archive, sizeof(archive), root, "meta.ark") != 0 ||
+	    mkdir(src, 0700) != 0 || mkdir(out, 0700) != 0)
+		goto cleanup;
+	if (path_join(path, sizeof(path), src, "d") != 0 ||
+	    mkdir(path, 0700) != 0 ||
+	    path_join(path, sizeof(path), src, "ro") != 0 ||
+	    mkdir(path, 0700) != 0 ||
+	    path_join(path, sizeof(path), src, "run.sh") != 0 ||
+	    write_text_file(path, "#!/bin/sh\n") != 0 ||
+	    path_join(path, sizeof(path), src, "d/f") != 0 ||
+	    write_text_file(path, "data\n") != 0 ||
+	    path_join(path, sizeof(path), src, "ro/f") != 0 ||
+	    write_text_file(path, "read only\n") != 0 ||
+	    path_join(path, sizeof(path), src, "l") != 0 ||
+	    symlink("run.sh", path) != 0)
+		goto cleanup;
+	/* Files first, then directories, so no later write moves an mtime. */
+	for (i = 0U; i < sizeof(want) / sizeof(want[0]); i++) {
+		if (path_join(path, sizeof(path), src, want[i].name) != 0)
+			goto cleanup;
+		if (want[i].mode != 0 && chmod(path, want[i].mode) != 0)
+			goto cleanup;
+		times[0].tv_sec = want[i].mtime;
+		times[0].tv_nsec = 0;
+		times[1] = times[0];
+		if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) != 0)
+			goto cleanup;
+	}
+	if (create_archive(archive, src, NULL) != 0 ||
+	    build_reader(root, recover_bin, sizeof(recover_bin)) != 0 ||
+	    run_program(recover_argv, out, NULL, NULL) != 0)
+		goto cleanup;
+	for (i = 0U; i < sizeof(want) / sizeof(want[0]); i++) {
+		if (rd_mode_mtime(out, want[i].name, want[i].mode,
+		                  want[i].mtime) != 0)
+			goto cleanup;
+	}
+	if (compare_tree(src, out) != 0)
+		goto cleanup;
+
+	/*
+	 * Hand-built (ark cannot read such a source tree): directory "p"
+	 * without its search bit (0600) holding directory "p/c" (0750). Only
+	 * the reverse order restores c, before p loses its search bit.
+	 */
+	memset(&hand, 0, sizeof(hand));
+	rd_set(&hand.e[0], 0x02U, "p", NULL);
+	hand.e[0].mode = 0600U;
+	rd_set(&hand.e[1], 0x02U, "p/c", NULL);
+	hand.e[1].mode = 0750U;
+	hand.e[1].mtime = UINT64_C(1600000000000000000);
+	hand.n = 2U;
+	hand.member_count = 2U;
+	len = rd_build(&hand, buf, sizeof(buf), &index_off, &index_len);
+	if (len == 0U || write_bytes_file(archive, buf, len) != 0 ||
+	    path_join(out, sizeof(out), root, "out-hand") != 0 ||
+	    mkdir(out, 0700) != 0 ||
+	    run_program(recover_argv, out, NULL, NULL) != 0 ||
+	    rd_mode_mtime(out, "p", 0600, 1700000000) != 0 ||
+	    path_join(path, sizeof(path), out, "p") != 0 ||
+	    chmod(path, 0700) != 0 ||
+	    rd_mode_mtime(out, "p/c", 0750, 1600000000) != 0)
+		goto cleanup;
+	rc = 0;
+cleanup:
+	/* Writable again so remove_tree can empty read-only directories. */
+	rd_make_writable(root);
+	(void)remove_tree(root);
+	return rc;
+}
+
+/*
+ * test_integration_generate_reader_keeps_verified - A damaged member stops
+ * the recovery with exit 1: the member before it stays, complete and
+ * verified, and the damaged member's file is removed. Here the last body
+ * byte (b.txt's data) is flipped, so b.txt fails its hash check. See
+ * ARCHITECTURE.md section 15.2.
+ */
+int test_integration_generate_reader_keeps_verified(void)
+{
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recover_bin[PATH_MAX], a[PATH_MAX], b[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	uint8_t *bytes;
+	size_t len;
+	struct stat st;
+	int rc;
+
+	bytes = NULL;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(out, sizeof(out), root, "out") != 0 ||
+	    path_join(archive, sizeof(archive), root, "two.ark") != 0 ||
+	    mkdir(src, 0700) != 0 || mkdir(out, 0700) != 0 ||
+	    path_join(a, sizeof(a), src, "a.txt") != 0 ||
+	    write_text_file(a, "first member\n") != 0 ||
+	    path_join(b, sizeof(b), src, "b.txt") != 0 ||
+	    write_text_file(b, "second member\n") != 0 ||
+	    create_archive(archive, src, NULL) != 0 ||
+	    read_file_bytes(archive, &bytes, &len) != 0 || len < 80U)
+		goto cleanup;
+	if (flip_archive_byte(archive, (off_t)le64_at(bytes + len - 64U) - 1) !=
+	        0 ||
+	    build_reader(root, recover_bin, sizeof(recover_bin)) != 0 ||
+	    run_program(recover_argv, out, "/dev/null", "/dev/null") != 1)
+		goto cleanup;
+	if (path_join(b, sizeof(b), out, "a.txt") != 0 || !files_equal(a, b) ||
+	    path_join(b, sizeof(b), out, "b.txt") != 0 || lstat(b, &st) == 0 ||
+	    errno != ENOENT)
+		goto cleanup;
+	rc = 0;
+cleanup:
+	free(bytes);
+	(void)remove_tree(root);
+	return rc;
+}
+
+/*
+ * test_integration_generate_reader_trailing_bytes - As in ark (C07), a chunk
+ * must be exactly one Deflate stream: the same archive member with one byte
+ * after the final block (covered by the chunk size and both hashes) fails
+ * recovery and leaves no file, and recovers without that byte. See
+ * ARCHITECTURE.md sections 6.2 and 15.2.
+ */
+int test_integration_generate_reader_trailing_bytes(void)
+{
+	static const uint8_t text[] = {'a', 'b', 'c'};
+	char root[PATH_MAX], out[PATH_MAX], archive[PATH_MAX];
+	char recover_bin[PATH_MAX];
+	char *recover_argv[] = {recover_bin, archive, NULL};
+	uint8_t comp[64];
+	uint8_t buf[512];
+	ssize_t clen;
+	size_t index_len;
+	size_t len;
+	int extra;
+	int rc;
+
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	clen =
+	    test_deflate_compress(text, sizeof(text), comp, sizeof(comp) - 1U,
+	                          ARK_DEFLATE_LEVEL_DEFAULT);
+	if (clen <= 0 ||
+	    path_join(archive, sizeof(archive), root, "pad.ark") != 0 ||
+	    build_reader(root, recover_bin, sizeof(recover_bin)) != 0)
+		goto cleanup;
+	comp[clen] = 0U;
+	for (extra = 1; extra >= 0; extra--) {
+		int want;
+
+		len = test_archive_one_chunk(buf, sizeof(buf), comp,
+		                             (size_t)clen + (size_t)extra,
+		                             sizeof(text), &index_len);
+		want = extra ? 1 : 0;
+		if (len == 0U || write_bytes_file(archive, buf, len) != 0 ||
+		    path_join(out, sizeof(out), root,
+		              extra ? "out-pad" : "out-ok") != 0 ||
+		    mkdir(out, 0700) != 0 ||
+		    run_program(recover_argv, out, "/dev/null", "/dev/null") !=
+		        want ||
+		    dir_is_empty(out) != extra)
+			goto cleanup;
+	}
+	rc = 0;
+cleanup:
 	(void)remove_tree(root);
 	return rc;
 }

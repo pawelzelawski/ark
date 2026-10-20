@@ -47,8 +47,9 @@ reader validates the index completely before touching the filesystem.
 compression algorithm (Deflate, RFC 1951) is public domain and reimplementable
 from spec. The hash algorithms (BLAKE3, SHA-256) are well-specified and
 independently implementable. The entire codebase is small enough to be read
-and understood by a single engineer in a day. The source code of the reader is
-intended to be included inside archives for maximum recovery longevity.
+and understood by a single engineer in a day. `ark generate-reader` writes a
+standalone reader whose source describes the whole format; kept next to the
+archives, it keeps them recoverable without ark.
 
 **Zero external dependencies.** libc and POSIX only, plus vendored libchevron
 (author's own library, same license, same standards). No third-party libraries.

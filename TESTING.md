@@ -642,9 +642,14 @@ test. These tests are the final gate before a phase is declared complete.
 | `test_integration_generate_reader_strict_c11` | generate-reader output builds with `-std=c11 -Wall -Wextra -Wpedantic -Werror` using `cc` (required) and `clang`/`gcc` when installed; each build recovers the test tree |
 | `test_integration_generate_reader_rejects_legacy_258` | The recovery reader fails on a hand-built archive whose chunk codes length 258 as 284 + 31 and recovers the same archive with 284 + 30 (258 bytes of `A`) |
 | `test_integration_generate_reader_no_follow` | Recovery reader refuses to write through a pre-existing symlink at a regular-file member path (empty and non-empty); symlink target unchanged |
-| `test_integration_generate_reader_no_follow_parent` | Recovery reader never follows a symlink in a parent component: a hand-built archive holding only `d/f` fails when `d` is a symlink to another directory (which stays empty) and recovers, creating `d`, when `d` is missing; an ark-built tree fails when its `sub` directory exists as a symlink |
+| `test_integration_generate_reader_no_follow_parent` | Recovery reader never follows a symlink in a parent component and never creates parents: a hand-built archive holding only `d/f` (no `d` member) is rejected with exit 2 and nothing written, both when `d` is a symlink to another directory (which stays empty) and when `d` is missing; an ark-built tree fails (exit 1) when its `sub` directory exists as a symlink |
 | `test_integration_generate_reader_member_types` | Recovery reader restores a directory, a file inside it, a hardlink to that file (same inode) and a symlink; the tree equals the source |
 | `test_integration_generate_reader_bounded_memory` | A 40 MiB archive of incompressible data recovers with the reader's `RLIMIT_DATA` at 32 MiB (pieces read with `pread`, not the whole file) and equals the source |
+| `test_integration_generate_reader_index_differential` | The recovery reader accepts exactly the indexes `ark_read_index` accepts: hand-built archives (every member type, symlink targets `.` and `d//f`) with 52 structured cases, one or more per ARCHITECTURE.md 8.3 check (including a hardlink target cut short by a NUL, a hardlink before its target, and hidden body bytes at the start, between members and at the end), each with its expected verdict, then every index byte of the reference archive flipped once (masks 0x01, 0x80, 0x04) with the index hash recomputed; a rejected archive must exit 2 with the destination empty, an accepted one must not exit 2; prints the outcome counts (174 recovered, 72 failed in extraction, 515 rejected) |
+| `test_integration_generate_reader_refuses_existing` | Like `ark extract` without `--overwrite`, the reader fails (exit 1) when a regular file already occupies a file, hardlink or symlink member path and leaves it unchanged; an existing directory is reused and the tree recovers |
+| `test_integration_generate_reader_metadata` | The reader restores mode (0777 bits) and mtime of files, directories (also a read-only one holding a file) and the mtime of a symlink itself; a hand-built directory without its search bit still gets its subdirectory's metadata (reverse index order) |
+| `test_integration_generate_reader_keeps_verified` | A damaged member (flipped body byte) stops recovery with exit 1; the member before it stays, identical to the source, and the damaged member's file is removed |
+| `test_integration_generate_reader_trailing_bytes` | A chunk with one byte after its final Deflate block (covered by the chunk size and both hashes) fails recovery and leaves no file; the same archive without the byte recovers |
 | `test_integration_deterministic` | Same source content archived twice; archives are bit-identical |
 | `test_integration_large_archive` | Archive containing 1000 files of mixed sizes; create, verify, extract; all clean |
 
@@ -752,6 +757,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | hardlink target type validated: only 0x01 accepted | `test_edge.c` | ARCHITECTURE.md §8.3 |
 | Deterministic archives: identical source produces identical output | `test_integration.c` | ARCHITECTURE.md §13.1 |
 | generate-reader output compiles and runs correctly | `test_integration.c` | ARCHITECTURE.md §15 |
+| Recovery reader accepts exactly the indexes ark accepts, before any write | `test_integration.c` | ARCHITECTURE.md §8.3, §15.2 |
 | Every create sequence step tested with forced failure | `test_fault.c` | ARCHITECTURE.md §16.3 |
 | Every extract sequence step tested with forced failure | `test_fault.c` | ARCHITECTURE.md §14 |
 
@@ -775,6 +781,7 @@ by one or more specific test cases.
 | Integration: full round-trip byte-identical | `test_integration_single_file` |
 | Integration: deterministic output | `test_integration_deterministic` |
 | Integration: generate-reader functional | `test_integration_generate_reader` |
+| Integration: recovery reader index checks equal ark's | `test_integration_generate_reader_index_differential` |
 | Valgrind clean on Linux | `make valgrind` full test suite |
 | ASan/UBSan clean on Linux | `make dev` full test suite |
 | All tests pass on OpenBSD | Full test suite on OpenBSD |
