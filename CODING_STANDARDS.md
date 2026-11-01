@@ -611,7 +611,7 @@ worker_compress(void *arg)
 
 	if (ark_deflate_enc_oneshot(w->enc, w->in, w->in_len, w->out,
 	    w->out_cap, &clen) == ARK_DEFLATE_OK)
-		ring_buf_write(w->ring, w->seq, w->out, clen);
+		ring_buf_publish(w->ring, w->seq, &w->out, clen);
 	return NULL;
 }
 

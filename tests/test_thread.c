@@ -27,8 +27,8 @@ typedef struct ring_buf ring_buf_t;
 typedef struct ark_pool ark_pool_t;
 
 ring_buf_t *ring_buf_init(size_t, ark_error_t *);
-int ring_buf_write(ring_buf_t *, uint64_t, const uint8_t *, size_t, ark_err_t,
-                   ark_error_t *);
+int ring_buf_publish(ring_buf_t *, uint64_t, uint8_t **, size_t, ark_err_t,
+                     ark_error_t *);
 int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
@@ -36,6 +36,7 @@ void ring_buf_free(ring_buf_t *);
 
 ark_pool_t *pool_test_init(int, int, ark_error_t *);
 int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
+int pool_test_submit_buf(ark_pool_t *, uint64_t, uint8_t **, size_t, size_t);
 int pool_test_read(ark_pool_t *, uint64_t, uint8_t **, size_t *, int *,
                    ark_err_t *, ark_error_t *);
 void pool_test_cancel(ark_pool_t *);
@@ -52,6 +53,8 @@ int ark_test_create_archive(const char *, const char **, size_t, int,
                             ark_hash_alg_t, int, ark_error_t *);
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
+int ark_test_verify_archive(const char *, const char *, int, int,
+                            ark_error_t *);
 size_t ark_test_known_dir_prefix(const char *, const char *);
 void ark_test_cli_fault_reset(void);
 void ark_test_cli_fault_inject(int, int, ark_err_t, int);
@@ -375,6 +378,24 @@ fail:
 	return 1;
 }
 
+/*
+ * ring_publish_copy - Publish len bytes of data through a full-size buffer.
+ */
+static int ring_publish_copy(ring_buf_t *ring, uint64_t seq,
+                             const uint8_t *data, size_t len, ark_error_t *err)
+{
+	uint8_t *buf;
+	int rc;
+
+	buf = (uint8_t *)malloc(ark_deflate_bound(ARK_CHUNK_SIZE));
+	if (buf == NULL)
+		return -1;
+	memcpy(buf, data, len);
+	rc = ring_buf_publish(ring, seq, &buf, len, ARK_OK, err);
+	free(buf);
+	return rc;
+}
+
 int test_ring_normal_produce_consume(void)
 {
 	ark_error_t err = {0};
@@ -394,7 +415,7 @@ int test_ring_normal_produce_consume(void)
 		ring_buf_free(ring);
 		return 1;
 	}
-	if (ring_buf_write(ring, 0U, in, sizeof(src), ARK_OK, &err) != 0) {
+	if (ring_publish_copy(ring, 0U, in, sizeof(src), &err) != 0) {
 		free(in);
 		ring_buf_free(ring);
 		return 1;
@@ -438,11 +459,11 @@ int test_ring_out_of_order_completion(void)
 		ring_buf_free(ring);
 		return 1;
 	}
-	if (ring_buf_write(ring, 1U, in1, sizeof(s1), ARK_OK, &err) != 0)
+	if (ring_publish_copy(ring, 1U, in1, sizeof(s1), &err) != 0)
 		goto fail;
 	free(in1);
 	in1 = NULL;
-	if (ring_buf_write(ring, 0U, in0, sizeof(s0), ARK_OK, &err) != 0)
+	if (ring_publish_copy(ring, 0U, in0, sizeof(s0), &err) != 0)
 		goto fail;
 	free(in0);
 	in0 = NULL;
@@ -1844,6 +1865,328 @@ int test_extract_pipeline_short_reads(void)
 
 done:
 	fault_reset();
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+int test_ring_publish_swaps_buffers(void)
+{
+	static const uint8_t payload[] = {1U, 2U, 3U, 4U};
+	const size_t cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+	ark_error_t err = {0};
+	ring_buf_t *ring;
+	uint8_t *buf;
+	uint8_t *first;
+	uint8_t *out = NULL;
+	size_t out_len = 0U;
+	int is_abort = 0;
+	ark_err_t worker_err = ARK_OK;
+	int rc = 1;
+
+	ring = ring_buf_init(1U, &err);
+	buf = (uint8_t *)malloc(cap);
+	if (ring == NULL || buf == NULL)
+		goto done;
+	first = buf;
+	memcpy(buf, payload, sizeof(payload));
+	if (ring_buf_publish(ring, 0U, &buf, sizeof(payload), ARK_OK, &err) !=
+	        0 ||
+	    buf == first || buf == NULL)
+		goto done;
+	/* The buffer handed back has the full capacity (checked by ASan). */
+	memset(buf, 0xA5, cap);
+	/* The slot's payload is the caller's buffer itself, not a copy. */
+	if (ring_buf_read(ring, 0U, &out, &out_len, &is_abort, &worker_err,
+	                  &err) != 0 ||
+	    out != first || out_len != sizeof(payload) || is_abort ||
+	    memcmp(out, payload, sizeof(payload)) != 0)
+		goto done;
+	/* A failed publish leaves the caller's buffer with the caller. */
+	first = buf;
+	if (ring_buf_publish(ring, 0U, &buf, 1U, ARK_OK, &err) != -1 ||
+	    buf != first)
+		goto done;
+	rc = 0;
+
+done:
+	free(buf);
+	if (ring != NULL)
+		ring_buf_free(ring);
+	return rc;
+}
+
+/*
+ * pool_read_stored - Read chunk seq from a decompress pool; 0 if it is want.
+ */
+static int pool_read_stored(ark_pool_t *pool, uint64_t seq, const char *want,
+                            ark_error_t *err)
+{
+	uint8_t *data = NULL;
+	size_t len = 0U;
+	int is_abort = 0;
+	ark_err_t worker_err = ARK_OK;
+
+	if (pool_test_read(pool, seq, &data, &len, &is_abort, &worker_err,
+	                   err) != 0 ||
+	    is_abort || len != strlen(want) || memcmp(data, want, len) != 0)
+		return -1;
+	return 0;
+}
+
+int test_pool_submit_buf_hands_over(void)
+{
+	/* Final stored Deflate blocks of three bytes. */
+	static const uint8_t abc[] = {0x01U, 0x03U, 0x00U, 0xFCU,
+	                              0xFFU, 'a',   'b',   'c'};
+	static const uint8_t xyz[] = {0x01U, 0x03U, 0x00U, 0xFCU,
+	                              0xFFU, 'x',   'y',   'z'};
+	const size_t cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+	ark_error_t err = {0};
+	ark_pool_t *pool;
+	uint8_t *buf;
+	uint8_t *first;
+	int rc = 1;
+
+	pool = pool_test_init(2, 1, &err);
+	buf = (uint8_t *)malloc(cap);
+	if (pool == NULL || buf == NULL)
+		goto done;
+	first = buf;
+	memcpy(buf, abc, sizeof(abc));
+	/* A wrong capacity or an oversized chunk leaves the buffer in place. */
+	if (pool_test_submit_buf(pool, 0U, &buf, cap - 1U, sizeof(abc)) != -1 ||
+	    pool_test_submit_buf(pool, 0U, &buf, cap, cap + 1U) != -1 ||
+	    buf != first)
+		goto done;
+	if (pool_test_submit_buf(pool, 0U, &buf, cap, sizeof(abc)) != 0 ||
+	    buf == first || buf == NULL)
+		goto done;
+	/* The buffer handed back has the full capacity (checked by ASan). */
+	memset(buf, 0xA5, cap);
+	memcpy(buf, xyz, sizeof(xyz));
+	if (pool_test_submit_buf(pool, 1U, &buf, cap, sizeof(xyz)) != 0 ||
+	    pool_read_stored(pool, 0U, "abc", &err) != 0 ||
+	    pool_read_stored(pool, 1U, "xyz", &err) != 0)
+		goto done;
+	rc = 0;
+
+done:
+	if (pool != NULL)
+		pool_test_shutdown(pool);
+	free(buf);
+	return rc;
+}
+
+int test_verify_pipeline_matches_across_workers(void)
+{
+	char root[] = "/tmp/ark-thread-vpipe-XXXXXX";
+	static const int workers[] = {1, 2, 3, 4, 16};
+	char src[1024];
+	char archive[1024];
+	char empty_src[1024];
+	char path[1024];
+	char empty_archive[1024];
+	const char *sources[1];
+	const char *tmp;
+	ark_error_t err = {0};
+	int whole_calls = 0;
+	size_t i;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (prepare_pipeline_tree(tmp, src, sizeof(src)) != 0 ||
+	    path_join(archive, sizeof(archive), tmp, "x.ark") != 0)
+		goto done;
+	sources[0] = src;
+	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
+	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+		goto done;
+	/* ARCHITECTURE.md section 6.3: every worker count reads every chunk
+	 * once and accepts the archive. */
+	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
+		fault_reset();
+		if (ark_test_verify_archive(archive, NULL, 0, workers[i],
+		                            &err) != 0)
+			goto done;
+		if (i > 0U && ark_fault.pread_calls != whole_calls)
+			goto done;
+		whole_calls = ark_fault.pread_calls;
+	}
+	if (whole_calls <= 150)
+		goto done;
+	/* Selective: d.link selects its one-chunk target c.dir/f001 only. */
+	fault_reset();
+	if (ark_test_verify_archive(archive, "d.link", 0, 4, &err) != 0 ||
+	    ark_fault.pread_calls != 1)
+		goto done;
+	/* Every chunk arrives in pieces of at most 4093 bytes. */
+	fault_reset();
+	ark_fault.pread_max = 4093;
+	if (ark_test_verify_archive(archive, NULL, 0, 4, &err) != 0 ||
+	    ark_fault.pread_calls <= 2 * whole_calls)
+		goto done;
+	fault_reset();
+	/* An archive whose only member has no chunks. */
+	if (path_join(empty_src, sizeof(empty_src), tmp, "only") != 0 ||
+	    mkdir(empty_src, 0755) != 0 ||
+	    path_join(path, sizeof(path), empty_src, "empty") != 0 ||
+	    write_seeded_file(path, 0U, 1U) != 0 ||
+	    path_join(empty_archive, sizeof(empty_archive), tmp, "e.ark") != 0)
+		goto done;
+	sources[0] = empty_src;
+	if (ark_test_create_archive(empty_archive, sources, 1U, 1,
+	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                            &err) != 0 ||
+	    ark_test_verify_archive(empty_archive, NULL, 0, 1, &err) != 0 ||
+	    ark_test_verify_archive(empty_archive, NULL, 0, 4, &err) != 0)
+		goto done;
+	rc = 0;
+
+done:
+	fault_reset();
+	if (remove_tree(tmp) != 0)
+		return 1;
+	return rc;
+}
+
+/*
+ * verify_ahead_captured - Verbose verify with stdout captured in out_path.
+ *
+ * Returns 0 when the verify result is code / errno_value and stdout is exactly
+ * want, -1 otherwise.
+ */
+static int verify_ahead_captured(const char *archive, int n_workers,
+                                 const char *out_path, ark_err_t code,
+                                 int errno_value, const char *want)
+{
+	ark_error_t err = {0};
+	uint8_t *got = NULL;
+	size_t got_len = 0U;
+	int saved;
+	int fd;
+	int verify_rc;
+	int rc = -1;
+
+	if (fflush(stdout) != 0)
+		return -1;
+	saved = dup(STDOUT_FILENO);
+	if (saved < 0)
+		return -1;
+	fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+		if (fd >= 0)
+			(void)close(fd);
+		(void)close(saved);
+		return -1;
+	}
+	(void)close(fd);
+	verify_rc = ark_test_verify_archive(archive, NULL, 1, n_workers, &err);
+	(void)fflush(stdout);
+	if (dup2(saved, STDOUT_FILENO) < 0) {
+		(void)close(saved);
+		return -1;
+	}
+	(void)close(saved);
+	if ((verify_rc == 0) != (code == ARK_OK) || err.code != code ||
+	    err.sys_errno != errno_value)
+		return -1;
+	if (read_file_bytes(out_path, &got, &got_len) == 0 &&
+	    got_len == strlen(want) && memcmp(got, want, got_len) == 0)
+		rc = 0;
+	free(got);
+	return rc;
+}
+
+/*
+ * expect_verify_fault - Verify the ahead archive with faults and check the
+ * reported error and the verbose lines printed before it. pread_fail and
+ * worker_fail are as in expect_ahead_fault.
+ */
+static int expect_verify_fault(const char *tmp, const char *archive,
+                               int n_workers, int pread_fail, int worker_fail,
+                               ark_err_t code, int errno_value,
+                               const char *want)
+{
+	char out_path[1024];
+	int rc;
+
+	if (path_join(out_path, sizeof(out_path), tmp, "verify.out") != 0)
+		return -1;
+	fault_reset();
+	ark_test_cli_fault_reset();
+	if (pread_fail > 0)
+		fault_inject(ARK_FAULT_PREAD, pread_fail, EIO);
+	if (worker_fail > 0)
+		ark_test_cli_fault_inject(ARK_CLI_FAULT_EXTRACT_WORKER,
+		                          worker_fail, ARK_ERR_IO_ALLOC,
+		                          ENOMEM);
+	rc = verify_ahead_captured(archive, n_workers, out_path, code,
+	                           errno_value, want);
+	fault_reset();
+	ark_test_cli_fault_reset();
+	return rc;
+}
+
+int test_verify_pipeline_errors_in_order(void)
+{
+	char root[] = "/tmp/ark-thread-vahead-XXXXXX";
+	static const int workers[] = {1, 2, 4, 16};
+	static const char both[] = "verify: a.big\nverify: z.rand\n";
+	static const char first[] = "verify: a.big\n";
+	char good_dir[1024];
+	char bad_dir[1024];
+	char good[1024];
+	char bad[1024];
+	const char *tmp;
+	ark_error_t err = {0};
+	size_t i;
+	int rc = 1;
+
+	tmp = mkdtemp(root);
+	if (tmp == NULL)
+		return 1;
+	if (path_join(good_dir, sizeof(good_dir), tmp, "good") != 0 ||
+	    mkdir(good_dir, 0755) != 0 ||
+	    path_join(bad_dir, sizeof(bad_dir), tmp, "bad") != 0 ||
+	    mkdir(bad_dir, 0755) != 0 ||
+	    make_ahead_archive(good_dir, 0, good, sizeof(good)) != 0 ||
+	    make_ahead_archive(bad_dir, 1, bad, sizeof(bad)) != 0)
+		goto done;
+	/*
+	 * ARCHITECTURE.md section 6.3: the same error and the same verbose
+	 * lines for every worker count, whatever the reader finds ahead.
+	 */
+	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
+		int n = workers[i];
+
+		if (expect_verify_fault(tmp, good, n, 0, 0, ARK_OK, 0, both) !=
+		        0 ||
+		    expect_verify_fault(tmp, good, n, 5, 0, ARK_ERR_IO_READ,
+		                        EIO, both) != 0 ||
+		    expect_verify_fault(tmp, bad, n, 0, 0, ARK_ERR_HASH_MEMBER,
+		                        0, both) != 0 ||
+		    expect_verify_fault(tmp, bad, n, 0, 2, ARK_ERR_IO_ALLOC,
+		                        ENOMEM, first) != 0 ||
+		    expect_verify_fault(tmp, good, n, 5, 4, ARK_ERR_IO_ALLOC,
+		                        ENOMEM, first) != 0 ||
+		    expect_verify_fault(tmp, good, n, 0, 5, ARK_ERR_IO_ALLOC,
+		                        ENOMEM, both) != 0)
+			goto done;
+	}
+	/* --member skips the damaged member, or reaches it. */
+	if (ark_test_verify_archive(bad, "a.big", 0, 4, &err) != 0)
+		goto done;
+	if (ark_test_verify_archive(bad, "z.rand", 0, 4, &err) != -1 ||
+	    err.code != ARK_ERR_HASH_MEMBER)
+		goto done;
+	rc = 0;
+
+done:
+	fault_reset();
+	ark_test_cli_fault_reset();
 	if (remove_tree(tmp) != 0)
 		return 1;
 	return rc;

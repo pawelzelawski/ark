@@ -50,6 +50,9 @@ enum {
 /* Result ring slots per worker: chunks finished while the I/O thread is busy
  * wait in the ring instead of stalling their worker. */
 #define ARK_RING_SLOTS_PER_WORKER 2U
+/* Worker output buffers and ring payloads trade places, so they are one size.
+ */
+#define ARK_RING_SLOT_CAP ark_deflate_bound(ARK_CHUNK_SIZE)
 /* Pending create members beyond one per in-flight chunk. */
 #define ARK_CREATE_PENDING_EXTRA 64U
 
@@ -161,14 +164,14 @@ typedef struct {
 } create_pipe_t;
 
 /*
- * extract_pipe_t - Extract-side decode-ahead across members.
+ * decode_pipe_t - Decode-ahead across members, for extract and verify.
  *
  * The reader side reads, hashes and submits the chunks of the selected
- * regular members in index order, ahead of the writer; the writer creates
- * members and writes their chunks strictly in index order. A reader failure
- * is held at its position (r_member, r_chunk; r_chunk == chunk_count for the
- * member hash) and reported when the writer reaches that position. See
- * ARCHITECTURE.md sections 6.3 and 14.3.
+ * regular members in index order, ahead of the consumer; the consumer takes
+ * the decoded chunks strictly in index order (extract writes them, verify
+ * only checks them). A reader failure is held at its position (r_member,
+ * r_chunk; r_chunk == chunk_count for the member hash) and reported when the
+ * consumer reaches that position. See ARCHITECTURE.md sections 6.3 and 14.3.
  */
 typedef struct {
 	ark_read_ctx_t *rctx;
@@ -188,7 +191,7 @@ typedef struct {
 	uint64_t drain_seq;
 	size_t in_flight;
 	size_t max_in_flight;
-} extract_pipe_t;
+} decode_pipe_t;
 
 typedef struct {
 	char root[PATH_MAX];
@@ -313,8 +316,8 @@ struct ark_pool {
 };
 
 ring_buf_t *ring_buf_init(size_t, ark_error_t *);
-int ring_buf_write(ring_buf_t *, uint64_t, const uint8_t *, size_t, ark_err_t,
-                   ark_error_t *);
+int ring_buf_publish(ring_buf_t *, uint64_t, uint8_t **, size_t, ark_err_t,
+                     ark_error_t *);
 int ring_buf_abort(ring_buf_t *, uint64_t, ark_err_t, ark_error_t *);
 int ring_buf_read(ring_buf_t *, uint64_t, uint8_t **, size_t *, int *,
                   ark_err_t *, ark_error_t *);
@@ -323,9 +326,12 @@ void ring_buf_free(ring_buf_t *);
 static void error_store_once(ark_shared_err_t *, const ark_error_t *);
 static int shared_err_get(const ark_shared_err_t *, ark_error_t *);
 static size_t pool_input_cap(ark_pool_mode_t);
-static size_t pool_output_cap(ark_pool_mode_t);
 static ark_pool_t *pool_init(int, ark_pool_mode_t, int, ark_error_t *);
 static int pool_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
+static int pool_queue_reserve(ark_pool_t *, size_t, pool_queue_slot_t **);
+static void pool_queue_push(ark_pool_t *, uint64_t, const pool_queue_slot_t *,
+                            size_t);
+static int pool_submit_buf(ark_pool_t *, uint64_t, uint8_t **, size_t, size_t);
 static void pool_shutdown(ark_pool_t *);
 
 static void *worker_compress(void *);
@@ -392,7 +398,7 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 	}
 	ring->n_slots = n_slots;
 	for (i = 0U; i < n_slots; i++) {
-		ring->slots[i].cap = ark_deflate_bound(ARK_CHUNK_SIZE);
+		ring->slots[i].cap = ARK_RING_SLOT_CAP;
 		/* OWNERSHIP: each ring slot owns one fixed payload buffer until
 		 * ring_buf_free. */
 		ring->slots[i].data = malloc(ring->slots[i].cap);
@@ -427,33 +433,33 @@ ring_buf_t *ring_buf_init(size_t n_slots, ark_error_t *err)
 }
 
 /*
- * ring_buf_write - Publish one completed worker result into the ring buffer.
+ * ring_buf_publish - Publish one completed worker result into the ring buffer.
  *
- * The caller's data bytes are copied into a preallocated ring slot buffer.
- * The I/O thread receives a borrowed pointer via ring_buf_read and must call
- * ring_buf_release after consuming the slot.
+ * The buffer *data, of ARK_RING_SLOT_CAP bytes, becomes the slot's payload
+ * without a copy, and *data receives the slot's previous buffer for the
+ * caller's next chunk. The I/O thread receives a borrowed pointer via
+ * ring_buf_read and must call ring_buf_release after consuming the slot. On
+ * failure *data is unchanged.
  *
  * Returns 0 on success, -1 on error.
  * Fails with ARK_ERR_USAGE on invalid arguments or duplicate sequence publish.
  *
- * Preconditions: seq is unique for each published chunk and data is non-NULL
- * when len is non-zero.
+ * Preconditions: seq is unique for each published chunk.
  */
-int ring_buf_write(ring_buf_t *ring, uint64_t seq, const uint8_t *data,
-                   size_t len, ark_err_t worker_err, ark_error_t *err)
+int ring_buf_publish(ring_buf_t *ring, uint64_t seq, uint8_t **data, size_t len,
+                     ark_err_t worker_err, ark_error_t *err)
 {
 	ring_slot_t *slot;
+	uint8_t *previous;
 	size_t idx;
-	size_t i;
 	int rc;
 
 	if (ring == NULL)
 		return fail_error(err, ARK_ERR_USAGE, "ring buffer is null", "",
 		                  0);
-	if (len > 0U && data == NULL)
+	if (data == NULL || *data == NULL)
 		return fail_error(err, ARK_ERR_USAGE,
-		                  "ring write data is null for non-zero length",
-		                  "", 0);
+		                  "ring publish buffer is null", "", 0);
 
 	idx = (size_t)(seq % ring->n_slots);
 	slot = &ring->slots[idx];
@@ -485,11 +491,13 @@ int ring_buf_write(ring_buf_t *ring, uint64_t seq, const uint8_t *data,
 	 * SAFETY: ring slots are reused modulo n_slots. Writers must not
 	 * overwrite a still-owned slot for another sequence; waiting here
 	 * preserves strict in-order drain semantics from ARCHITECTURE.md
-	 * section 6.3.
+	 * section 6.3. No reader borrows the slot's buffer here: it is free
+	 * (ready is 0), so it can change owner.
 	 */
 	slot->seq = seq;
-	for (i = 0U; i < len; i++)
-		slot->data[i] = data[i];
+	previous = slot->data;
+	slot->data = *data;
+	*data = previous;
 	slot->len = len;
 	slot->abort = 0;
 	slot->worker_err = worker_err;
@@ -724,19 +732,6 @@ static size_t pool_input_cap(ark_pool_mode_t mode)
 }
 
 /*
- * pool_output_cap - Return maximum worker output size for a pool mode.
- *
- * Compress workers may emit up to ark_deflate_bound(ARK_CHUNK_SIZE) bytes;
- * decompress workers emit at most one uncompressed ARK chunk.
- */
-static size_t pool_output_cap(ark_pool_mode_t mode)
-{
-	if (mode == ARK_POOL_DECOMPRESS)
-		return ARK_CHUNK_SIZE;
-	return ark_deflate_bound(ARK_CHUNK_SIZE);
-}
-
-/*
  * pool_init - Allocate and initialise a worker pool bound to one mode.
  *
  * mode selects a fixed worker routine for the lifetime of the pool:
@@ -816,7 +811,7 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, int level,
 	for (i = 0; i < n_workers; i++) {
 		pool->worker_args[i].pool = pool;
 		pool->worker_args[i].src_cap = pool_input_cap(mode);
-		pool->worker_args[i].dst_cap = pool_output_cap(mode);
+		pool->worker_args[i].dst_cap = ARK_RING_SLOT_CAP;
 		pool->worker_args[i].src = malloc(pool->worker_args[i].src_cap);
 		pool->worker_args[i].dst = malloc(pool->worker_args[i].dst_cap);
 		/*
@@ -1057,23 +1052,16 @@ static ark_pool_t *pool_init(int n_workers, ark_pool_mode_t mode, int level,
 }
 
 /*
- * pool_submit - Enqueue one chunk for processing by a mode-bound worker pool.
+ * pool_queue_reserve - Wait for a free queue slot able to hold src_len bytes.
  *
- * Blocks while the queue is full. Returns -1 if cancellation is active.
- *
- * pool_submit copies src bytes into a preallocated queue slot. No allocation
- * occurs on the per-chunk hot path.
+ * Returns 0 with pool->mutex held and *qslot set, for pool_queue_push; -1 with
+ * the mutex released on a size, cancellation or synchronisation failure.
  */
-static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
-                       size_t src_len)
+static int pool_queue_reserve(ark_pool_t *pool, size_t src_len,
+                              pool_queue_slot_t **qslot)
 {
-	pool_queue_slot_t *qslot;
 	int rc;
 
-	if (pool == NULL)
-		return -1;
-	if (src_len > 0U && src == NULL)
-		return -1;
 	if (src_len > pool_input_cap(pool->mode))
 		return -1;
 	if (__atomic_load_n((int *)&pool->cancelled, __ATOMIC_ACQUIRE) != 0)
@@ -1096,13 +1084,20 @@ static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 		return -1;
 	}
 
-	qslot = &pool->queue_slots[pool->q_tail];
-	if (src_len > qslot->cap) {
+	*qslot = &pool->queue_slots[pool->q_tail];
+	if (src_len > (*qslot)->cap) {
 		(void)pthread_mutex_unlock(&pool->mutex);
 		return -1;
 	}
-	for (size_t i = 0U; i < src_len; i++)
-		qslot->src[i] = src[i];
+	return 0;
+}
+
+/*
+ * pool_queue_push - Publish the reserved slot's chunk and release pool->mutex.
+ */
+static void pool_queue_push(ark_pool_t *pool, uint64_t seq,
+                            const pool_queue_slot_t *qslot, size_t src_len)
+{
 	pool->queue[pool->q_tail] = (pool_work_t){
 	    .seq = seq,
 	    .src = qslot->src,
@@ -1112,6 +1107,58 @@ static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 	pool->q_count++;
 	(void)pthread_cond_signal(&pool->cv_not_empty);
 	(void)pthread_mutex_unlock(&pool->mutex);
+}
+
+/*
+ * pool_submit - Enqueue one chunk for processing by a mode-bound worker pool.
+ *
+ * Blocks while the queue is full. Returns -1 if cancellation is active.
+ *
+ * pool_submit copies src bytes into a preallocated queue slot; a caller whose
+ * buffer can change owner uses pool_submit_buf instead. No allocation
+ * occurs on the per-chunk hot path.
+ */
+static int pool_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
+                       size_t src_len)
+{
+	pool_queue_slot_t *qslot;
+
+	if (pool == NULL)
+		return -1;
+	if (src_len > 0U && src == NULL)
+		return -1;
+	if (pool_queue_reserve(pool, src_len, &qslot) != 0)
+		return -1;
+	for (size_t i = 0U; i < src_len; i++)
+		qslot->src[i] = src[i];
+	pool_queue_push(pool, seq, qslot, src_len);
+	return 0;
+}
+
+/*
+ * pool_submit_buf - Enqueue one chunk held in a caller buffer, without a copy.
+ *
+ * The buffer *buf, of buf_cap bytes, becomes the queue slot's input, and *buf
+ * receives the slot's previous buffer for the caller's next chunk. buf_cap
+ * must be the pool's input capacity. On failure *buf is unchanged.
+ *
+ * Returns 0 on success, -1 on invalid arguments or cancellation.
+ */
+static int pool_submit_buf(ark_pool_t *pool, uint64_t seq, uint8_t **buf,
+                           size_t buf_cap, size_t src_len)
+{
+	pool_queue_slot_t *qslot;
+	uint8_t *previous;
+
+	if (pool == NULL || buf == NULL || *buf == NULL ||
+	    buf_cap != pool_input_cap(pool->mode))
+		return -1;
+	if (pool_queue_reserve(pool, src_len, &qslot) != 0)
+		return -1;
+	previous = qslot->src;
+	qslot->src = *buf;
+	*buf = previous;
+	pool_queue_push(pool, seq, qslot, src_len);
 	return 0;
 }
 
@@ -1224,9 +1271,9 @@ static void *worker_compress(void *arg)
 			(void)pthread_mutex_unlock(&pool->mutex);
 			break;
 		}
-		for (size_t i = 0U; i < work.src_len; i++)
-			warg->src[i] = work.src[i];
-		work.src = warg->src;
+		/* The queue slot keeps the worker's free buffer. */
+		pool->queue_slots[pool->q_head].src = warg->src;
+		warg->src = work.src;
 		work.dst = warg->dst;
 		work.dst_cap = warg->dst_cap;
 		pool->queue[pool->q_head] = (pool_work_t){0};
@@ -1282,8 +1329,8 @@ static void *worker_compress(void *arg)
 			break;
 		}
 
-		if (ring_buf_write(pool->ring, work.seq, out, out_len, ARK_OK,
-		                   NULL) != 0) {
+		if (ring_buf_publish(pool->ring, work.seq, &warg->dst, out_len,
+		                     ARK_OK, NULL) != 0) {
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
@@ -1352,9 +1399,9 @@ static void *worker_decompress(void *arg)
 			(void)pthread_mutex_unlock(&pool->mutex);
 			break;
 		}
-		for (size_t i = 0U; i < work.src_len; i++)
-			warg->src[i] = work.src[i];
-		work.src = warg->src;
+		/* The queue slot keeps the worker's free buffer. */
+		pool->queue_slots[pool->q_head].src = warg->src;
+		warg->src = work.src;
 		work.dst = warg->dst;
 		pool->queue[pool->q_head] = (pool_work_t){0};
 		pool->q_head = (pool->q_head + 1U) % pool->q_cap;
@@ -1394,8 +1441,8 @@ static void *worker_decompress(void *arg)
 			break;
 		}
 
-		if (ring_buf_write(pool->ring, work.seq, out, out_len, ARK_OK,
-		                   NULL) != 0) {
+		if (ring_buf_publish(pool->ring, work.seq, &warg->dst, out_len,
+		                     ARK_OK, NULL) != 0) {
 			ark_error_t local_err = {0};
 
 			(void)fail_error(&local_err, ARK_ERR_IO_WRITE,
@@ -1424,7 +1471,7 @@ static int parent_dir(const char *, char *, size_t, ark_error_t *);
 static int cmd_create(const ark_args_t *, ark_pool_t *, ark_error_t *);
 static int cmd_extract(const ark_args_t *, int, ark_pool_t *, ark_error_t *);
 static int cmd_list(const ark_args_t *, ark_error_t *);
-static int cmd_verify(const ark_args_t *, ark_error_t *);
+static int cmd_verify(const ark_args_t *, ark_pool_t *, ark_error_t *);
 static int cmd_generate_reader(const ark_args_t *, ark_error_t *);
 static int create_pipe_init(create_pipe_t *, ark_write_ctx_t *,
                             chevron_handle_t *, ark_pool_t *, const char *,
@@ -1478,11 +1525,11 @@ static int read_full(int, void *, size_t, const char *, ark_error_t *);
 static int read_chunk_at(int, void *, size_t, uint64_t, const char *,
                          ark_error_t *);
 static int write_full(int, const void *, size_t, const char *, ark_error_t *);
-static int extract_pipe_read_one(extract_pipe_t *, ark_error_t *);
-static int extract_pipe_take(extract_pipe_t *, const ark_member_meta_t *,
-                             uint32_t, uint8_t **, size_t *, ark_error_t *);
-static void extract_pipe_release(extract_pipe_t *);
-static int extract_pipe_member_end(extract_pipe_t *, uint32_t, ark_error_t *);
+static int decode_pipe_read_one(decode_pipe_t *, ark_error_t *);
+static int decode_pipe_take(decode_pipe_t *, const ark_member_meta_t *,
+                            uint32_t, uint8_t **, size_t *, ark_error_t *);
+static void decode_pipe_release(decode_pipe_t *);
+static int decode_pipe_member_end(decode_pipe_t *, uint32_t, ark_error_t *);
 static uint64_t le64_decode(const uint8_t *);
 static int read_archive_index(int, const char *, ark_read_ctx_t *, uint8_t **,
                               size_t *, ark_error_t *);
@@ -1517,6 +1564,7 @@ static void format_mtime_human(uint64_t, char *, size_t);
 #ifdef ARK_TEST
 ark_pool_t *pool_test_init(int, int, ark_error_t *);
 int pool_test_submit(ark_pool_t *, uint64_t, const uint8_t *, size_t);
+int pool_test_submit_buf(ark_pool_t *, uint64_t, uint8_t **, size_t, size_t);
 int pool_test_read(ark_pool_t *, uint64_t, uint8_t **, size_t *, int *,
                    ark_err_t *, ark_error_t *);
 void pool_test_cancel(ark_pool_t *);
@@ -1531,6 +1579,8 @@ void ark_test_cli_fault_reset(void);
 void ark_test_cli_fault_inject(int, int, ark_err_t, int);
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
+int ark_test_verify_archive(const char *, const char *, int, int,
+                            ark_error_t *);
 size_t ark_test_known_dir_prefix(const char *, const char *);
 void ark_test_force_owner_restore(int);
 static int ark_test_cli_fault_should_fail(int, ark_error_t *, const char *);
@@ -2981,18 +3031,18 @@ cleanup:
 /*
  * cmd_verify - Validate archive and verify selected regular members.
  *
- * ARCHITECTURE.md section 14.3: verify hashes compressed bytes while
- * decompressing each chunk into a bounded temporary buffer with no
- * filesystem writes.
+ * ARCHITECTURE.md sections 6.3 and 14.3: the I/O thread reads and hashes
+ * compressed bytes, workers decompress into ring slots, and the results are
+ * checked in archive order with no filesystem writes.
  */
-static int cmd_verify(const ark_args_t *args, ark_error_t *err)
+static int cmd_verify(const ark_args_t *args, ark_pool_t *pool,
+                      ark_error_t *err)
 {
 	ark_read_ctx_storage_t rstorage = {0};
 	ark_read_ctx_t *rctx;
+	decode_pipe_t pipe = {0};
 	uint8_t *index_buf;
 	unsigned char *selected;
-	uint8_t *comp_buf;
-	uint8_t *decomp_buf;
 	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
@@ -3002,14 +3052,17 @@ static int cmd_verify(const ark_args_t *args, ark_error_t *err)
 	rctx = (ark_read_ctx_t *)rstorage.bytes;
 	index_buf = NULL;
 	selected = NULL;
-	comp_buf = NULL;
-	decomp_buf = NULL;
 	rc = -1;
+	if (pool == NULL)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "verify worker pool is required", "", 0);
 
 	archive_fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
-	if (archive_fd == -1)
-		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
-		                  args->archive_path, errno);
+	if (archive_fd == -1) {
+		(void)fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
+		                 args->archive_path, errno);
+		goto cleanup;
+	}
 	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
 	                       &index_len, err) != 0)
 		goto cleanup;
@@ -3026,20 +3079,30 @@ static int cmd_verify(const ark_args_t *args, ark_error_t *err)
 		goto cleanup;
 
 	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
-	/* OWNERSHIP: command cleanup frees both verification buffers. */
-	comp_buf = (uint8_t *)malloc(comp_cap);
-	decomp_buf = (uint8_t *)malloc(ARK_CHUNK_SIZE);
-	if (comp_buf == NULL || decomp_buf == NULL) {
+	/* OWNERSHIP: command cleanup frees pipe.comp_buf, which is whichever
+	 * buffer the pool handed back last. */
+	pipe.comp_buf = (uint8_t *)malloc(comp_cap);
+	if (pipe.comp_buf == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
-		                 "verification buffer allocation failed", "",
-		                 0);
+		                 "chunk buffer allocation failed", "", 0);
 		goto cleanup;
 	}
+	/*
+	 * At most one chunk per ring slot is in flight, so a worker never
+	 * waits for a slot the I/O thread has not drained. See ARCHITECTURE.md
+	 * section 6.3.
+	 */
+	pipe.rctx = rctx;
+	pipe.pool = pool;
+	pipe.selected = selected;
+	pipe.member_count = member_count;
+	pipe.archive_fd = archive_fd;
+	pipe.comp_cap = comp_cap;
+	pipe.max_in_flight = pool->ring->n_slots;
 
 	for (uint32_t i = 0U; i < member_count; i++) {
 		const ark_member_meta_t *meta;
 		uint32_t chunk;
-		uint64_t chunk_off;
 
 		if (selected[i] == 0U)
 			continue;
@@ -3056,53 +3119,33 @@ static int cmd_verify(const ark_args_t *args, ark_error_t *err)
 			}
 		}
 
-		if (ark_read_verify_member_begin(rctx, meta, err) != 0)
-			goto cleanup;
-		chunk_off = meta->data_offset;
+		/*
+		 * SAFETY: the reader hashes compressed bytes in on-disk chunk
+		 * order before submitting them for decompression; results and
+		 * held failures are taken in archive order. See ARCHITECTURE.md
+		 * sections 6.3 and 14.3.
+		 */
 		for (chunk = 0U; chunk < meta->chunk_count; chunk++) {
-			size_t csz;
+			uint8_t *out_buf = NULL;
+			size_t out_len = 0U;
 
-			csz = (size_t)meta->chunk_sizes[chunk];
-			if (csz > comp_cap) {
-				(void)fail_error(err, ARK_ERR_FMT_INDEX,
-				                 "chunk size exceeds bound",
-				                 meta->path, 0);
+			if (decode_pipe_take(&pipe, meta, chunk, &out_buf,
+			                     &out_len, err) != 0)
 				goto cleanup;
-			}
-			if (read_chunk_at(archive_fd, comp_buf, csz, chunk_off,
-			                  meta->path, err) != 0)
-				goto cleanup;
-			/*
-			 * SAFETY: verification hashes compressed bytes in
-			 * on-disk chunk order before decompression. See
-			 * ARCHITECTURE.md section 14.3.
-			 */
-			if (ark_read_verify_member_update(
-			        rctx, meta, chunk, comp_buf, csz, err) != 0)
-				goto cleanup;
-			if (ark_read_chunk(rctx, meta, chunk, comp_buf, csz,
-			                   decomp_buf, ARK_CHUNK_SIZE, err) < 0)
-				goto cleanup;
-			if (UINT64_MAX - chunk_off < (uint64_t)csz) {
-				(void)fail_error(err, ARK_ERR_FMT_INDEX,
-				                 "chunk offset overflow",
-				                 meta->path, 0);
-				goto cleanup;
-			}
-			chunk_off += (uint64_t)csz;
+			decode_pipe_release(&pipe);
 		}
-		if (ark_read_verify_member_final(rctx, meta, err) != 0)
+		if (decode_pipe_member_end(&pipe, i, err) != 0)
 			goto cleanup;
 	}
 
 	rc = 0;
 
 cleanup:
-	free(decomp_buf);
-	free(comp_buf);
+	pool_shutdown(pool);
+	free(pipe.comp_buf);
 	free(selected);
 	free(index_buf);
-	if (ARK_CLOSE(archive_fd) != 0 && rc == 0)
+	if (archive_fd != -1 && ARK_CLOSE(archive_fd) != 0 && rc == 0)
 		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
 		                args->archive_path, errno);
 	(void)index_len;
@@ -3147,7 +3190,7 @@ static int cmd_generate_reader(const ark_args_t *args, ark_error_t *err)
 }
 
 /*
- * extract_pipe_read_one - Advance the reader by one chunk or one member end.
+ * decode_pipe_read_one - Advance the reader by one chunk or one member end.
  *
  * Reads, hashes and submits the next chunk, or finishes the member hash after
  * its last chunk. Unselected and non-regular members are skipped. A failed
@@ -3156,7 +3199,7 @@ static int cmd_generate_reader(const ark_args_t *args, ark_error_t *err)
  * Returns 1 after a step, 0 when the reader is done, holds a failure or has
  * no ring slot for its next chunk, -1 on an error reported at once.
  */
-static int extract_pipe_read_one(extract_pipe_t *p, ark_error_t *err)
+static int decode_pipe_read_one(decode_pipe_t *p, ark_error_t *err)
 {
 	const ark_member_meta_t *meta;
 	size_t csz;
@@ -3214,10 +3257,11 @@ static int extract_pipe_read_one(extract_pipe_t *p, ark_error_t *err)
 		p->r_failed = 1;
 		return 0;
 	}
-	if (pool_submit(p->pool, p->submit_seq, p->comp_buf, csz) != 0) {
+	if (pool_submit_buf(p->pool, p->submit_seq, &p->comp_buf, p->comp_cap,
+	                    csz) != 0) {
 		if (!shared_err_get(&p->pool->shared_err, err))
 			(void)fail_error(err, ARK_ERR_FMT_DATA,
-			                 "extract worker submit failed",
+			                 "decode worker submit failed",
 			                 meta->path, 0);
 		return -1;
 	}
@@ -3229,19 +3273,19 @@ static int extract_pipe_read_one(extract_pipe_t *p, ark_error_t *err)
 }
 
 /*
- * extract_pipe_take - Wait for chunk `chunk` of the member being written.
+ * decode_pipe_take - Wait for chunk `chunk` of the member being consumed.
  *
  * Lets the reader fill every free ring slot first, then waits for the oldest
  * in-flight chunk, which is the requested one: both sides walk the same
  * members and chunks in index order. With nothing in flight the reader holds
  * a failure at exactly this chunk, which is reported now. On success *data
- * borrows the ring slot until extract_pipe_release.
+ * borrows the ring slot until decode_pipe_release.
  *
  * Returns 0 on success, -1 on error.
  */
-static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
-                             uint32_t chunk, uint8_t **data, size_t *len,
-                             ark_error_t *err)
+static int decode_pipe_take(decode_pipe_t *p, const ark_member_meta_t *meta,
+                            uint32_t chunk, uint8_t **data, size_t *len,
+                            ark_error_t *err)
 {
 	ark_err_t worker_err;
 	size_t expected_len;
@@ -3249,7 +3293,7 @@ static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
 	int rc;
 
 	do {
-		rc = extract_pipe_read_one(p, err);
+		rc = decode_pipe_read_one(p, err);
 		if (rc < 0)
 			return -1;
 	} while (rc > 0);
@@ -3259,8 +3303,8 @@ static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
 			return -1;
 		}
 		return fail_error(err, ARK_ERR_USAGE,
-		                  "extract pipeline out of sequence",
-		                  meta->path, 0);
+		                  "decode pipeline out of sequence", meta->path,
+		                  0);
 	}
 
 	*data = NULL;
@@ -3276,8 +3320,8 @@ static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
 			    err,
 			    worker_err != ARK_OK ? worker_err
 			                         : ARK_ERR_FMT_DATA,
-			    "extract worker aborted", meta->path, 0);
-		extract_pipe_release(p);
+			    "invalid deflate stream", meta->path, 0);
+		decode_pipe_release(p);
 		return -1;
 	}
 
@@ -3293,16 +3337,16 @@ static int extract_pipe_take(extract_pipe_t *p, const ark_member_meta_t *meta,
 		(void)fail_error(err, ARK_ERR_FMT_DATA,
 		                 "decompressed chunk length mismatch",
 		                 meta->path, 0);
-		extract_pipe_release(p);
+		decode_pipe_release(p);
 		return -1;
 	}
 	return 0;
 }
 
 /*
- * extract_pipe_release - Return the oldest in-flight chunk's ring slot.
+ * decode_pipe_release - Return the oldest in-flight chunk's ring slot.
  */
-static void extract_pipe_release(extract_pipe_t *p)
+static void decode_pipe_release(decode_pipe_t *p)
 {
 	ring_buf_release(p->pool->ring, p->drain_seq);
 	p->drain_seq++;
@@ -3310,7 +3354,7 @@ static void extract_pipe_release(extract_pipe_t *p)
 }
 
 /*
- * extract_pipe_member_end - Report the member hash once all chunks are written.
+ * decode_pipe_member_end - Report the member hash once all chunks are taken.
  *
  * Moves the reader past member i (its hash is finished after its last chunk
  * was read) and reports a failure held at member i: its hash, or for a
@@ -3318,13 +3362,13 @@ static void extract_pipe_release(extract_pipe_t *p)
  *
  * Returns 0 on success, -1 on error.
  */
-static int extract_pipe_member_end(extract_pipe_t *p, uint32_t i,
-                                   ark_error_t *err)
+static int decode_pipe_member_end(decode_pipe_t *p, uint32_t i,
+                                  ark_error_t *err)
 {
 	while (!p->r_failed && p->r_member <= i) {
 		int rc;
 
-		rc = extract_pipe_read_one(p, err);
+		rc = decode_pipe_read_one(p, err);
 		if (rc < 0)
 			return -1;
 		if (rc == 0)
@@ -3336,7 +3380,7 @@ static int extract_pipe_member_end(extract_pipe_t *p, uint32_t i,
 	}
 	if (!p->r_failed && p->r_member <= i)
 		return fail_error(err, ARK_ERR_USAGE,
-		                  "extract pipeline out of sequence", "", 0);
+		                  "decode pipeline out of sequence", "", 0);
 	return 0;
 }
 
@@ -3354,11 +3398,10 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	ark_read_ctx_t *rctx;
 	cleanup_tracker_t tracker = {0};
 	dir_deferred_meta_t deferred_dirs = {0};
-	extract_pipe_t pipe = {0};
+	decode_pipe_t pipe = {0};
 	char known_dir[1024];
 	uint8_t *index_buf;
 	unsigned char *selected;
-	uint8_t *comp_buf;
 	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
@@ -3369,7 +3412,6 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	rctx = (ark_read_ctx_t *)rstorage.bytes;
 	index_buf = NULL;
 	selected = NULL;
-	comp_buf = NULL;
 	archive_fd = -1;
 	out_fd = -1;
 	rc = -1;
@@ -3408,9 +3450,10 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 		goto cleanup;
 
 	comp_cap = ark_deflate_bound(ARK_CHUNK_SIZE);
-	/* OWNERSHIP: command cleanup frees comp_buf. */
-	comp_buf = (uint8_t *)malloc(comp_cap);
-	if (comp_buf == NULL) {
+	/* OWNERSHIP: command cleanup frees pipe.comp_buf, which is whichever
+	 * buffer the pool handed back last. */
+	pipe.comp_buf = (uint8_t *)malloc(comp_cap);
+	if (pipe.comp_buf == NULL) {
 		(void)fail_error(err, ARK_ERR_IO_ALLOC,
 		                 "chunk buffer allocation failed", "", 0);
 		goto cleanup;
@@ -3425,7 +3468,6 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	pipe.selected = selected;
 	pipe.member_count = member_count;
 	pipe.archive_fd = archive_fd;
-	pipe.comp_buf = comp_buf;
 	pipe.comp_cap = comp_cap;
 	pipe.max_in_flight = pool->ring->n_slots;
 
@@ -3609,17 +3651,17 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				size_t out_len = 0U;
 				int wrc;
 
-				if (extract_pipe_take(&pipe, meta, chunk,
-				                      &out_buf, &out_len,
-				                      err) != 0)
+				if (decode_pipe_take(&pipe, meta, chunk,
+				                     &out_buf, &out_len,
+				                     err) != 0)
 					goto cleanup;
 				wrc = write_full(out_fd, out_buf, out_len,
 				                 meta->path, err);
-				extract_pipe_release(&pipe);
+				decode_pipe_release(&pipe);
 				if (wrc != 0)
 					goto cleanup;
 			}
-			if (extract_pipe_member_end(&pipe, i, err) != 0)
+			if (decode_pipe_member_end(&pipe, i, err) != 0)
 				goto cleanup;
 			if (restore_regular_meta(out_fd, meta, err) != 0)
 				goto cleanup;
@@ -3661,7 +3703,7 @@ cleanup:
 	}
 	cleanup_free(&tracker);
 	dir_deferred_free(&deferred_dirs);
-	free(comp_buf);
+	free(pipe.comp_buf);
 	free(selected);
 	free(index_buf);
 	if (archive_fd != -1 && ARK_CLOSE(archive_fd) != 0 && rc == 0)
@@ -5160,9 +5202,14 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 		if (unveil(NULL, NULL) != 0)
 			return fail_error(err, ARK_ERR_USAGE,
 			                  "unveil lock failed", "", errno);
-		if (pledge("stdio rpath", NULL) != 0)
+		if (cmd == ARK_CMD_VERIFY) {
+			if (openbsd_pledge_threads_precreated(
+			        "stdio rpath pthread", "stdio rpath", err) != 0)
+				return -1;
+		} else if (pledge("stdio rpath", NULL) != 0) {
 			return fail_error(err, ARK_ERR_USAGE, "pledge failed",
 			                  "", errno);
+		}
 		return 0;
 	case ARK_CMD_GENERATE_READER:
 		if (dst_path == NULL)
@@ -5700,6 +5747,13 @@ int pool_test_submit(ark_pool_t *pool, uint64_t seq, const uint8_t *src,
 	return pool_submit(pool, seq, src, src_len);
 }
 
+/* ARK_TEST only: submit one work item by handing the buffer over. */
+int pool_test_submit_buf(ark_pool_t *pool, uint64_t seq, uint8_t **buf,
+                         size_t buf_cap, size_t src_len)
+{
+	return pool_submit_buf(pool, seq, buf, buf_cap, src_len);
+}
+
 /* ARK_TEST only: read one ring slot through pool-owned ring buffer. */
 int pool_test_read(ark_pool_t *pool, uint64_t seq, uint8_t **data, size_t *len,
                    int *abort, ark_err_t *worker_err, ark_error_t *err)
@@ -5892,6 +5946,32 @@ int ark_test_extract_archive(const char *archive_path, const char *output_path,
 		                "output directory close failed", output_path,
 		                errno);
 	return rc;
+}
+
+/* ARK_TEST only: run verify with an explicit worker count. */
+int ark_test_verify_archive(const char *archive_path, const char *member_path,
+                            int verbose, int n_workers, ark_error_t *err)
+{
+	ark_args_t args;
+	ark_pool_t *pool;
+
+	if (archive_path == NULL || n_workers <= 0)
+		return fail_error(
+		    err, ARK_ERR_USAGE,
+		    "ARK_TEST verify helper received invalid arguments", "", 0);
+
+	args = (ark_args_t){0};
+	args.cmd = ARK_CMD_VERIFY;
+	args.archive_path = archive_path;
+	args.verbose = verbose;
+	if (member_path != NULL) {
+		args.member_paths = &member_path;
+		args.member_count = 1U;
+	}
+	pool = pool_init(n_workers, ARK_POOL_DECOMPRESS, 0, err);
+	if (pool == NULL)
+		return -1;
+	return cmd_verify(&args, pool, err);
 }
 
 /* ARK_TEST only: expose the extract parent-directory cache prefix rule. */
@@ -6094,9 +6174,10 @@ int main(int argc, char **argv)
 #if defined(__OpenBSD__) && !defined(__linux__)
 	/*
 	 * SAFETY: OpenBSD requires thread-pool creation before pledge for
-	 * create/extract. See ARCHITECTURE.md sections 6.3 and 10.4.
+	 * create/extract/verify. See ARCHITECTURE.md sections 6.3 and 10.4.
 	 */
-	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT) {
+	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT ||
+	    args.cmd == ARK_CMD_VERIFY) {
 		io_pool =
 		    pool_init(default_worker_count(),
 		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
@@ -6149,7 +6230,8 @@ int main(int argc, char **argv)
 	 * workers inherit Landlock at thread start. See ARCHITECTURE.md
 	 * sections 6.3 and 10.4.
 	 */
-	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT) {
+	if (args.cmd == ARK_CMD_CREATE || args.cmd == ARK_CMD_EXTRACT ||
+	    args.cmd == ARK_CMD_VERIFY) {
 		io_pool =
 		    pool_init(default_worker_count(),
 		              args.cmd == ARK_CMD_CREATE ? ARK_POOL_COMPRESS
@@ -6174,7 +6256,7 @@ int main(int argc, char **argv)
 	else if (args.cmd == ARK_CMD_LIST)
 		rc = cmd_list(&args, &err);
 	else if (args.cmd == ARK_CMD_VERIFY)
-		rc = cmd_verify(&args, &err);
+		rc = cmd_verify(&args, io_pool, &err), io_pool = NULL;
 	else if (args.cmd == ARK_CMD_GENERATE_READER)
 		rc = cmd_generate_reader(&args, &err);
 	else

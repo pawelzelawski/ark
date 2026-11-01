@@ -293,6 +293,10 @@ int test_create_pipeline_worker_fault(void);
 int test_extract_pipeline_matches_across_workers(void);
 int test_extract_pipeline_errors_in_order(void);
 int test_extract_pipeline_short_reads(void);
+int test_ring_publish_swaps_buffers(void);
+int test_pool_submit_buf_hands_over(void);
+int test_verify_pipeline_matches_across_workers(void);
+int test_verify_pipeline_errors_in_order(void);
 int test_extract_known_dir_prefix(void);
 
 int test_sha256_empty(void);
@@ -679,6 +683,12 @@ static const test_case_t g_tests[] = {
     {"test_extract_pipeline_errors_in_order",
      test_extract_pipeline_errors_in_order},
     {"test_extract_pipeline_short_reads", test_extract_pipeline_short_reads},
+    {"test_ring_publish_swaps_buffers", test_ring_publish_swaps_buffers},
+    {"test_pool_submit_buf_hands_over", test_pool_submit_buf_hands_over},
+    {"test_verify_pipeline_matches_across_workers",
+     test_verify_pipeline_matches_across_workers},
+    {"test_verify_pipeline_errors_in_order",
+     test_verify_pipeline_errors_in_order},
     {"test_extract_known_dir_prefix", test_extract_known_dir_prefix},
     {"test_extract_stub", test_extract_stub},
     {"test_integration_single_file", test_integration_single_file},

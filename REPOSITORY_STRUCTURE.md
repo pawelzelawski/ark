@@ -293,15 +293,17 @@ src/
                         #   cmd_extract()         - validate index, extract members
                         #   cmd_list()            - read index, print member table
                         #   cmd_verify()          - read index, verify all member hashes
+                        #                           and chunks on the worker pool
                         #   cmd_generate_reader() - write recovery_template.c to output
                         #
                         # Argument parsing:
                         #   parse_args()          - validate flags and operands
                         #
-                        # Thread pool (create and extract):
+                        # Thread pool (create, extract and verify):
                         #   pool_init()           - allocate worker pool and
                         #                           per-worker encoders
-                        #   pool_submit()         - submit chunk to worker queue
+                        #   pool_submit()         - copy chunk into worker queue
+                        #   pool_submit_buf()     - hand chunk buffer to worker queue
                         #   pool_shutdown()       - cancel flag, join, free
                         #   worker_compress()     - worker thread: compress one chunk
                         #   worker_decompress()   - worker thread: decompress one chunk
@@ -317,19 +319,19 @@ src/
                         #   create_pipe_flush()   - write all queued chunks and
                         #                           members, in order
                         #
-                        # Extract decode-ahead (chunks of later members in
-                        # flight, members written in index order):
-                        #   extract_pipe_read_one()   - read, hash and submit
+                        # Decode-ahead for extract and verify (chunks of later
+                        # members in flight, results taken in index order):
+                        #   decode_pipe_read_one()    - read, hash and submit
                         #                               the next chunk
-                        #   extract_pipe_take()       - wait for the chunk being
-                        #                               written; report a held
+                        #   decode_pipe_take()        - wait for the chunk being
+                        #                               consumed; report a held
                         #                               reader failure
-                        #   extract_pipe_member_end() - report a held member
+                        #   decode_pipe_member_end()  - report a held member
                         #                               hash failure
                         #
                         # Ring buffer:
                         #   ring_buf_init()       - initialise fixed-size ring buffer
-                        #   ring_buf_write()      - worker: write compressed result
+                        #   ring_buf_publish()    - worker: hand result buffer to slot
                         #   ring_buf_abort()      - worker: write abort sentinel
                         #   ring_buf_read()       - I/O thread: read next slot in order
                         #   ring_buf_free()       - release ring buffer
@@ -466,6 +468,8 @@ tests/
 │                           # Extract decode-ahead: same tree for every
 │                           #   worker count; failures found ahead reported
 │                           #   in archive order; parent-directory cache.
+│                           # Parallel verify: same result and --verbose lines
+│                           #   for every worker count.
 │                           # TSan required at phase boundary.
 │                           # See TESTING.md §4.
 │
@@ -704,12 +708,13 @@ Checks: >
 | `cmd_verify` | `src/main.c` | Internal; verify subcommand |
 | `cmd_generate_reader` | `src/main.c` | Internal; generate-reader subcommand |
 | `pool_init` | `src/main.c` | Internal; thread pool setup |
-| `pool_submit` | `src/main.c` | Internal; enqueue chunk for worker |
+| `pool_submit` | `src/main.c` | Internal; enqueue a copy of a chunk for a worker |
+| `pool_submit_buf` | `src/main.c` | Internal; enqueue a chunk by handing its buffer over |
 | `pool_shutdown` | `src/main.c` | Internal; cancel, join, free |
 | `worker_compress` | `src/main.c` | Internal; compression worker thread |
 | `worker_decompress` | `src/main.c` | Internal; decompression worker thread |
 | `ring_buf_init` | `src/main.c` | Internal; ring buffer setup |
-| `ring_buf_write` | `src/main.c` | Internal; worker writes result slot |
+| `ring_buf_publish` | `src/main.c` | Internal; worker hands its result buffer to the slot |
 | `ring_buf_abort` | `src/main.c` | Internal; worker writes abort sentinel |
 | `ring_buf_read` | `src/main.c` | Internal; I/O thread reads next slot |
 | `ring_buf_free` | `src/main.c` | Internal; release ring buffer |
@@ -718,9 +723,9 @@ Checks: >
 | `create_pipe_add` | `src/main.c` | Internal; queue a create member in order |
 | `create_pipe_submit` | `src/main.c` | Internal; submit one create chunk |
 | `create_pipe_flush` | `src/main.c` | Internal; write all queued chunks and members |
-| `extract_pipe_read_one` | `src/main.c` | Internal; read, hash and submit the next extract chunk |
-| `extract_pipe_take` | `src/main.c` | Internal; wait for the chunk being written, in order |
-| `extract_pipe_member_end` | `src/main.c` | Internal; report a held member hash failure |
+| `decode_pipe_read_one` | `src/main.c` | Internal; read, hash and submit the next extract or verify chunk |
+| `decode_pipe_take` | `src/main.c` | Internal; wait for the chunk being consumed, in order |
+| `decode_pipe_member_end` | `src/main.c` | Internal; report a held member hash failure |
 | `cleanup_track` | `src/main.c` | Internal; register created object |
 | `cleanup_created` | `src/main.c` | Internal; remove all tracked objects |
 | `sandbox_apply` | `src/main.c` | Internal; pledge/Landlock per subcommand |

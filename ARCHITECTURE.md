@@ -609,6 +609,27 @@ writer checks a member's ancestor directories (§14.4) only below the last
 directory it confirmed or created in this run: ark never replaces a
 directory, so a confirmed directory stays one.
 
+**Parallel verify.** `verify` uses the same reader side, ring and workers. In
+place of the writer, the I/O thread takes each decoded chunk in index order,
+checks its length and releases the slot, and it prints the `--verbose` line of
+a member when it reaches that member. A failure is held and reported in the
+same way, so the error and the `--verbose` lines are the same for every worker
+count, and they are the ones a single-threaded loop would give: within a
+member, a decode or length failure of a chunk comes before the member hash
+mismatch, which is reported after the member's last chunk. `verify` writes
+nothing to the filesystem, so no cleanup follows the failure.
+
+**Buffer handoff.** Chunk bytes are not copied on their way through the pool:
+the decode pipeline hands its compressed chunk buffer to a queue slot and gets
+the slot's free buffer back (`pool_submit_buf`), a worker trades its free input
+buffer for the queue slot's, and a worker publishes a result by trading its
+output buffer for the ring slot's (`ring_buf_publish`). All ownership changes
+happen under the pool or ring mutex, and every buffer of a kind has one size
+(`pool_input_cap`, `ARK_RING_SLOT_CAP`). Create copies each chunk once into a
+queue slot (`pool_submit`), because it costs little next to compressing. The
+copies would otherwise dominate for stored chunks, whose decoding is itself a
+copy, and two of them would run with a mutex held.
+
 **Output ordering.** Compressed chunks are always written to the archive
 in input order regardless of completion order. Worker threads write
 completed chunks into the ring buffer indexed by chunk sequence number.
@@ -625,13 +646,14 @@ reordering buffer to a fixed number of in-flight chunks and members and
 prevents unbounded memory growth regardless of archive size or member count.
 
 **Cancellation.** The thread pool must support a cancellation signal. On
-any fatal error during a parallel operation (create or extract), the I/O
+any fatal error during a parallel operation (create, extract or verify), the I/O
 thread sets a shared cancellation flag visible to all workers before
 joining them. Workers check this flag between chunks and exit their
 compression or decompression loop cleanly when it is set. The I/O thread
 joins all workers before proceeding to error handling or cleanup. No
 worker thread may access shared context state after the cancellation flag
-is set. This requirement applies to both create and extract subcommands.
+is set. This requirement applies to the create, extract and verify
+subcommands.
 
 **Worker-to-I/O error propagation.** A worker thread may itself encounter
 a fatal error. On the create path this means `ark_deflate_enc_oneshot`
@@ -679,8 +701,8 @@ and must not be unified:
   apply Landlock → create thread pool → run operation.
 
 - **OpenBSD (pledge):** `pledge()` restricts the entire process and
-  does not permit `pthread_create` under the pledges used for create
-  and extract. Therefore on OpenBSD, the thread pool must be created
+  does not permit `pthread_create` under the pledges used for create,
+  extract and verify. Therefore on OpenBSD, the thread pool must be created
   *before* `pledge()` is called. The sequence is: argument parsing →
   open destination dirfd → create thread pool → apply pledge+unveil →
   run operation.
@@ -1486,7 +1508,7 @@ relative to thread pool creation (see §6.3 for the full rationale):
   occurs before Landlock application.
 - **OpenBSD:** The thread pool is created before `pledge()` is called,
   because `pledge()` does not permit `pthread_create` under the pledges
-  required for create and extract. Pre-sandbox setup and thread pool
+  required for create, extract and verify. Pre-sandbox setup and thread pool
   creation both occur before pledge+unveil application.
 
 **Pre-sandbox setup for extract.** Before applying the sandbox, the extract
@@ -1515,7 +1537,7 @@ policy. The footprint is narrow and fixed.
 | `create` | `stdio rpath wpath cpath fattr pthread` | src: `r`, dst parent: `rwc` | read src, read+write+create+truncate dst parent |
 | `extract` | `stdio rpath wpath cpath fattr pthread` | archive: `r`, dst dir: `rwc` | read archive, read+write+create+truncate+refer+remove-file+remove-dir dst dir |
 | `list` | `stdio rpath` | archive: `r` | read archive only |
-| `verify` | `stdio rpath` | archive: `r` | read archive only |
+| `verify` | `stdio rpath pthread` | archive: `r` | read archive only |
 | `generate-reader` | `stdio wpath cpath` | output parent dir: `rwc` | write+create+truncate output parent dir |
 
 **Notes:**
@@ -1592,7 +1614,9 @@ policy. The footprint is narrow and fixed.
   as a separate implementation artifact but is part of the security
   architecture of this document.
 - For `list` and `verify`, `rpath` is the minimum OpenBSD pledge needed to
-  open and read the archive file. The `unveil` restriction to the archive
+  open and read the archive file (`verify` adds the same defensive `pthread`
+  token as create and extract, with the same fallback; its pool already
+  exists). The `unveil` restriction to the archive
   path alone provides the effective confinement; `rpath` without `unveil`
   would be over-broad.
 
@@ -2922,9 +2946,8 @@ int ark_read_find_member(const ark_read_ctx_t *ctx,
    Deflate stream, or bytes after the stream's final block, returns -1 with
    ARK_ERR_FMT_DATA. Returns decompressed bytes written on success, -1 on
    error. chunk_index must be in range [0, meta->chunk_count).
-   Single-threaded extraction: main.c calls this in the main loop after
-   reading each compressed chunk. Parallel extraction: workers call
-   ark_deflate_dec_oneshot directly and never call this function; the I/O
+   For a caller that decodes in its own thread. ark's extract and verify do
+   not call it: workers call ark_deflate_dec_oneshot directly; the I/O
    thread performs length validation and ARK_ERR_FMT_DATA classification
    after draining each ring buffer slot (see §6.3). */
 ssize_t ark_read_chunk(ark_read_ctx_t          *ctx,

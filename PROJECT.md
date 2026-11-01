@@ -66,7 +66,8 @@ without modification.
 **Multi-core aware by design.** Member data is split into fixed-size
 independent chunks. Each chunk is compressed and hashed independently. This
 enables parallel compression on archive creation and parallel decompression
-on extraction, utilising all available CPU cores for large archives.
+on extraction and verification, utilising all available CPU cores for large
+archives.
 
 **Atomic crash safety.** The archive writer uses libchevron's streaming
 interface. The target `.ark` file either exists complete and verified or does

@@ -348,3 +348,49 @@ is most of the per-member cost for trees of empty files. After these
 changes the I/O thread's per-member system calls (open, write, metadata,
 close) bound trees of small files; single large files were already
 parallel and are unchanged.
+
+**Parallel verify and buffer handoff** (ark only; Improvements 23). Verify
+decodes in the worker pool with the same reader side as extract; the I/O
+thread still reads and hashes. Chunks now pass through the pool by swapping
+buffers instead of three 1 MiB copies (`pool_submit_buf`, worker take,
+`ring_buf_publish`), two of which ran with a mutex held. Without the handoff,
+verify of a 256 MiB random file took 0.46 s against 0.17 s before (measured
+next to other load), because stored chunks decode by copying and the copies
+dominate. Into tmpfs, release builds, best of 5, interleaved with the previous
+binary, extracted trees and archives identical. i7-7500U (4 workers), idle:
+
+| Command, data | Before | After |
+|---|---|---|
+| verify, `/usr/include` copy (121 MB, 7,645 files) | 0.35 s 99 % CPU | 0.21 s 263 % |
+| verify, 255 MB corpus file | 0.98 s 99 % | 0.41 s 380 % |
+| verify, 256 MiB random file | 0.13 s 98 % | 0.17 s 131 % |
+| verify, 40,000 empty files | 0.10 s | 0.10 s |
+| extract, `/usr/include` copy | 0.37 s 224 % | 0.32 s 228 % |
+| extract, 255 MB corpus file | 0.53 s 362 % | 0.45 s 374 % |
+| extract, 256 MiB random file | 0.44 s 182 % | 0.25 s 116 % |
+| extract, 40,000 empty files | 0.61 s | 0.61 s |
+| create, `/usr/include` copy | 1.57 s | 1.58 s |
+| create, 255 MB corpus file | 4.64 s | 4.70 s |
+
+Verify's peak RSS grows with the pool: 3.7 -> 23 MB on the random file, 21 ->
+33 MB on the `/usr/include` copy, at 4 workers. Verify of incompressible data
+stays a little slower than the single-threaded loop: hashing bounds it on the
+I/O thread, and handing chunks to workers costs more than decoding stored
+blocks in place.
+
+Ryzen 7 4800H (8C/16T, 16 workers, tmpfs, on AC, `schedutil`, best of 5, same
+method; `/usr/include` copy 93 MB, 5,502 files; "text" is 256 MiB of those
+files repeated):
+
+| Data | verify before | verify after | extract before | extract after |
+|---|---|---|---|---|
+| `/usr/include` copy | 0.22 s | 0.08 s 527 % | 0.28 s | 0.20 s |
+| 256 MiB text | 0.47 s | 0.06 s 1,105 % | 0.32 s | 0.19 s |
+| 256 MiB random | 0.10 s | 0.16 s 146 % | 0.52 s | 0.29 s |
+| 40,000 empty files | 0.10 s | 0.10 s | 0.64 s | 0.64 s |
+
+Create is unchanged within noise (`/usr/include` copy 0.66 -> 0.59 s with a
+median of 0.81 -> 0.77 s, 256 MiB text 0.61 -> 0.61 s, random 0.80 -> 0.75 s,
+empty files 0.41 -> 0.41 s). Verify's peak RSS at 16 workers: 2.8 -> 57 MB on
+the text file, 3.7 -> 83 MB on the random file, 16 -> 41 MB on the
+`/usr/include` copy.

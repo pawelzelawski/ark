@@ -15,6 +15,8 @@ ssize_t test_deflate_compress(const uint8_t *, size_t, uint8_t *, size_t, int);
 /* In-process extract defined in src/main.c (ARK_TEST). */
 int ark_test_extract_archive(const char *, const char *, int, const char *, int,
                              ark_error_t *);
+int ark_test_verify_archive(const char *, const char *, int, int,
+                            ark_error_t *);
 
 typedef ark_write_ctx_storage_t write_ctx_storage_t;
 
@@ -2400,6 +2402,11 @@ int test_extract_chunk_trailing_bytes(void)
 			break;
 		}
 		memset(&err, 0, sizeof(err));
+		xrc = ark_test_verify_archive(arc, NULL, 0, 1, &err);
+		if (extra == 0U ? xrc != 0
+		                : xrc != -1 || err.code != ARK_ERR_FMT_DATA)
+			rc = 1;
+		memset(&err, 0, sizeof(err));
 		xrc = ark_test_extract_archive(arc, out_dir, 0, NULL, 1, &err);
 		if (extra == 0U) {
 			uint8_t got[8];
@@ -2424,9 +2431,9 @@ int test_extract_chunk_trailing_bytes(void)
 }
 
 /*
- * extract_built_archive - Write len bytes of archive buf to dir/t.ark and
- * extract it into dir/out with four workers. Returns 0 when extraction
- * fails with code and leaves dir/out empty, 1 otherwise.
+ * extract_built_archive - Write len bytes of archive buf to dir/t.ark, verify
+ * it and extract it into dir/out, both with four workers. Returns 0 when both
+ * fail with code and extraction leaves dir/out empty, 1 otherwise.
  */
 static int extract_built_archive(const char *dir, const uint8_t *buf,
                                  size_t len, ark_err_t code)
@@ -2449,6 +2456,10 @@ static int extract_built_archive(const char *dir, const uint8_t *buf,
 		(void)unlink(arc);
 		return 1;
 	}
+	memset(&err, 0, sizeof(err));
+	if (ark_test_verify_archive(arc, NULL, 0, 4, &err) != -1 ||
+	    err.code != code)
+		rc = 1;
 	memset(&err, 0, sizeof(err));
 	if (ark_test_extract_archive(arc, out_dir, 0, NULL, 4, &err) != -1 ||
 	    err.code != code || access(member, F_OK) == 0)
