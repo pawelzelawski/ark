@@ -457,6 +457,15 @@ complete.
 
 ### 4.5 Create Pipeline
 
+The pipeline tests in 4.5 and 4.6 share one source tree
+(`prepare_pipeline_tree` in `tests/test_thread.c`). File contents differ per
+file but compress well: each 4 KiB block is 256 random letters, then those
+letters repeated, so compressing, decoding and hashing the archive stay cheap
+under Valgrind. Archives that the extract, verify and create-fault tests only
+set up are made at level 1 (`PIPELINE_SETUP_LEVEL`);
+`test_create_pipeline_matches_across_workers` compares archives made at the
+default level.
+
 | Test case | What is verified |
 |---|---|
 | `test_create_deterministic_single_worker` | Two single-worker creates of one tree give identical archives |
@@ -472,10 +481,10 @@ complete.
 |---|---|
 | `test_extract_pipeline_matches_across_workers` | The create-pipeline tree (archive made by one worker) extracts with 1, 2, 3, 4 and 16 workers: every file's bytes, mode and mtime, link targets, the hardlink and the empty file match the source; `--member d.link` extracts the hardlink and its target under an implicit `c.dir` and nothing else |
 | `test_extract_pipeline_errors_in_order` | Archive of a four-chunk file then a stored one-chunk file; with 1, 2, 4 and 16 workers: a read failure of the second file's chunk is reported after the first file's four chunks are written; a hash mismatch of the second file (one stored byte flipped) after its chunk is written; a decompress worker failure in the first file wins over either (`ARK_CLI_FAULT_EXTRACT_WORKER`); output writes before the error counted; output directory empty afterwards |
-| `test_extract_pipeline_short_reads` | Every chunk read arrives in pieces of at most 4,093 bytes (`ark_fault.pread_max`): the tree still matches the source, with more than twice the `pread` calls of whole reads |
+| `test_extract_pipeline_short_reads` | Every chunk read arrives in pieces of at most 127 bytes (`ark_fault.pread_max`): the tree still matches the source, with more than twice the `pread` calls of whole reads |
 | `test_ring_publish_swaps_buffers` | The slot's payload is the published buffer itself; the buffer handed back has the full capacity; a failed publish leaves the caller's buffer in place |
 | `test_pool_submit_buf_hands_over` | A decompress pool decodes two chunks submitted by handover, the second in the buffer handed back at full capacity; a wrong capacity or an oversized chunk leaves the buffer in place |
-| `test_verify_pipeline_matches_across_workers` | The create-pipeline tree verifies with 1, 2, 3, 4 and 16 workers, one `pread` per chunk each time; `--member d.link` reads only its target's chunk; chunks in pieces of at most 4,093 bytes; an archive whose only member has no chunks |
+| `test_verify_pipeline_matches_across_workers` | The create-pipeline tree verifies with 1, 2, 3, 4 and 16 workers, one `pread` per chunk each time; `--member d.link` reads only its target's chunk; chunks in pieces of at most 127 bytes; an archive whose only member has no chunks |
 | `test_verify_pipeline_errors_in_order` | The archive of `test_extract_pipeline_errors_in_order` with 1, 2, 4 and 16 workers and the same faults: same error and exactly the same `--verbose` lines every time (stdout captured); `--member` skips the damaged member or reaches it |
 | `test_extract_known_dir_prefix` | Parent-directory cache rule: only whole leading components shared with the last confirmed directory are skipped (`a/b` covers `a/b/c`, but only `a` of `a/bc/d`) |
 

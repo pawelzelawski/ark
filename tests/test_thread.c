@@ -1216,8 +1216,23 @@ int test_create_deterministic_multi_worker_matches_single(void)
 }
 
 /*
+ * Archives that the extract, verify and create-fault pipeline tests only set
+ * up are compressed at the fastest level (still Huffman-coded blocks): their
+ * compression is not what those tests check, and under valgrind it cost most
+ * of their time. test_create_pipeline_matches_across_workers keeps the
+ * default level, whose bytes it compares across worker counts.
+ */
+#define PIPELINE_SETUP_LEVEL ARK_DEFLATE_LEVEL_FAST
+
+/*
  * write_seeded_file - Write total bytes of compressible data that differ per
  * seed, so a chunk written for the wrong member changes the archive.
+ *
+ * Each 4 KiB block is 256 random letters (from an alphabet of eight) and then
+ * those 256 letters repeated: long matches keep compression, decoding and the
+ * hash of the compressed bytes cheap at every level, which shortens the
+ * pipeline tests under valgrind; random letters only would fill every hash
+ * chain at the default level.
  */
 static int write_seeded_file(const char *path, size_t total, uint32_t seed)
 {
@@ -1237,6 +1252,10 @@ static int write_seeded_file(const char *path, size_t total, uint32_t seed)
 
 		n = total - done < sizeof(block) ? total - done : sizeof(block);
 		for (i = 0U; i < n; i++) {
+			if (i >= 256U) {
+				block[i] = block[i & 255U];
+				continue;
+			}
 			x = x * 1103515245U + 12345U;
 			block[i] = (uint8_t)('a' + ((x >> 16) & 7U));
 		}
@@ -1428,7 +1447,9 @@ int test_create_pipeline_matches_across_workers(void)
 	char out_one[1024];
 	char out_n[1024];
 	char out_dir[1024];
+	const char *sources[1];
 	const char *tmp;
+	ark_error_t err = {0};
 	size_t i;
 	int rc = 1;
 
@@ -1445,9 +1466,15 @@ int test_create_pipeline_matches_across_workers(void)
 	 * once and still written in traversal order, so every worker count
 	 * gives the bytes of the single-worker archive.
 	 */
+	sources[0] = src;
+	if (ark_test_create_archive(out_one, sources, 1U, 1, ARK_HASH_BLAKE3,
+	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+		goto done;
 	for (i = 0U; i < sizeof(workers) / sizeof(workers[0]); i++) {
-		if (create_and_compare_archives(src, out_one, 1, out_n,
-		                                workers[i]) != 0)
+		if (ark_test_create_archive(
+		        out_n, sources, 1U, workers[i], ARK_HASH_BLAKE3,
+		        ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0 ||
+		    !same_file_bytes(out_one, out_n))
 			goto done;
 	}
 	if (check_pipeline_extract(out_one, src, out_dir, 2) != 0)
@@ -1493,7 +1520,7 @@ static int expect_pipeline_fault(int kind, int fail_on, int n_workers,
 	else
 		fault_inject(kind, fail_on, errno_value);
 	if (ark_test_create_archive(archive, sources, 1U, n_workers,
-	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                            ARK_HASH_BLAKE3, PIPELINE_SETUP_LEVEL,
 	                            &err) == 0)
 		goto done;
 	if (err.code != code || err.sys_errno != errno_value)
@@ -1582,7 +1609,7 @@ int test_extract_pipeline_matches_across_workers(void)
 		goto done;
 	sources[0] = src;
 	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
-	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+	                            PIPELINE_SETUP_LEVEL, &err) != 0)
 		goto done;
 	/*
 	 * ARCHITECTURE.md section 6.3: chunks of later members are decoded
@@ -1718,7 +1745,7 @@ static int make_ahead_archive(const char *tmp, int hash_bad, char *archive,
 		return -1;
 	sources[0] = src;
 	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
-	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+	                            PIPELINE_SETUP_LEVEL, &err) != 0)
 		return -1;
 	if (!hash_bad)
 		return 0;
@@ -1849,15 +1876,18 @@ int test_extract_pipeline_short_reads(void)
 		goto done;
 	sources[0] = src;
 	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
-	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+	                            PIPELINE_SETUP_LEVEL, &err) != 0)
 		goto done;
-	/* One pread per chunk, then every chunk in pieces of <= 4093 bytes. */
+	/*
+	 * One pread per chunk, then every chunk in pieces of <= 127 bytes (the
+	 * seeded data compresses well: most chunks are well under 1 KiB).
+	 */
 	fault_reset();
 	if (check_pipeline_extract(archive, src, out_whole, 4) != 0)
 		goto done;
 	whole_calls = ark_fault.pread_calls;
 	fault_reset();
-	ark_fault.pread_max = 4093;
+	ark_fault.pread_max = 127;
 	if (check_pipeline_extract(archive, src, out, 4) != 0 ||
 	    ark_fault.pread_calls <= 2 * whole_calls)
 		goto done;
@@ -2002,7 +2032,7 @@ int test_verify_pipeline_matches_across_workers(void)
 		goto done;
 	sources[0] = src;
 	if (ark_test_create_archive(archive, sources, 1U, 1, ARK_HASH_BLAKE3,
-	                            ARK_DEFLATE_LEVEL_DEFAULT, &err) != 0)
+	                            PIPELINE_SETUP_LEVEL, &err) != 0)
 		goto done;
 	/* ARCHITECTURE.md section 6.3: every worker count reads every chunk
 	 * once and accepts the archive. */
@@ -2022,9 +2052,10 @@ int test_verify_pipeline_matches_across_workers(void)
 	if (ark_test_verify_archive(archive, "d.link", 0, 4, &err) != 0 ||
 	    ark_fault.pread_calls != 1)
 		goto done;
-	/* Every chunk arrives in pieces of at most 4093 bytes. */
+	/* Every chunk longer than 127 bytes arrives in pieces (see
+	 * test_extract_pipeline_short_reads). */
 	fault_reset();
-	ark_fault.pread_max = 4093;
+	ark_fault.pread_max = 127;
 	if (ark_test_verify_archive(archive, NULL, 0, 4, &err) != 0 ||
 	    ark_fault.pread_calls <= 2 * whole_calls)
 		goto done;
@@ -2038,7 +2069,7 @@ int test_verify_pipeline_matches_across_workers(void)
 		goto done;
 	sources[0] = empty_src;
 	if (ark_test_create_archive(empty_archive, sources, 1U, 1,
-	                            ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                            ARK_HASH_BLAKE3, PIPELINE_SETUP_LEVEL,
 	                            &err) != 0 ||
 	    ark_test_verify_archive(empty_archive, NULL, 0, 1, &err) != 0 ||
 	    ark_test_verify_archive(empty_archive, NULL, 0, 4, &err) != 0)
