@@ -303,6 +303,8 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_write_header_dst_cap_undersize` | `dst_cap < 16`; returns -1, `ARK_ERR_IO_ALLOC` |
 | `test_write_footer_dst_cap_undersize` | `dst_cap < 64`; returns -1, `ARK_ERR_IO_ALLOC` |
 | `test_write_index_dst_cap_undersize` | `dst_cap` too small for serialised index; -1, `ARK_ERR_IO_ALLOC` |
+| `test_write_index_size_query` | `ark_write_index_size` gives the exact size (per ARCHITECTURE.md 5.2 entry sizes) with zero members and after a directory, a three-chunk file, a symlink and a hardlink; a repeated query gives the same size and leaves the context usable; `ark_write_index` fails one byte short (`ARK_ERR_IO_ALLOC`) and writes exactly that many bytes |
+| `test_write_index_size_out_of_sequence` | `ark_write_index_size` with a NULL context or size, before the header, with an open member and after `ark_write_index`; each `ARK_ERR_USAGE` |
 
 **Byte layout correctness:**
 
@@ -355,7 +357,8 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_read_check6_hardlink_forward_reference` | Check 7 | Hardlink target appears after hardlink; `ARK_ERR_FMT_INDEX` |
 | `test_read_check7_duplicate_path` | Check 8 | Two members with identical paths; `ARK_ERR_FMT_INDEX` |
 | `test_read_check8_missing_ancestor` | Check 9 | Leaf member path with no parent directory member; `ARK_ERR_FMT_INDEX` |
-| `test_read_check9_present_ancestor_non_directory` | Check 10 | Present ancestor is not an earlier directory; `ARK_ERR_FMT_INDEX` |
+| `test_read_check9_present_ancestor_non_directory` | Check 9 | Ancestor is present but not a directory; `ARK_ERR_FMT_INDEX` |
+| `test_read_selective_requires_full_ancestry` | Checks 9, 10 | Hand-built archive holding only `absent/victim` (no `absent` member): verify and extract, each with and without `--member absent/victim`, fail with `ARK_ERR_FMT_INDEX` and create nothing; the same member as `victim` passes all four runs |
 | `test_read_check10_size_mismatch` | Check 11 | `size_compressed` != sum of `chunk_sizes`; `ARK_ERR_FMT_INDEX` |
 | `test_read_check11_data_offset_low` | Check 12 | `data_offset < 16`; `ARK_ERR_FMT_INDEX` |
 | `test_read_check11_data_range_exceeds_body` | Check 12 | `data_offset + size_compressed > index_offset`; `ARK_ERR_FMT_INDEX` |

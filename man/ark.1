@@ -91,6 +91,8 @@ Extract only the named member.
 This option may be specified more than once.
 If a selected hardlink requires its target member, the target is included
 automatically.
+Parent directories of a selected member that are not selected themselves are
+created with mode 0700 when they do not exist yet.
 .It Fl -overwrite
 Overwrite existing extraction targets.
 Without this option,

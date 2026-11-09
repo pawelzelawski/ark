@@ -719,6 +719,7 @@ ark_write_header(&ctx, header_buf, sizeof(header_buf), &err);
 ark_write_member_begin(&ctx, &meta, &err);
 ark_write_chunk(&ctx, comp_data, comp_len, out, out_cap, &err);
 ark_write_member_end(&ctx, &err);
+ark_write_index_size(&ctx, &idx_cap, &err);         /* size idx_buf */
 ark_write_index(&ctx, idx_buf, idx_cap, &err);
 ark_write_footer(&ctx, idx_offset, idx_len, footer_buf, 64, &err);
 ark_write_free(&ctx);

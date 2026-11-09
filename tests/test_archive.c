@@ -451,6 +451,163 @@ int test_write_index_dst_cap_undersize(void)
 	return err.code == ARK_ERR_IO_ALLOC ? 0 : 1;
 }
 
+/*
+ * Begin and end one member; regular members get nchunks one-byte chunks.
+ */
+static int add_member(ark_write_ctx_t *ctx, ark_member_meta_t *meta,
+                      unsigned nchunks, ark_error_t *err)
+{
+	const uint8_t chunk[1] = {0x5a};
+	uint8_t out[4];
+	unsigned i;
+
+	meta->size_original = (uint64_t)nchunks * ARK_CHUNK_SIZE;
+	meta->data_offset = nchunks == 0U ? 0U : 16U;
+	if (ark_write_member_begin(ctx, meta, err) != 0)
+		return -1;
+	for (i = 0U; i < nchunks; i++) {
+		if (ark_write_chunk(ctx, chunk, sizeof(chunk), out, sizeof(out),
+		                    err) != 1)
+			return -1;
+	}
+	return ark_write_member_end(ctx, err);
+}
+
+/*
+ * ark_write_index_size reports the exact index size after every member
+ * (entry size per ARCHITECTURE.md 5.2: 79 fixed bytes, path, a u16 length
+ * plus target for links, u32 chunk count, u32 per chunk), leaves the context
+ * usable, and ark_write_index then needs exactly that many bytes.
+ */
+int test_write_index_size_query(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint8_t header[16];
+	uint8_t index[512];
+	size_t size;
+	size_t expect;
+	int rc;
+
+	rc = 1;
+	ctx = ctx_from_storage(&storage);
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16)
+		goto done;
+	size = 1U;
+	if (ark_write_index_size(ctx, &size, &err) != 0 || size != 0U)
+		goto done;
+
+	meta_init(&meta, 0x02U, "d");
+	if (add_member(ctx, &meta, 0U, &err) != 0)
+		goto done;
+	expect = 79U + 1U + 4U;
+	if (ark_write_index_size(ctx, &size, &err) != 0 || size != expect)
+		goto done;
+
+	meta_init(&meta, 0x01U, "d/file");
+	if (add_member(ctx, &meta, 3U, &err) != 0)
+		goto done;
+	expect += 79U + 6U + 4U + 3U * 4U;
+	if (ark_write_index_size(ctx, &size, &err) != 0 || size != expect)
+		goto done;
+
+	meta_init(&meta, 0x03U, "d/sym");
+	meta.link = "target";
+	if (add_member(ctx, &meta, 0U, &err) != 0)
+		goto done;
+	expect += 79U + 5U + 2U + 6U + 4U;
+	meta_init(&meta, 0x04U, "d/hard");
+	meta.link = "d/file";
+	if (add_member(ctx, &meta, 0U, &err) != 0)
+		goto done;
+	expect += 79U + 6U + 2U + 6U + 4U;
+	if (ark_write_index_size(ctx, &size, &err) != 0 || size != expect)
+		goto done;
+	/* A second query gives the same answer: the query changes nothing. */
+	if (ark_write_index_size(ctx, &size, &err) != 0 || size != expect)
+		goto done;
+
+	/* One byte short is still the serializer's undersized error. */
+	if (ark_write_index(ctx, index, size - 1U, &err) != -1 ||
+	    err.code != ARK_ERR_IO_ALLOC)
+		goto done;
+	if (ark_write_index(ctx, index, size, &err) != (ssize_t)size)
+		goto done;
+	rc = 0;
+done:
+	ark_write_free(ctx);
+	return rc;
+}
+
+/*
+ * The size query is valid in IDLE state only and rejects NULL arguments.
+ */
+int test_write_index_size_out_of_sequence(void)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_member_meta_t meta;
+	ark_error_t err;
+	uint8_t header[16];
+	uint8_t index[256];
+	size_t size;
+	int rc;
+
+	if (ark_write_index_size(NULL, &size, &err) != -1 ||
+	    err.code != ARK_ERR_USAGE)
+		return 1;
+
+	rc = 1;
+	ctx = ctx_from_storage(&storage);
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
+		return 1;
+	/* READY: header not written yet. */
+	if (ark_write_index_size(ctx, &size, &err) != -1 ||
+	    err.code != ARK_ERR_USAGE)
+		goto done;
+	ark_write_free(ctx);
+
+	/* MEMBER: a member is still open. */
+	ctx = ctx_from_storage(&storage);
+	meta_init(&meta, 0x01U, "a");
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16 ||
+	    ark_write_index_size(ctx, NULL, &err) != -1 ||
+	    err.code != ARK_ERR_USAGE)
+		goto done;
+	if (ark_write_member_begin(ctx, &meta, &err) != 0)
+		goto done;
+	if (ark_write_index_size(ctx, &size, &err) != -1 ||
+	    err.code != ARK_ERR_USAGE)
+		goto done;
+	ark_write_free(ctx);
+
+	/* INDEXED: the index is already written. */
+	ctx = ctx_from_storage(&storage);
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0)
+		return 1;
+	if (ark_write_header(ctx, header, sizeof(header), &err) != 16 ||
+	    add_member(ctx, &meta, 0U, &err) != 0 ||
+	    ark_write_index(ctx, index, sizeof(index), &err) <= 0)
+		goto done;
+	if (ark_write_index_size(ctx, &size, &err) != -1 ||
+	    err.code != ARK_ERR_USAGE)
+		goto done;
+	rc = 0;
+done:
+	ark_write_free(ctx);
+	return rc;
+}
+
 int test_write_header_magic(void)
 {
 	write_ctx_storage_t storage;
@@ -2622,6 +2779,114 @@ int test_extract_chunk_over_bound(void)
 	}
 	free(buf);
 	free(chunk);
+	(void)rmdir(dir);
+	return rc;
+}
+
+/*
+ * Write buf to dir/t.ark, then run verify and extract (all members and
+ * --member `member`) into an empty dir/out. With expect == 0 every run must
+ * succeed; otherwise every run must fail with ARK_ERR_FMT_INDEX and leave
+ * dir/out empty.
+ */
+static int ancestry_runs(const char *dir, const uint8_t *buf, size_t len,
+                         const char *member, int expect)
+{
+	char arc[64];
+	char out_dir[64];
+	char path[128];
+	ark_error_t err;
+	FILE *f;
+	int pass;
+	int rc;
+
+	(void)snprintf(arc, sizeof(arc), "%s/t.ark", dir);
+	(void)snprintf(out_dir, sizeof(out_dir), "%s/out", dir);
+	f = fopen(arc, "wb");
+	if (f == NULL)
+		return 1;
+	rc = fwrite(buf, 1U, len, f) == len ? 0 : 1;
+	if (fclose(f) != 0)
+		rc = 1;
+	for (pass = 0; rc == 0 && pass < 4; pass++) {
+		const char *sel;
+		int got;
+
+		sel = (pass & 1) != 0 ? member : NULL;
+		memset(&err, 0, sizeof(err));
+		if (mkdir(out_dir, 0700) != 0) {
+			rc = 1;
+			break;
+		}
+		if (pass < 2)
+			got = ark_test_verify_archive(arc, sel, 0, 4, &err);
+		else
+			got = ark_test_extract_archive(arc, out_dir, 0, sel, 4,
+			                               &err);
+		if (expect == 0) {
+			if (got != 0)
+				rc = 1;
+		} else if (got != -1 || err.code != ARK_ERR_FMT_INDEX ||
+		           rmdir(out_dir) != 0) {
+			rc = 1; /* failed differently or created something */
+			break;
+		}
+		if (expect == 0) {
+			/* Remove what a successful extract created. */
+			(void)snprintf(path, sizeof(path), "%s/%s", out_dir,
+			               member);
+			(void)unlink(path);
+			if (strchr(member, '/') != NULL) {
+				char *slash;
+
+				slash = strrchr(path, '/');
+				*slash = '\0';
+				(void)rmdir(path);
+			}
+			if (rmdir(out_dir) != 0)
+				rc = 1;
+		}
+	}
+	(void)rmdir(out_dir);
+	(void)unlink(arc);
+	return rc;
+}
+
+/*
+ * Every index needs full ancestry, for selective extraction too
+ * (ARCHITECTURE.md section 8.3 checks 9 and 10, section 14.4): an archive
+ * whose only member is "absent/victim", with no "absent" directory member,
+ * is rejected by verify and extract, with and without --member, before
+ * anything is created. The same member without a parent ("victim") is
+ * accepted by all four runs, so the missing ancestor is the only cause.
+ */
+int test_read_selective_requires_full_ancestry(void)
+{
+	char dir[] = "/tmp/ark-anc.XXXXXX";
+	uint8_t src[] = {0x61U, 0x62U, 0x63U};
+	uint8_t comp[128];
+	uint8_t buf[512];
+	ssize_t clen;
+	size_t index_len;
+	size_t len;
+	int rc = 1;
+
+	if (mkdtemp(dir) == NULL)
+		return 1;
+	clen = test_deflate_compress(src, sizeof(src), comp, sizeof(comp),
+	                             ARK_DEFLATE_LEVEL_DEFAULT);
+	if (clen <= 0)
+		goto done;
+	len = test_archive_one_chunk_at(buf, sizeof(buf), "absent/victim", comp,
+	                                (size_t)clen, sizeof(src), &index_len);
+	if (len == 0U || ancestry_runs(dir, buf, len, "absent/victim", -1) != 0)
+		goto done;
+	len = test_archive_one_chunk_at(buf, sizeof(buf), "victim", comp,
+	                                (size_t)clen, sizeof(src), &index_len);
+	if (len == 0U || ancestry_runs(dir, buf, len, "victim", 0) != 0)
+		goto done;
+	rc = 0;
+done:
 	(void)rmdir(dir);
 	return rc;
 }

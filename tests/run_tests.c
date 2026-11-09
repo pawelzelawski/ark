@@ -22,6 +22,8 @@ int test_write_free_any_state(void);
 int test_write_header_dst_cap_undersize(void);
 int test_write_footer_dst_cap_undersize(void);
 int test_write_index_dst_cap_undersize(void);
+int test_write_index_size_query(void);
+int test_write_index_size_out_of_sequence(void);
 int test_write_header_magic(void);
 int test_write_header_version(void);
 int test_write_header_flags_zero(void);
@@ -69,6 +71,7 @@ int test_read_index_many_members(void);
 int test_read_index_many_members_duplicate(void);
 int test_read_check8_missing_ancestor(void);
 int test_read_check9_present_ancestor_non_directory(void);
+int test_read_selective_requires_full_ancestry(void);
 int test_read_check10_size_mismatch(void);
 int test_read_check11_data_offset_low(void);
 int test_read_check11_data_range_exceeds_body(void);
@@ -474,6 +477,9 @@ static const test_case_t g_tests[] = {
     {"test_write_footer_dst_cap_undersize",
      test_write_footer_dst_cap_undersize},
     {"test_write_index_dst_cap_undersize", test_write_index_dst_cap_undersize},
+    {"test_write_index_size_query", test_write_index_size_query},
+    {"test_write_index_size_out_of_sequence",
+     test_write_index_size_out_of_sequence},
     {"test_write_header_magic", test_write_header_magic},
     {"test_write_header_version", test_write_header_version},
     {"test_write_header_flags_zero", test_write_header_flags_zero},
@@ -539,6 +545,8 @@ static const test_case_t g_tests[] = {
     {"test_read_check8_missing_ancestor", test_read_check8_missing_ancestor},
     {"test_read_check9_present_ancestor_non_directory",
      test_read_check9_present_ancestor_non_directory},
+    {"test_read_selective_requires_full_ancestry",
+     test_read_selective_requires_full_ancestry},
     {"test_read_check10_size_mismatch", test_read_check10_size_mismatch},
     {"test_read_check11_data_offset_low", test_read_check11_data_offset_low},
     {"test_read_check11_data_range_exceeds_body",

@@ -1598,8 +1598,8 @@ static int range_cmp(const void *a, const void *b)
  * path), 9 (every parent is an earlier directory member), 13 (no overlap),
  * 14 (hardlinks name regular files), 15 (bodies fill the archive from byte
  * 16 to the index without gaps) and 16 (zero-data members carry the
- * empty-input hash). Check 10 concerns ark's selective extraction; check 9
- * implies it for the reader, which always extracts everything.
+ * empty-input hash). Check 10 (selective extraction) adds nothing to
+ * check 9.
  */
 static const char *check_members(const rec_member_t *members, uint32_t count,
                                  uint64_t index_offset,

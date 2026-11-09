@@ -547,37 +547,6 @@ static int validate_ancestors_full(const ark_member_meta_t *members,
 	return 0;
 }
 
-static int validate_present_ancestor_dirs(const ark_member_meta_t *members,
-                                          const ark_path_ref_t *refs,
-                                          uint32_t member_count, uint32_t idx,
-                                          ark_error_t *err)
-{
-	const char *path;
-	const char *slash;
-
-	path = members[idx].path;
-	slash = path;
-	while ((slash = strchr(slash, '/')) != NULL) {
-		int64_t pidx;
-
-		pidx = path_ref_find(refs, member_count, path,
-		                     (size_t)(slash - path));
-		if (pidx >= 0) {
-			if ((uint64_t)pidx >= idx)
-				return ark_fail(err, ARK_ERR_FMT_INDEX,
-				                "ancestor appears after child",
-				                0);
-			if (members[pidx].type != 0x02U)
-				return ark_fail(
-				    err, ARK_ERR_FMT_INDEX,
-				    "present ancestor not directory", 0);
-		}
-		slash++;
-	}
-
-	return 0;
-}
-
 /* One member body [start, end) in the archive file. */
 struct body_range {
 	uint64_t start;
@@ -1089,12 +1058,48 @@ int ark_write_member_end(ark_write_ctx_t *ctx, ark_error_t *err)
 	return 0;
 }
 
+/*
+ * Serialized size of the whole index block: the sum of all entry sizes, with
+ * overflow checks. Shared by ark_write_index_size and ark_write_index so the
+ * size query and the serializer can never disagree.
+ */
+static int index_total_size(const ark_write_ctx_t *ctx, size_t *out,
+                            ark_error_t *err)
+{
+	size_t i;
+	size_t need;
+	size_t total;
+
+	total = 0U;
+	for (i = 0U; i < ctx->member_count; i++) {
+		if (member_index_size(&ctx->members[i], &need, err) != 0)
+			return -1;
+		if (size_add_overflow(total, need, &total) != 0)
+			return ark_fail(err, ARK_ERR_USAGE,
+			                "index size overflow", 0);
+	}
+	*out = total;
+	return 0;
+}
+
+int ark_write_index_size(const ark_write_ctx_t *ctx, size_t *size,
+                         ark_error_t *err)
+{
+	if (ctx == NULL || size == NULL)
+		return ark_fail(err, ARK_ERR_USAGE, "null index argument", 0);
+	/* ARCHITECTURE.md section 16.3: a read-only query in IDLE state; it
+	 * changes no context state. */
+	if (ctx->state != ARK_WRITE_STATE_IDLE)
+		return ark_fail(err, ARK_ERR_USAGE,
+		                "index size query out of sequence", 0);
+	return index_total_size(ctx, size, err);
+}
+
 ssize_t ark_write_index(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
                         ark_error_t *err)
 {
 	ark_hash_state_t idx_hash;
 	size_t i;
-	size_t need;
 	size_t total;
 	size_t written;
 
@@ -1105,14 +1110,8 @@ ssize_t ark_write_index(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
 		return ark_fail(err, ARK_ERR_USAGE,
 		                "write index out of sequence", 0);
 
-	total = 0U;
-	for (i = 0U; i < ctx->member_count; i++) {
-		if (member_index_size(&ctx->members[i], &need, err) != 0)
-			return -1;
-		if (size_add_overflow(total, need, &total) != 0)
-			return ark_fail(err, ARK_ERR_USAGE,
-			                "index size overflow", 0);
-	}
+	if (index_total_size(ctx, &total, err) != 0)
+		return -1;
 	if (dst_cap < total)
 		return ark_fail(err, ARK_ERR_IO_ALLOC,
 		                "index destination too small", 0);
@@ -1600,17 +1599,14 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			goto fmt_index;
 	}
 
-	/* ARCHITECTURE.md section 8.3 check 9. */
+	/*
+	 * ARCHITECTURE.md section 8.3 checks 9 and 10: every index needs full
+	 * ancestry, whatever the operation; check 10 (selective extraction)
+	 * adds nothing beyond check 9.
+	 */
 	for (i = 0U; i < ctx->member_count; i++) {
 		if (validate_ancestors_full(members, refs, ctx->member_count, i,
 		                            err) != 0)
-			goto fail;
-	}
-
-	/* ARCHITECTURE.md section 8.3 check 10. */
-	for (i = 0U; i < ctx->member_count; i++) {
-		if (validate_present_ancestor_dirs(
-		        members, refs, ctx->member_count, i, err) != 0)
 			goto fail;
 	}
 

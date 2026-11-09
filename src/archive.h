@@ -238,10 +238,28 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx, const uint8_t *src,
 int ark_write_member_end(ark_write_ctx_t *ctx, ark_error_t *err);
 
 /*
+ * ark_write_index_size - Report the exact serialized size of the index block.
+ *
+ * Stores in *size the number of bytes ark_write_index will write for the
+ * members recorded so far (0 for a zero-member archive). Read-only: the
+ * context state is unchanged, so members may still be added afterwards.
+ *
+ * Returns 0 on success, -1 on failure.
+ * Failure contract: returns ARK_ERR_USAGE for NULL arguments, outside IDLE
+ * state, or when the size does not fit in size_t.
+ * Preconditions: ctx in IDLE state.
+ *
+ * See ARCHITECTURE.md section 16.3.
+ */
+int ark_write_index_size(const ark_write_ctx_t *ctx, size_t *size,
+                         ark_error_t *err);
+
+/*
  * ark_write_index - Serialize index block into dst and store index hash.
  *
  * Returns bytes written on success, -1 on failure.
- * Failure contract: returns ARK_ERR_IO_ALLOC when dst buffer is undersized.
+ * Failure contract: returns ARK_ERR_IO_ALLOC when dst buffer is undersized
+ * (dst_cap below the ark_write_index_size result).
  * Preconditions: ctx in IDLE state after all members are finalized.
  *
  * See ARCHITECTURE.md section 16.3.

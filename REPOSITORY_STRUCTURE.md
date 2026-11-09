@@ -208,6 +208,7 @@ src/
 │                       #   ark_write_member_begin()  - begin member
 │                       #   ark_write_chunk()         - record pre-compressed chunk
 │                       #   ark_write_member_end()    - finalise member
+│                       #   ark_write_index_size()    - exact index size
 │                       #   ark_write_index()         - serialise index
 │                       #   ark_write_footer()        - serialise footer
 │                       #   ark_write_free()          - release context
@@ -693,6 +694,7 @@ Checks: >
 | `ark_write_member_begin` | `src/archive.c` | Public |
 | `ark_write_chunk` | `src/archive.c` | Public; I/O thread only |
 | `ark_write_member_end` | `src/archive.c` | Public |
+| `ark_write_index_size` | `src/archive.c` | Public; read-only size query for the index buffer |
 | `ark_write_index` | `src/archive.c` | Public |
 | `ark_write_footer` | `src/archive.c` | Public |
 | `ark_write_free` | `src/archive.c` | Public |

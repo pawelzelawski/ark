@@ -1786,6 +1786,9 @@ static int default_worker_count(void)
 /*
  * create_serialize_index - Allocate and serialize the index block.
  *
+ * Asks the write context for the exact index size first, so the serializer
+ * runs once into a buffer that fits (ARCHITECTURE.md section 16.3).
+ *
  * OWNERSHIP: on success *out_buf transfers to caller and is freed by
  * cmd_create cleanup.
  */
@@ -1793,35 +1796,25 @@ static int create_serialize_index(ark_write_ctx_t *ctx, uint8_t **out_buf,
                                   size_t *out_len, ark_error_t *err)
 {
 	uint8_t *buf;
-	size_t cap;
+	size_t size;
+	ssize_t n;
 
-	cap = 4096U;
-	for (;;) {
-		ssize_t n;
-
-		/* OWNERSHIP: temporary buffer is freed here on retry/failure.
-		 */
-		buf = (uint8_t *)malloc(cap);
-		if (buf == NULL)
-			return fail_error(err, ARK_ERR_IO_ALLOC,
-			                  "index buffer allocation failed", "",
-			                  0);
-		n = ark_write_index(ctx, buf, cap, err);
-		if (n >= 0) {
-			*out_buf = buf;
-			*out_len = (size_t)n;
-			return 0;
-		}
-		if (err == NULL || err->code != ARK_ERR_IO_ALLOC) {
-			free(buf);
-			return -1;
-		}
+	if (ark_write_index_size(ctx, &size, err) != 0)
+		return -1;
+	/* OWNERSHIP: freed here on failure. A zero-member index still gets a
+	 * one-byte allocation so the buffer is never NULL. */
+	buf = (uint8_t *)malloc(size == 0U ? 1U : size);
+	if (buf == NULL)
+		return fail_error(err, ARK_ERR_IO_ALLOC,
+		                  "index buffer allocation failed", "", 0);
+	n = ark_write_index(ctx, buf, size, err);
+	if (n < 0) {
 		free(buf);
-		if (cap > (SIZE_MAX / 2U))
-			return fail_error(err, ARK_ERR_IO_ALLOC,
-			                  "index buffer size overflow", "", 0);
-		cap *= 2U;
+		return -1;
 	}
+	*out_buf = buf;
+	*out_len = (size_t)n;
+	return 0;
 }
 
 /*

@@ -1196,14 +1196,18 @@ The reader verifies in this order before any filesystem side effect:
    is `ARK_ERR_FMT_INDEX`
 8. No duplicate member paths; a repeated path is `ARK_ERR_FMT_INDEX`;
    comparison is performed on the canonical path bytes as stored
-9. For full extraction: every member's parent path either is the extraction
-   root or is itself a directory member appearing earlier in the index;
-   a missing or non-directory ancestor is `ARK_ERR_FMT_INDEX`
-10. For --member selective extraction: every selected member's ancestor paths
-    that are present in the archive index must be directory members appearing
-    earlier in the index; a present non-directory ancestor or a later-ordered
-    directory ancestor is `ARK_ERR_FMT_INDEX`. Ancestors absent from the
-    index will be created implicitly and are not an error (see §14.4).
+9. Full ancestry, for every index and every operation (list, verify, full
+   and selective extraction): every member's parent path either is the
+   extraction root or is itself a directory member appearing earlier in the
+   index; a missing, later-ordered or non-directory ancestor is
+   `ARK_ERR_FMT_INDEX`
+10. For --member selective extraction: no further index rule. Check 9 already
+    makes every ancestor of a selected member an earlier directory member.
+    Ancestors that are in the index but not selected are created implicitly
+    if missing from the filesystem (§14.4); an index without an ancestor
+    entry is rejected by check 9 like any other, so a selective extraction
+    never has to invent a directory the archive does not contain. The writer
+    always records full ancestry (§13.1).
 11. For each regular member with `size_original > 0`: `size_compressed`
     equals the sum of its `chunk_sizes` entries; a mismatch is
     `ARK_ERR_FMT_INDEX`. Regular members with `size_original == 0` have
@@ -2217,15 +2221,14 @@ the extraction target for conflicts. If any member path already exists and
 
 For `--member` selective extraction, the preflight must also check all
 ancestor directory paths that will be created implicitly for the selected
-members. For each selected member, derive the set of all ancestor paths
-that are not in the selected member set, regardless of whether those
-ancestors appear in the archive index. Any ancestor not in the selected
-set will be created implicitly if it is missing from the filesystem
-(see §14.4). For each such ancestor path, check whether an object already
-exists at that path in the extraction target: if it exists and is not a
-directory, it is a conflict. Collect all such conflicts and report them
-before any filesystem side effect, using the same abort model as explicit
-conflicts.
+members. For each selected member, derive the set of all ancestor paths that
+are not in the selected member set (all of them are directory members of the
+index, §8.3 check 9). Any ancestor not in the selected set will be created
+implicitly if it is missing from the filesystem (see §14.4). For each such
+ancestor path, check whether an object already exists at that path in the
+extraction target: if it exists and is not a directory, it is a conflict.
+Collect all such conflicts and report them before any filesystem side
+effect, using the same abort model as explicit conflicts.
 
 This pre-flight check is an advisory early-exit optimisation. The
 authoritative conflict detection occurs at extraction time: each output
@@ -2405,16 +2408,18 @@ format error, not a condition to accommodate.
 
 **Selective extraction (`--member`) parent directory handling.** When
 extracting a subset of members via `--member`, the selected set may not
-include the parent directories of requested leaf members. In this case the
-reader creates any missing parent directories implicitly, as needed, before
-extracting each requested member. These implicitly created directories use
-mode `0700`. Implicitly created directories are tracked in the same cleanup
-list as all other filesystem objects created during the extraction run and
-are subject to the same cleanup policy in §14.3. If extraction aborts after
-implicit directories have been created, they are removed along with all
-other created objects. This is the only case where implicit directory
-creation is permitted; it applies exclusively to `--member` selective
-extraction and not to full extraction.
+include the parent directories of requested leaf members. These parents are
+always directory members of the index (§8.3 check 9 rejects an index without
+them, for selective extraction too); they are simply not selected. In this
+case the reader creates any missing parent directories implicitly, as
+needed, before extracting each requested member. These implicitly created
+directories use mode `0700`. Implicitly created directories are tracked in
+the same cleanup list as all other filesystem objects created during the
+extraction run and are subject to the same cleanup policy in §14.3. If
+extraction aborts after implicit directories have been created, they are
+removed along with all other created objects. This is the only case where
+implicit directory creation is permitted; it applies exclusively to
+`--member` selective extraction and not to full extraction.
 
 ### 14.5 Metadata Restoration Per Member Type
 
@@ -2550,14 +2555,14 @@ build then needs no extra flags. It also defines `_FILE_OFFSET_BITS 64`, so
 
 **Reader validation.** Before any filesystem change the reader applies the
 footer checks that `main.c` makes before `ark_read_init` and checks 1-9 and
-11-16 of §8.3 (check 10 belongs to selective extraction, which the reader
-does not offer; check 9 implies it), with ark's verdict: an archive that ark
-rejects makes the reader exit with status 2 and write nothing. While
-extracting it checks each chunk as ark does (valid Deflate under the §7.4
-rules, nothing after the final block, exact length) and each file's hash.
-The integration test `test_integration_generate_reader_index_differential`
-runs the same indexes through both readers: one structured case per check
-and a flip of every byte of a reference index.
+11-16 of §8.3 (check 10 adds nothing to check 9), with ark's verdict: an
+archive that ark rejects makes the reader exit with status 2 and write
+nothing. While extracting it checks each chunk as ark does (valid Deflate
+under the §7.4 rules, nothing after the final block, exact length) and each
+file's hash. The integration test
+`test_integration_generate_reader_index_differential` runs the same indexes
+through both readers: one structured case per check and a flip of every byte
+of a reference index.
 
 **Reader extraction.** The reader extracts into the current directory, held
 as a directory fd. For each member it opens the parent directories one
@@ -2765,6 +2770,7 @@ following states. Invalid transitions return -1 with `ARK_ERR_USAGE`.
 UNINIT  --ark_write_init-->        READY
 READY   --ark_write_header-->      IDLE
 IDLE    --ark_write_member_begin--> MEMBER
+IDLE    --ark_write_index_size-->  IDLE      (read-only size query)
 IDLE    --ark_write_index-->       INDEXED   (zero-member archive)
 MEMBER  --ark_write_chunk-->       MEMBER    (repeats per chunk)
 MEMBER  --ark_write_member_end-->  IDLE
@@ -2776,16 +2782,16 @@ Calling `ark_write_chunk` outside MEMBER state, calling
 `ark_write_member_begin` while already in MEMBER state, calling
 `ark_write_index` before all members are ended, or calling
 `ark_write_footer` before `ark_write_index` all return -1 with
-`ARK_ERR_USAGE`. Calling `ark_write_member_end` outside MEMBER state
-returns -1 with `ARK_ERR_USAGE`. Calling `ark_write_chunk` for a member
-type other than 0x01 (regular file) returns -1 with `ARK_ERR_USAGE`.
-The format stores each chunk size as a u32 field (maximum 4,294,967,295
-bytes). Passing `src_len > UINT32_MAX` to `ark_write_chunk` returns -1
-with `ARK_ERR_USAGE`: the value cannot be stored in the index without
-truncation. In practice the CLI's 1MB uncompressed chunk pipeline cannot
-produce compressed output approaching this limit even for maximally
-incompressible content; the check exists to enforce the API contract
-regardless of caller behaviour.
+`ARK_ERR_USAGE`; so does `ark_write_index_size` outside IDLE state. Calling
+`ark_write_member_end` outside MEMBER state returns -1 with `ARK_ERR_USAGE`.
+Calling `ark_write_chunk` for a member type other than 0x01 (regular file)
+returns -1 with `ARK_ERR_USAGE`. The format stores each chunk size as a u32
+field (maximum 4,294,967,295 bytes). Passing `src_len > UINT32_MAX` to
+`ark_write_chunk` returns -1 with `ARK_ERR_USAGE`: the value cannot be
+stored in the index without truncation. In practice the CLI's 1MB
+uncompressed chunk pipeline cannot produce compressed output approaching
+this limit even for maximally incompressible content; the check exists to
+enforce the API contract regardless of caller behaviour.
 
 ```c
 /* Initialise a write context. hash_alg and the compression level
@@ -2849,15 +2855,25 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx,
 int ark_write_member_end(ark_write_ctx_t *ctx,
                          ark_error_t     *err);
 
+/* Report in *size the exact number of bytes ark_write_index will write
+   for the members finalised so far (0 for a zero-member archive). Valid in
+   IDLE state only; read-only, so the state stays IDLE and more members may
+   follow. Returns 0, or -1 with ARK_ERR_USAGE for NULL arguments, a call
+   outside IDLE state, or a size that does not fit in size_t. main.c sizes
+   the index buffer with it and calls ark_write_index once; no call ever
+   depends on retrying after an error (§16.1). */
+int ark_write_index_size(const ark_write_ctx_t *ctx,
+                         size_t                *size,
+                         ark_error_t           *err);
+
 /* Serialise the index block into dst. Returns bytes written or -1.
    Must be called after all members are finalised via ark_write_member_end.
    Computes the index hash over the serialised index bytes and stores it
    in the write context. ark_write_footer retrieves this stored hash from
    the context; no separate hash parameter is needed.
-   If dst_cap is insufficient to hold the serialised index, returns -1 with
-   ARK_ERR_IO_ALLOC: the caller undersized the buffer. The required size
-   can be computed from the accumulated member metadata before this call;
-   main.c is responsible for allocating a sufficient buffer. */
+   If dst_cap is below the ark_write_index_size result, returns -1 with
+   ARK_ERR_IO_ALLOC: the caller undersized the buffer, and the context is
+   then in the indeterminate after-error state of §16.1. */
 ssize_t ark_write_index(ark_write_ctx_t *ctx,
                         uint8_t         *dst,
                         size_t           dst_cap,
