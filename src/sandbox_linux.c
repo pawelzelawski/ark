@@ -165,6 +165,8 @@ static const ark_seccomp_rule_t g_rules[] = {
     {SYS_newfstatat, G_RPATH, CHECK_ALLOW},
     {SYS_getdents64, G_RPATH, CHECK_ALLOW},
     {SYS_readlinkat, G_RPATH, CHECK_ALLOW},
+    /* realpath of a relative path (create's source and archive parent) */
+    {SYS_getcwd, G_RPATH, CHECK_ALLOW},
     {SYS_statx, G_RPATH, CHECK_ALLOW},
 #ifdef __x86_64__
     {SYS_readlink, G_RPATH, CHECK_ALLOW},

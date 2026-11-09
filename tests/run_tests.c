@@ -251,6 +251,7 @@ int test_fault_extract_cleanup_rmdir(void);
 int test_fault_extract_cleanup_implicit_parents(void);
 int test_integration_single_file(void);
 int test_integration_directory_tree(void);
+int test_integration_relative_paths(void);
 int test_integration_all_member_types(void);
 int test_integration_empty_file(void);
 int test_integration_round_trip_blake3(void);
@@ -726,6 +727,7 @@ static const test_case_t g_tests[] = {
     {"test_extract_stub", test_extract_stub},
     {"test_integration_single_file", test_integration_single_file},
     {"test_integration_directory_tree", test_integration_directory_tree},
+    {"test_integration_relative_paths", test_integration_relative_paths},
     {"test_integration_all_member_types", test_integration_all_member_types},
     {"test_integration_empty_file", test_integration_empty_file},
     {"test_integration_round_trip_blake3", test_integration_round_trip_blake3},

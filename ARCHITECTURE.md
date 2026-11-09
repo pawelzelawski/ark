@@ -1650,7 +1650,7 @@ before any archive or source byte is parsed.
   | Group | System calls (Linux names) |
   |---|---|
   | `stdio` | `read write readv writev pread64 close lseek fstat brk mmap mprotect munmap mremap madvise futex getpid geteuid getuid getegid getgid getrandom clock_gettime gettimeofday rt_sigprocmask rt_sigreturn exit_group ioctl sendto`; `socket` and `connect` fail with `EACCES` |
-  | `rpath` | `openat` (read-only unless wpath/cpath), `newfstatat statx getdents64 readlinkat` (+ `readlink` on x86-64) |
+  | `rpath` | `openat` (read-only unless wpath/cpath), `newfstatat statx getdents64 readlinkat getcwd` (+ `readlink` on x86-64) |
   | `wpath` | `openat`, `fsync fdatasync ftruncate pwrite64` |
   | `cpath` | `openat`, `mkdirat unlinkat symlinkat linkat renameat renameat2` (+ `mkdir unlink rmdir link symlink rename` on x86-64) |
   | `fattr` | `utimensat fchmod fchmodat fchmodat2 fchown fchownat` (+ `lchown chmod` on x86-64) |
@@ -1709,7 +1709,9 @@ before any archive or source byte is parsed.
   missing Landlock.
 - **Deriving the lists.** Run every subcommand under `strace -f` with
   realistic input, normal and error paths (conflicts, `--overwrite`,
-  `--member`, corrupted archive, replaced output), and collect the calls
+  `--member`, corrupted archive, replaced output), with absolute and
+  relative paths (create resolves relative paths with `realpath`, which
+  calls `getcwd`), on a terminal and redirected, and collect the calls
   made after the `seccomp(SECCOMP_SET_MODE_FILTER, ...)` call (before this
   filter existed: after `landlock_restrict_self` and the last `clone3`).
   A new call is assigned to the promise group whose pledge promise would

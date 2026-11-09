@@ -668,6 +668,7 @@ test. These tests are the final gate before a phase is declared complete.
 |---|---|
 | `test_integration_single_file` | Create archive from one file; verify; extract; byte-identical |
 | `test_integration_directory_tree` | Create from directory with subdirectories; extract; full tree matches |
+| `test_integration_relative_paths` | Every subcommand with relative paths from a working directory (`tree.ark src`, `./tree2.ark ./src`, `--output out`, `../tree2.ark` into the current directory, `generate-reader reader.c`); both extracted trees match. Create resolves relative paths with `realpath` (`getcwd`), which the Linux seccomp filter must allow |
 | `test_integration_all_member_types` | Archive with regular, directory, symlink, hardlink; extract; all types correct |
 | `test_integration_empty_file` | Archive containing empty regular file; extract; empty file present |
 | `test_integration_round_trip_blake3` | BLAKE3 hash algorithm; create and verify; no hash errors |

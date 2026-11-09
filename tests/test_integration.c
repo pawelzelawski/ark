@@ -671,6 +671,55 @@ cleanup:
 	(void)remove_tree(root);
 	return rc;
 }
+/*
+ * Every subcommand with relative paths, run from the test root: create
+ * resolves relative source and archive paths with realpath (getcwd), which
+ * the Linux seccomp filter must allow (ARCHITECTURE.md section 10.4).
+ */
+int test_integration_relative_paths(void)
+{
+	char root[PATH_MAX], src[PATH_MAX], out[PATH_MAX], out2[PATH_MAX];
+	char ark[PATH_MAX];
+	int rc;
+
+	if (realpath(g_ark_bin, ark) == NULL)
+		return 1;
+	if (make_temp_root(root, sizeof(root)) != 0)
+		return 1;
+	rc = 1;
+	if (path_join(src, sizeof(src), root, "src") != 0 ||
+	    path_join(out, sizeof(out), root, "out") != 0 ||
+	    path_join(out2, sizeof(out2), root, "out2") != 0)
+		goto cleanup;
+	if (make_basic_tree(src) != 0 || mkdir(out, 0700) != 0 ||
+	    mkdir(out2, 0700) != 0)
+		goto cleanup;
+	{
+		char *create1[] = {ark, "create", "tree.ark", "src", NULL};
+		char *create2[] = {ark, "create", "./tree2.ark", "./src", NULL};
+		char *list[] = {ark, "list", "tree.ark", NULL};
+		char *verify[] = {ark, "verify", "tree2.ark", NULL};
+		char *extract1[] = {ark,   "extract",  "--output",
+		                    "out", "tree.ark", NULL};
+		char *extract2[] = {ark, "extract", "../tree2.ark", NULL};
+		char *reader[] = {ark, "generate-reader", "reader.c", NULL};
+
+		if (run_program(create1, root, NULL, NULL) != 0 ||
+		    run_program(create2, root, NULL, NULL) != 0 ||
+		    run_program(list, root, NULL, NULL) != 0 ||
+		    run_program(verify, root, NULL, NULL) != 0 ||
+		    run_program(extract1, root, NULL, NULL) != 0 ||
+		    run_program(extract2, out2, NULL, NULL) != 0 ||
+		    run_program(reader, root, NULL, NULL) != 0)
+			goto cleanup;
+	}
+	if (compare_tree(src, out) != 0 || compare_tree(src, out2) != 0)
+		goto cleanup;
+	rc = 0;
+cleanup:
+	(void)remove_tree(root);
+	return rc;
+}
 int test_integration_all_member_types(void)
 {
 	struct stat a_st;
