@@ -17,47 +17,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/random.h>
+#endif
+
 #include "../include/chevron.h"
 #include "chevron_internal.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
-
-/*
- * chevron_mkostemp_cloexec - portable mkostemp(O_CLOEXEC) equivalent.
- *
- * mkostemp is a GNU extension. Keep libchevron buildable with only POSIX/XSI
- * feature macros by using mkstemp followed immediately by FD_CLOEXEC.
- */
-static int
-chevron_mkostemp_cloexec(char *template, int flags)
-{
-	int fd;
-	int fdflags;
-	int saved_errno;
-
-	if ((flags & ~O_CLOEXEC) != 0) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	fd = mkstemp(template);
-	if (fd == -1)
-		return -1;
-
-	fdflags = fcntl(fd, F_GETFD);
-	if (fdflags == -1 ||
-	    fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) == -1) {
-		saved_errno = errno;
-		(void)close(fd);
-		(void)unlink(template);
-		errno = saved_errno;
-		return -1;
-	}
-
-	return fd;
-}
 
 /*
  * chevron_fail - populate err and return -1.
@@ -76,7 +45,7 @@ static inline int chevron_fail(chevron_error_t *err, chevron_err_t e,
 /*
  * chevron_ok - populate err with success values and return 0.
  */
-static inline int __attribute__((unused)) chevron_ok(chevron_error_t *err)
+static inline int chevron_ok(chevron_error_t *err)
 {
 	if (err != NULL) {
 		err->err         = CHEVRON_ERR_NONE;
@@ -251,69 +220,66 @@ static int inspect_target(int dirfd, const char *basename, chevron_handle_t *h,
 	 * Caller-specified mode is overridden by the target's mode.
 	 * See ARCHITECTURE.md §5.1.
 	 */
-	h->_mode = st.st_mode;
+	h->_mode = st.st_mode & 07777;
 	h->_uid  = st.st_uid;
 	h->_gid  = st.st_gid;
 	return 0;
 }
 
 /*
- * create_tmp_mkostemp - create a named temporary file in the parent directory.
+ * generate_tmp_name - generate an unpredictable named-temp basename.
  * See ARCHITECTURE.md §3.2.
  */
-static int create_tmp_mkostemp(const char *parent, int *fd_out,
-                               char *tmp_name_out, chevron_error_t *err)
+static int generate_tmp_name(char *out, chevron_error_t *err)
 {
-	static const char prefix[] = ".chevron_XXXXXX";
-	char              template[PATH_MAX];
-	size_t            pfx_off;
-	int               fd;
-	int               n;
+	static const char charset[] = "abcdefghijklmnopqrstuvwxyz"
+	                              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	                              "0123456789";
+	static const char prefix[]  = ".chevron_";
+	unsigned char     random[6];
+	size_t            i;
+	size_t            plen;
 
-	/*
-	 * Build the full template. pfx_off is the byte offset of the prefix
-	 * inside template - used to rebuild the XXXXXX suffix on EINTR retry
-	 * and to extract the basename after mkostemp succeeds.
-	 */
-	n = snprintf(template, sizeof(template), "%s/%s", parent, prefix);
-	if (n < 0 || (size_t)n >= sizeof(template))
-		return chevron_fail(err, CHEVRON_ERR_INVALID,
-		                    CHEVRON_OP_VALIDATE, ENAMETOOLONG);
+	plen = sizeof(prefix) - 1;
+	if (CHEVRON_GETENTROPY(random, sizeof(random)) == -1)
+		return chevron_fail(err, CHEVRON_ERR_OPEN, CHEVRON_OP_OPEN_TMP,
+		                    errno);
 
-	pfx_off = strlen(parent) + 1; /* skip "parent/" */
+	memcpy(out, prefix, plen);
+	for (i = 0; i < sizeof(random); i++)
+		out[plen + i] = charset[random[i] % (sizeof(charset) - 1)];
+	out[plen + sizeof(random)] = '\0';
+	return 0;
+}
 
-	for (;;) {
-		/*
-		 * NOTE: mkostemp mutates the template buffer. Restore the
-		 * XXXXXX suffix before each call so retries use a fresh
-		 * template. On the first call this is a no-op.
-		 * See ARCHITECTURE.md §3.2.
-		 */
-		memcpy(template + pfx_off, prefix, sizeof(prefix));
+/*
+ * create_tmp_named - create a named temporary file relative to dirfd.
+ * See ARCHITECTURE.md §3.2.
+ */
+static int create_tmp_named(int dirfd, int *fd_out, char *tmp_name_out,
+                            chevron_error_t *err)
+{
+	int          fd;
+	unsigned int attempt;
 
-		fd = CHEVRON_MKOSTEMP(template, O_CLOEXEC);
-		if (fd != -1)
-			break;
-		if (errno != EINTR) {
-			if (errno == ENAMETOOLONG)
-				return chevron_fail(err, CHEVRON_ERR_INVALID,
-				                    CHEVRON_OP_VALIDATE, errno);
+	for (attempt = 0; attempt < 32; attempt++) {
+		if (generate_tmp_name(tmp_name_out, err) != 0)
+			return -1;
+		do {
+			fd = CHEVRON_OPENAT(dirfd, tmp_name_out,
+			                    O_RDWR | O_CREAT | O_EXCL |
+			                        O_CLOEXEC | O_NOFOLLOW,
+			                    0600);
+		} while (fd == -1 && errno == EINTR);
+		if (fd != -1) {
+			*fd_out = fd;
+			return 0;
+		}
+		if (errno != EEXIST)
 			return chevron_fail(err, CHEVRON_ERR_OPEN,
 			                    CHEVRON_OP_OPEN_TMP, errno);
-		}
 	}
-
-	/*
-	 * template now holds the full path of the created temp file.
-	 * Copy the basename into tmp_name_out - the openat-safe relative name
-	 * used with renameat and unlinkat anchored to the parent dirfd.
-	 *
-	 * The basename is always sizeof(prefix) - 1 bytes long (mkostemp
-	 * replaces XXXXXX in-place, keeping the total length constant).
-	 */
-	memcpy(tmp_name_out, template + pfx_off, sizeof(prefix));
-	*fd_out = fd;
-	return 0;
+	return chevron_fail(err, CHEVRON_ERR_OPEN, CHEVRON_OP_OPEN_TMP, EEXIST);
 }
 
 /*
@@ -336,6 +302,9 @@ static int write_loop(int fd, const void *buf, size_t len, chevron_error_t *err)
 			return chevron_fail(err, CHEVRON_ERR_WRITE,
 			                    CHEVRON_OP_WRITE, errno);
 		}
+		if (n == 0)
+			return chevron_fail(err, CHEVRON_ERR_WRITE,
+			                    CHEVRON_OP_WRITE, EIO);
 		p += n;
 		len -= (size_t)n;
 	}
@@ -560,9 +529,10 @@ static int chevron_validate_args(const char *path, const void *buf, size_t len,
  * NOTE: O_RDWR is required with O_TMPFILE; O_WRONLY alone produces EINVAL
  * on some kernels. See ARCHITECTURE.md §3.1.
  */
-static int try_open_otmpfile(const char *parent, int *fd_out)
+static int try_open_otmpfile(int dirfd, int *fd_out)
 {
-	int fd;
+	unsigned char entropy_probe;
+	int           fd;
 
 #ifdef CHEVRON_TEST
 	/*
@@ -576,7 +546,19 @@ static int try_open_otmpfile(const char *parent, int *fd_out)
 	}
 #endif
 
-	fd = CHEVRON_OPEN(parent, O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
+	/*
+	 * The O_TMPFILE commit path needs getentropy() to name the linked
+	 * inode. On Linux kernels without getrandom(2), choose the named
+	 * fallback before creating an unnamed inode that cannot later be
+	 * committed.
+	 */
+	if (CHEVRON_GETENTROPY(&entropy_probe, sizeof(entropy_probe)) == -1) {
+		if (errno == ENOSYS)
+			return 0;
+		return -1;
+	}
+
+	fd = CHEVRON_OPENAT(dirfd, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
 	if (fd == -1) {
 		if (errno == EOPNOTSUPP || errno == EINVAL || errno == EISDIR ||
 		    errno == EINTR)
@@ -594,16 +576,15 @@ static int try_open_otmpfile(const char *parent, int *fd_out)
  * Wraps try_open_otmpfile() to add the EINTR-retry policy required by the
  * committed (non-probe) creation path: EINTR is retried, not treated as a
  * fallback trigger. Soft fallback errnos (EOPNOTSUPP, EINVAL, EISDIR) still
- * cause a return of 0 so the caller can switch to the mkostemp path.
+ * cause a return of 0 so the caller can switch to the named openat path.
  * See ARCHITECTURE.md §3.1.
  */
-static int create_tmp_otmpfile(const char *parent, int *fd_out,
-                               chevron_error_t *err)
+static int create_tmp_otmpfile(int dirfd, int *fd_out, chevron_error_t *err)
 {
 	int rc;
 
 	for (;;) {
-		rc = try_open_otmpfile(parent, fd_out);
+		rc = try_open_otmpfile(dirfd, fd_out);
 		if (rc == 1)
 			return 1;
 		if (rc == -1)
@@ -613,66 +594,12 @@ static int create_tmp_otmpfile(const char *parent, int *fd_out,
 		 * rc == 0: soft failure. EINTR means the syscall was
 		 * interrupted - retry. EOPNOTSUPP / EINVAL / EISDIR mean the
 		 * kernel/filesystem does not support O_TMPFILE - return 0 so
-		 * the caller falls back to mkostemp.
+		 * the caller falls back to named openat.
 		 */
 		if (errno == EINTR)
 			continue;
 		return 0;
 	}
-}
-
-/*
- * generate_tmp_name - generate an unpredictable basename for the linkat
- * temp entry on the O_TMPFILE path.
- */
-static void generate_tmp_name(const chevron_handle_t *h, char *out,
-                              unsigned int attempt)
-{
-	static const char    charset[] = "abcdefghijklmnopqrstuvwxyz"
-	                                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	                                 "0123456789";
-	static const char    prefix[]  = ".chevron_";
-	static uint64_t      nonce     = UINT64_C(0x7f4a7c159e3779b9);
-	uint64_t             seed;
-	size_t               i;
-	size_t               plen;
-	const unsigned char *p;
-
-	plen = sizeof(prefix) - 1; /* exclude NUL */
-
-	/*
-	 * Mix handle-local state, ASLR-influenced pointer values, and a
-	 * per-process nonce so the generated name is not trivially predictable.
-	 */
-	nonce += UINT64_C(0x9e3779b97f4a7c15);
-	seed = nonce ^ (uint64_t)attempt;
-	seed ^= (uint64_t)(uintptr_t)h;
-	seed ^= (uint64_t)(uintptr_t)out << 7;
-	seed ^= (uint64_t)(uintptr_t)&attempt << 13;
-	p = (const unsigned char *)h->_target_name;
-	while (*p != '\0') {
-		seed ^= (uint64_t)*p++;
-		seed *= UINT64_C(0x100000001b3);
-	}
-	seed ^= (uint64_t)(unsigned int)(h->_fd + 1);
-	seed ^= (uint64_t)(unsigned int)(h->_dirfd + 1) << 17;
-	seed ^= (uint64_t)h->_mode << 32;
-	seed ^= (uint64_t)(unsigned int)h->_uid << 9;
-	seed ^= (uint64_t)(unsigned int)h->_gid << 23;
-	seed ^= (uint64_t)(unsigned int)h->_durability << 41;
-	if (seed == 0)
-		seed = UINT64_C(0x9e3779b97f4a7c15);
-
-	memcpy(out, prefix, plen);
-	for (i = 0; i < 6; i++) {
-		/* xorshift64* step; deterministic, no syscall dependency. */
-		seed ^= seed >> 12;
-		seed ^= seed << 25;
-		seed ^= seed >> 27;
-		seed *= UINT64_C(2685821657736338717);
-		out[plen + i] = charset[seed % (sizeof(charset) - 1)];
-	}
-	out[plen + 6] = '\0';
 }
 
 /*
@@ -703,7 +630,8 @@ static int commit_linkat_otmpfile(chevron_handle_t *h, chevron_error_t *err)
 	unsigned int attempt;
 
 	for (attempt = 0; attempt < 32; attempt++) {
-		generate_tmp_name(h, tmp_name, attempt);
+		if (generate_tmp_name(tmp_name, err) != 0)
+			return -1;
 
 		do {
 			rc = CHEVRON_LINKAT(h->_fd, "", h->_dirfd, tmp_name,
@@ -778,7 +706,7 @@ static int chevron_do_open(chevron_handle_t *h, const char *path,
 	 *
 	 * See ARCHITECTURE.md §3.1 and §3.3.
 	 */
-	rc = create_tmp_otmpfile(parent, &h->_fd, err);
+	rc = create_tmp_otmpfile(h->_dirfd, &h->_fd, err);
 	if (rc == -1)
 		goto cleanup;
 	if (rc == 1)
@@ -791,7 +719,7 @@ static int chevron_do_open(chevron_handle_t *h, const char *path,
 	{
 		/* Step 5b: create named temporary file. See ARCHITECTURE.md
 		 * §3.2. */
-		rc = create_tmp_mkostemp(parent, &h->_fd, h->_tmp_name, err);
+		rc = create_tmp_named(h->_dirfd, &h->_fd, h->_tmp_name, err);
 		if (rc != 0)
 			goto cleanup;
 	}
@@ -833,7 +761,7 @@ static int chevron_do_write(chevron_handle_t *h, const void *buf, size_t len,
  * chevron_do_commit - apply permissions, fsync, close, rename, dir fsync.
  *
  * O_TMPFILE path detection: h->_tmp_name[0] == '\0' inside the
- * __linux__ && O_TMPFILE guard signals the O_TMPFILE path. The mkostemp
+ * __linux__ && O_TMPFILE guard signals the O_TMPFILE path. The named-openat
  * path always populates h->_tmp_name in chevron_do_open; the O_TMPFILE
  * path leaves it empty until linkat succeeds here.
  * See ARCHITECTURE.md §3.1 - linkat must precede close.
@@ -881,7 +809,7 @@ static int chevron_do_commit(chevron_handle_t *h, chevron_error_t *err)
 	 * Step 11a (O_TMPFILE only): link the unnamed inode to a fresh
 	 * temporary name in the parent directory.
 	 *
-	 * Detected via h->_tmp_name[0] == '\0': create_tmp_mkostemp always
+	 * Detected via h->_tmp_name[0] == '\0': create_tmp_named always
 	 * populates h->_tmp_name; create_tmp_otmpfile leaves it empty until
 	 * linkat succeeds. This check is safe inside the __linux__ && O_TMPFILE
 	 * guard because on non-Linux platforms this block is compiled out.
@@ -1007,8 +935,6 @@ int chevron_open(chevron_handle_t *handle, const char *path,
 	 * See ARCHITECTURE.md §4.2.
 	 */
 	if (handle->_fd != -1 || handle->_dirfd != -1) {
-		handle->_fd    = -1;
-		handle->_dirfd = -1;
 		return chevron_fail(err, CHEVRON_ERR_INVALID,
 		                    CHEVRON_OP_VALIDATE, 0);
 	}
@@ -1023,7 +949,9 @@ int chevron_open(chevron_handle_t *handle, const char *path,
 		return -1;
 	}
 
-	return chevron_do_open(handle, path, durability, mode, err);
+	if (chevron_do_open(handle, path, durability, mode, err) != 0)
+		return -1;
+	return chevron_ok(err);
 }
 
 /*
@@ -1058,7 +986,7 @@ int chevron_write_chunk(chevron_handle_t *handle, const void *buf, size_t len,
 		handle->_dirfd = -1;
 		return -1;
 	}
-	return 0;
+	return chevron_ok(err);
 }
 
 /*

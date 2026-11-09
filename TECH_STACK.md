@@ -38,7 +38,8 @@ package manager files and no submodules beyond libchevron.
 is the author's own library under the same ISC license and identical technical
 standards. It is not an external dependency in any meaningful sense: one
 repository clone produces a complete, buildable source tree with no network
-access required.
+access required. The vendored files are upstream's, unmodified, at the
+commit named in `vendor/libchevron/COMMIT` (ARCHITECTURE.md section 9).
 
 **sha256, blake3, deflate** are internal implementations compiled directly
 into the `ark` binary. Each is a self-contained two-file component (`.h` +

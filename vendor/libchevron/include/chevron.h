@@ -4,7 +4,8 @@
 /*
  * chevron.h - libchevron public API
  *
- * Crash-safe atomic file replacement for Linux and OpenBSD.
+ * Atomic file replacement with local-filesystem durability requests for Linux
+ * and OpenBSD.
  *
  * Single-shot:
  *   chevron_write(path, buf, len, durability, mode, err)
@@ -53,11 +54,11 @@
 /*
  * chevron_durability_t - caller-selectable durability level.
  *
- * CHEVRON_FULL  - fsync file and parent directory; data and directory entry
- *                 are durable after crash.
- * CHEVRON_FILE  - fsync file only; data is durable; directory entry
- *                 durability depends on a higher-level mechanism.
- * CHEVRON_NONE  - atomic rename only; not durable across crash.
+ * CHEVRON_FULL  - request fsync on file and parent directory; strongest
+ *                 available local-filesystem durability request.
+ * CHEVRON_FILE  - request fsync on file only; caller must make the namespace
+ *                 update durable by another mechanism.
+ * CHEVRON_NONE  - atomic rename only; no crash-durability request.
  */
 typedef enum {
 	CHEVRON_FULL = 0,
@@ -157,9 +158,11 @@ int chevron_write(const char *path, const void *buf, size_t len,
  * file descriptors and is in the active state.
  *
  * handle must be initialised with CHEVRON_HANDLE_INIT and must be inactive
- * (_fd == -1) before calling. err may be NULL.
+ * (_fd == -1) before calling. A rejected call leaves an active handle
+ * unchanged. err may be NULL.
  *
- * Returns 0 on success, -1 on failure.
+ * Returns 0 on success, -1 on failure. On success, a non-NULL err is set to
+ * CHEVRON_ERR_NONE, CHEVRON_OP_NONE, and errno_value 0.
  */
 int chevron_open(chevron_handle_t *handle, const char *path,
                  chevron_durability_t durability, mode_t mode,
@@ -175,7 +178,8 @@ int chevron_open(chevron_handle_t *handle, const char *path,
  * the inactive state. Calling chevron_abort() afterward is safe (no-op).
  *
  * handle->_fd == -1 returns CHEVRON_ERR_INVALID immediately.
- * err may be NULL. Returns 0 on success, -1 on failure.
+ * err may be NULL. On success, a non-NULL err is set to CHEVRON_ERR_NONE,
+ * CHEVRON_OP_NONE, and errno_value 0. Returns 0 on success, -1 on failure.
  */
 int chevron_write_chunk(chevron_handle_t *handle, const void *buf, size_t len,
                         chevron_error_t *err);

@@ -1445,6 +1445,15 @@ the author's own library under the same ISC license and technical standards.
 The project description states "zero external dependencies"; libchevron is
 not an external dependency.
 
+`vendor/libchevron/` holds the upstream files unmodified (`include/chevron.h`,
+`src/chevron.c`, `src/chevron_internal.h`, `LICENSE`) and `COMMIT`, the full
+upstream commit they come from. A fix libchevron needs is made in the
+libchevron repository under its own gate; ark then copies those files at the
+new commit and updates `COMMIT`. ark never patches the vendored copy.
+libchevron creates its temporary file with `openat` relative to the parent
+directory it has opened, under a random `.chevron_` name from
+`getentropy` (on Linux the `getrandom` system call).
+
 ---
 
 ## 10. Platform Behaviour
