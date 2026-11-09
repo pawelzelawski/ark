@@ -17,14 +17,15 @@ index hash, sandboxed operations, and atomic writes via vendored
   decompress in parallel too
 - Crash-safe archive writes via vendored
   [libchevron](https://github.com/pawelzelawski/libchevron)
-- Mandatory sandboxing: Landlock/seccomp-bpf on Linux, `pledge(2)` and
-  `unveil(2)` on OpenBSD
+- Mandatory sandboxing: Landlock and a seccomp-bpf system call filter per
+  subcommand on Linux, `pledge(2)` and `unveil(2)` on OpenBSD
 - Standalone recovery reader generation for long-term archive recovery
 
 ## Requirements
 
 - Linux 5.13+ or OpenBSD 6.4+
-- x86_64 or ARM64
+- x86_64 or ARM64 (on Linux the build stops on any other architecture)
+- glibc on Linux (musl is untested)
 - C11 compiler
 - `make`
 - No external runtime dependencies beyond libc/pthread
@@ -34,6 +35,14 @@ Linux 5.13 is a hard minimum because Landlock sandboxing is mandatory. On Linux
 5.13 through 5.18, extracting archives containing hardlinks is rejected before
 filesystem side effects because hardlink extraction requires Landlock ABI v2,
 available from Linux 5.19.
+
+On Linux, every subcommand also runs under a seccomp-bpf allowlist of system
+calls, the counterpart of its OpenBSD `pledge(2)` promises. The allowlists
+exist for x86_64 and ARM64 only, so ark does not build for other Linux
+architectures rather than run there without a tested filter. They were
+derived and tested with glibc. A system call outside the list stops ark with
+exit status 70 and a message naming the call number; please report it as a
+bug.
 
 ## Build
 

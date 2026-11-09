@@ -538,6 +538,11 @@ In production builds the macros expand to the real syscalls with zero
 overhead. In test builds (`-DARK_TEST`) they expand to stubs. Bypassing
 the macros silently breaks fault injection coverage.
 
+The one exception is a signal handler: it may call only async-signal-safe
+functions, and the test stubs are not. The SIGSYS handler of the seccomp
+filter (`src/sandbox_linux.c`) therefore calls `write(2)` and `_exit(2)`
+directly, with a `SAFETY:` comment saying so.
+
 ### 4.2 EINTR Retry Pattern
 
 All retryable syscalls use the same retry loop pattern:

@@ -111,22 +111,38 @@ All diagnostic output goes to syslog. No file-based logging exists.
 `stderr` is used only for interactive terminal output (warnings, errors,
 progress) when `isatty(STDERR_FILENO)` is true.
 
+`openlog` is called with `LOG_NDELAY`, and `tzset()` before it, both before
+any sandbox: the syslog socket and the time zone must be in place before
+the Linux seccomp filter (no `socket`/`connect` afterwards) and Landlock
+(no `/etc/localtime`) go on. See ARCHITECTURE.md section 10.4.
+
 ### 3.6 Linux-Specific Headers (conditional)
 
 ```c
 #ifdef __linux__
 #include <linux/landlock.h>   /* LANDLOCK_ACCESS_FS_*, landlock_ruleset_attr */
-#include <linux/seccomp.h>    /* SECCOMP_SET_MODE_FILTER, seccomp_data       */
-#include <linux/filter.h>     /* sock_filter, sock_fprog                      */
-#include <sys/prctl.h>        /* prctl, PR_SET_SECCOMP, PR_SET_NO_NEW_PRIVS  */
+#include <sys/prctl.h>        /* prctl, PR_SET_NO_NEW_PRIVS                  */
 #include <sys/syscall.h>      /* syscall, SYS_landlock_create_ruleset, etc.   */
 #endif
+
+/* src/sandbox_linux.c (built on Linux only) */
+#include <asm/ioctls.h>       /* TCGETS, TCGETS2 (ioctl argument check)      */
+#include <asm/termbits.h>     /* struct termios2 (size in TCGETS2)           */
+#include <linux/audit.h>      /* AUDIT_ARCH_X86_64, AUDIT_ARCH_AARCH64       */
+#include <linux/filter.h>     /* sock_filter, sock_fprog, BPF_*              */
+#include <linux/seccomp.h>    /* SECCOMP_SET_MODE_FILTER, seccomp_data       */
+#include <signal.h>           /* sigaction, SIGSYS, siginfo_t si_syscall     */
+#include <stdatomic.h>        /* atomic_flag (report once from the handler)  */
 ```
 
-All Landlock and seccomp-bpf code is guarded by `#ifdef __linux__`. No
-platform-specific code exists outside these guards. The Linux sandboxing
-headers are always present on any Linux 5.13+ build host; no installation
-beyond the standard kernel headers package is required.
+All Landlock code is guarded by `#ifdef __linux__`; the seccomp-bpf filter
+lives in `src/sandbox_linux.c`, which the Makefile builds on Linux only. No
+platform-specific code exists outside these. The Linux sandboxing headers
+are always present on any Linux 5.13+ build host; no installation beyond
+the standard kernel headers package is required. The filter is installed
+with the `seccomp(2)` system call (`SECCOMP_FILTER_FLAG_TSYNC`), not
+`prctl(PR_SET_SECCOMP)`, because only the system call can filter the
+running worker threads too.
 
 ### 3.7 OpenBSD-Specific Headers (conditional)
 
@@ -418,10 +434,14 @@ OpenBSD 7.9 (amd64 and arm64) with `clang-tools-extra` and `cppcheck`.
 **Installation**: `apt install cppcheck` / `pkg_add cppcheck`
 
 ```sh
-cppcheck --enable=all --error-exitcode=1 \
+cppcheck --enable=all --error-exitcode=1 --inline-suppr \
          --suppress=missingIncludeSystem \
          src/
 ```
+
+`--inline-suppr` honours `/* cppcheck-suppress <id> */` comments; each one
+says why (for example the SIGSYS handler in `src/sandbox_linux.c`, whose
+`siginfo_t *` parameter `sigaction` fixes as non-const).
 
 ### 7.6 clang-format
 
@@ -443,7 +463,7 @@ Both platforms are first-class. No platform is secondary or best-effort.
 
 | Platform | Minimum Version | Requirement | Notes |
 |---|---|---|---|
-| Linux | Kernel 5.13 | Hard - Landlock ABI v1 | ASan/UBSan; TSan; Valgrind |
+| Linux | Kernel 5.13 | Hard - Landlock ABI v1; seccomp-bpf | ASan/UBSan; TSan; Valgrind; glibc |
 | OpenBSD | 6.4 | Hard - unveil(2) | Standard test suite; no sanitisers |
 
 **Linux 5.13 is a hard minimum.** Landlock is not optional and there is no
@@ -467,6 +487,16 @@ in active use will satisfy both requirements.
 |---|---|
 | x86_64 | First-class |
 | ARM64 | First-class |
+
+On **Linux** these are the only architectures ark builds for:
+`src/sandbox_linux.c` holds a seccomp-bpf allowlist for x86-64 and arm64
+(the Linux architectures in the quality gates) and stops the build with
+`#error` on any other, so no Linux binary runs without a tested system call
+filter. A port adds the architecture's `AUDIT_ARCH_*` value and an allowlist
+derived and tested on it (ARCHITECTURE.md section 10.4). The allowlists are
+tested with glibc only; musl is untested. OpenBSD builds on any architecture
+its clang supports (pledge needs no per-architecture list); x86_64 and ARM64
+are the ones tested.
 
 The codebase is POSIX C with no inline assembly. The only
 architecture-specific code is the hashes' optional hardware files, written
@@ -504,7 +534,7 @@ have no intrinsics. See ARCHITECTURE.md section 8.4.
 | GCC | >= 11.0 | Build tool | Secondary compiler (no TSan) | Linux only |
 | libc | system | System lib | Standard C, POSIX interfaces | Linux, OpenBSD |
 | libpthread | system | System lib | Thread pool (via `-lpthread`) | Linux only |
-| Linux kernel | >= 5.13 | Runtime | Landlock sandboxing | Linux only |
+| Linux kernel | >= 5.13 | Runtime | Landlock and seccomp-bpf sandboxing | Linux only |
 | OpenBSD | >= 6.4 | Runtime | unveil sandboxing | OpenBSD only |
 | Valgrind | latest | Dev tool | Memory checking | Linux only |
 | cppcheck | latest | Dev tool | Static analysis | Linux, OpenBSD |

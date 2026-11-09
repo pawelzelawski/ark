@@ -147,6 +147,7 @@ deflate.c / deflate.h     Deflate compress + decompress - pure algorithm, no I/O
 zwrap.c / zwrap.h         zlib format + Adler-32 over deflate - library API, not used by ark
 archive.c / archive.h     Format read/write - calls hash and deflate layers
 main.c                    CLI, filesystem traversal, platform I/O, libchevron use
+sandbox_linux.c / .h      Linux seccomp-bpf system call filter per subcommand
 vendor/libchevron/        Vendored libchevron at pinned commit
 ```
 
@@ -168,6 +169,12 @@ reuse in other projects without modification.
 Linux and OpenBSD are equally first-class. No feature, behaviour, or error
 path is permitted to work correctly on one platform and incorrectly on the
 other.
+
+On Linux these two architectures are the only ones ark builds for: each
+subcommand runs under a seccomp-bpf system call allowlist, which exists and
+is tested for x86_64 and ARM64 (with glibc) only, and the build stops on any
+other Linux architecture rather than produce a binary without a tested
+filter (ARCHITECTURE.md section 10.4).
 
 ---
 

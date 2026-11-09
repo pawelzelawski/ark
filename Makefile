@@ -31,6 +31,13 @@ else \
 	echo ""; \
 fi
 
+# Linux seccomp-bpf filter (ARCHITECTURE.md section 10.4): Linux only;
+# sandbox_linux.c stops the build on Linux architectures other than x86-64
+# and arm64, which have no tested allowlist.
+SANDBOX_SRCS != if [ "$(OS)" = "Linux" ]; then \
+	echo src/sandbox_linux.c; \
+fi
+
 # SHA-256 hardware block function for the build machine's architecture
 # (ARCHITECTURE.md section 8.4): sha256_x86.c on x86-64, sha256_arm.c on
 # arm64, none elsewhere; sha256.c calls it only under the matching macro.
@@ -78,51 +85,62 @@ CFLAGS_COMMON = -std=c11 -Wall -Wextra -Wpedantic        \
 		-D_XOPEN_SOURCE=700                                 \
 		$(SHA256_HW_DEFS) $(BLAKE3_HW_DEFS)
 
+# ARK_SECCOMP_SANITIZER: the seccomp filter also allows the sanitizer and
+# valgrind runtimes' own system calls, and goes on without a filter where
+# seccomp is missing (valgrind). Debug and test builds only, never release.
 CFLAGS_DEV = $(CFLAGS_COMMON)                             \
 	-O0 -g3 -gdwarf-4                                   \
 	-Werror                                              \
 	-fno-omit-frame-pointer                              \
+	-DARK_SECCOMP_SANITIZER                              \
 	$(SANITIZERS)
 
 CFLAGS_RELEASE = $(CFLAGS_COMMON) -O2
 
 CFLAGS_TEST = $(CFLAGS_DEV) -DARK_TEST -DARK_DEFLATE_TEST -DARK_BLAKE3_TEST
 
+# ARK_TEST_NO_SECCOMP: the in-process seccomp tests are skipped (TSan's
+# runtime and valgrind cannot run under the filter, TESTING.md).
 CFLAGS_TSAN = $(CFLAGS_COMMON)                            \
 	-O1 -g3                                              \
 	-fsanitize=thread                                    \
 	-fno-omit-frame-pointer                              \
+	-DARK_SECCOMP_SANITIZER -DARK_TEST_NO_SECCOMP        \
 	-DARK_TEST -DARK_DEFLATE_TEST -DARK_BLAKE3_TEST
 
 CFLAGS_VG = $(CFLAGS_COMMON)                              \
 	-O0 -g3 -gdwarf-4                                    \
+	-DARK_SECCOMP_SANITIZER -DARK_TEST_NO_SECCOMP        \
 	-DARK_TEST -DARK_DEFLATE_TEST -DARK_BLAKE3_TEST
 
 INCLUDES = -I. -I./src -I./vendor/libchevron/include -I./$(BUILD_DIR)
 
 APP_SRCS = src/archive.c src/blake3.c src/blake3_cpu.c $(BLAKE3_HW_SRCS) \
-	src/deflate.c src/main.c src/sha256.c src/sha256_cpu.c \
+	src/deflate.c src/main.c $(SANDBOX_SRCS) src/sha256.c src/sha256_cpu.c \
 	$(SHA256_HW_SRCS) vendor/libchevron/src/chevron.c
 
 CORE_SRCS = src/archive.c src/blake3.c src/blake3_cpu.c $(BLAKE3_HW_SRCS) \
-	src/deflate.c src/main.c src/sha256.c src/sha256_cpu.c \
+	src/deflate.c src/main.c $(SANDBOX_SRCS) src/sha256.c src/sha256_cpu.c \
 	$(SHA256_HW_SRCS) src/zwrap.c vendor/libchevron/src/chevron.c
 
 TEST_SRCS = tests/run_tests.c tests/ark_stubs.c tests/test_archive.c \
 	tests/test_blake3.c tests/test_deflate.c tests/test_edge.c \
 	tests/test_extract.c tests/test_fault.c tests/test_integration.c \
-	tests/test_sha256.c tests/test_thread.c tests/test_zwrap.c
+	tests/test_seccomp.c tests/test_sha256.c tests/test_thread.c \
+	tests/test_zwrap.c
 
 FORMAT_SRCS = src/archive.c src/archive.h src/ark_internal.h src/blake3.c \
 	src/blake3.h src/blake3_arm.c src/blake3_cpu.c src/blake3_cpu.h \
 	src/blake3_x86.c src/deflate.c src/deflate.h src/main.c \
-	src/recovery_template.c src/sha256.c src/sha256.h src/sha256_arm.c \
+	src/recovery_template.c src/sandbox_linux.c src/sandbox_linux.h \
+	src/sha256.c src/sha256.h src/sha256_arm.c \
 	src/sha256_cpu.c src/sha256_cpu.h src/sha256_x86.c src/zwrap.c \
 	src/zwrap.h \
 	tests/ark_stubs.c tests/run_tests.c tests/test_archive.c \
 	tests/test_blake3.c tests/test_deflate.c tests/test_edge.c \
 	tests/test_extract.c tests/test_fault.c tests/test_integration.c \
-	tests/test_sha256.c tests/test_thread.c tests/test_zwrap.c
+	tests/test_seccomp.c tests/test_sha256.c tests/test_thread.c \
+	tests/test_zwrap.c
 
 .PHONY: all dev release test test-tsan valgrind test-qemu lint format clean install
 
@@ -172,11 +190,11 @@ test-qemu: $(TEST_BIN_VG)
 
 lint:
 	clang-tidy src/archive.c src/blake3.c src/blake3_cpu.c $(BLAKE3_HW_SRCS) \
-		src/deflate.c src/main.c src/sha256.c src/sha256_cpu.c \
-		$(SHA256_HW_SRCS) src/zwrap.c \
+		src/deflate.c src/main.c $(SANDBOX_SRCS) src/sha256.c \
+		src/sha256_cpu.c $(SHA256_HW_SRCS) src/zwrap.c \
 		-- $(CFLAGS_RELEASE) $(INCLUDES) $(TIDY_RESOURCE_DIR)
 	@if command -v cppcheck >/dev/null 2>&1; then \
-		cppcheck --enable=all --error-exitcode=1 \
+		cppcheck --enable=all --error-exitcode=1 --inline-suppr \
 			 --suppress=missingIncludeSystem \
 			 --suppress=unusedFunction \
 			 --suppress=checkersReport \

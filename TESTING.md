@@ -42,7 +42,8 @@ tests/
 ├── test_extract.c        # extraction correctness, metadata, cleanup, --overwrite
 ├── test_fault.c          # fault injection at each sequence step
 ├── test_edge.c           # boundary conditions and adversarial inputs
-└── test_integration.c    # end-to-end create → verify → extract pipelines
+├── test_integration.c    # end-to-end create → verify → extract pipelines
+└── test_seccomp.c        # Linux seccomp-bpf filter per subcommand (§9.1)
 ```
 
 `make test` builds all test files with `-DARK_TEST`, `-DARK_DEFLATE_TEST`
@@ -707,13 +708,19 @@ test. These tests are the final gate before a phase is declared complete.
 
 All tests must pass on all platforms before any phase is declared complete.
 Platform-conditional test code is not permitted - the same test binary runs
-unmodified on Linux and OpenBSD.
+unmodified on Linux and OpenBSD. The one exception is `test_seccomp.c`
+(§9.1): seccomp-bpf exists only on Linux, so its tests are compiled for
+Linux and pass as no-ops elsewhere; they are registered on every platform,
+so the test count is the same everywhere.
 
 **Sandboxing tests:** The sandboxing policy (`pledge`/`unveil` on OpenBSD,
-Landlock on Linux) is exercised by the integration tests. Each subcommand
-test verifies the sandbox does not interfere with legitimate operations.
-Sandbox policy is applied in each integration test as it would be in
-production.
+Landlock and the seccomp-bpf filter on Linux) is exercised by the
+integration tests. Each subcommand test verifies the sandbox does not
+interfere with legitimate operations. Sandbox policy is applied in each
+integration test as it would be in production: on Linux every integration
+test runs `./build/ark` (the ASan build) under its subcommand's seccomp
+allowlist, so a missing system call on any tested path fails that test with
+exit status 70.
 
 OpenBSD-specific note: `generate-reader` uses libchevron atomic commit flow,
 which performs metadata operations (`fchmod`/`fchown`) and read-only parent
@@ -726,6 +733,42 @@ correct behaviour on the host kernel's Landlock ABI version. No specific
 kernel version is required for the test environment beyond the hard minimum
 of Linux 5.13.
 
+### 9.1 Linux seccomp-bpf Filter (`test_seccomp.c`)
+
+ARCHITECTURE.md §10.4. Each in-process test forks a child that installs one
+subcommand's filter with `ark_seccomp_apply` and makes allowed and
+forbidden calls; the parent checks the exit status and the report on
+stderr, so no filter reaches the test harness. The test binary is built
+with `ARK_SECCOMP_SANITIZER`, so the filters carry the ASan/UBSan extras.
+
+| Test | Verifies |
+|---|---|
+| `test_seccomp_profiles_install` | All five profiles install (`/proc/self/status` shows `Seccomp: 2`); allowed calls work; `socket` fails with `EACCES`; an unknown profile is refused |
+| `test_seccomp_blocks_unlisted_call` | A call in no allowlist (`ptrace`) is reported on stderr and exits with status 70, for every profile |
+| `test_seccomp_read_only_profiles` | `list` and `verify` may open files for reading only (a write open stops the process); the other profiles may open for writing |
+| `test_seccomp_no_exec_memory_or_ioctl` | `mmap` with `PROT_EXEC` and an `ioctl` other than the `isatty` query stop the process, for every profile |
+| `test_seccomp_covers_running_threads` | A thread started before the filter is filtered too (TSYNC), as ark's worker pool is |
+| `test_seccomp_foreign_abi_killed` | x86-64: an x32 call number kills the process with SIGSYS (no report); no-op on arm64 |
+| `test_seccomp_cli_threads_filtered` | The production binary: `list`, `verify` and `extract` on a FIFO archive block in `open` after the sandbox; every thread of the process (main + workers) shows `Seccomp: 2`; then ark fails on the FIFO with exit status 2 |
+
+**Skipped (pass with a note "seccomp tests skipped"):** on OpenBSD, and in
+the TSan and valgrind test builds (`ARK_TEST_NO_SECCOMP`): valgrind does
+not implement `seccomp(2)` (`ENOSYS`), and TSan's runtime needs further
+system calls and crashes handling the trapped `SIGSYS`. Neither matters for
+ark itself: those runs execute `./build/ark` (the ASan build) natively for
+the integration tests. `./build/ark` itself cannot run under valgrind (it is
+the ASan build; valgrind does not run ASan binaries, filter or not). A debug
+build of ark without ASan (the valgrind flags, `ARK_SECCOMP_SANITIZER`, no
+`-fsanitize`) runs under valgrind with the warning "seccomp unavailable
+(debug build), running without the system call filter"; a release build
+refuses to run without the filter.
+
+**Re-deriving the allowlist** (after a change that adds system calls, or for
+a new architecture or C library): ARCHITECTURE.md §10.4 "Deriving the
+lists". The integration tests on CI's amd64 and arm64 runners (Ubuntu glibc)
+and the development machine (Fedora glibc) are the check that the lists are
+complete.
+
 ---
 
 ## 10. Sanitiser and Tool Matrix
@@ -735,6 +778,7 @@ of Linux 5.13.
 | Memory errors, leaks | Valgrind | Linux | After each phase; before release |
 | Memory errors, undefined behaviour | ASan/UBSan | Linux | Every `make test` (dev build) |
 | Data races | TSan | Linux (Clang only) | At thread phase boundary; before release |
+| seccomp allowlists complete | Integration tests under the filter (`make test`) | Linux x86-64 and arm64 (CI) | Every `make test`; after any change adding system calls |
 | SHA-256 hardware and BLAKE3 SIMD backends | `make test-qemu` (qemu-x86_64 -cpu max); CI runners natively | Linux x86-64; CI arm64 | When the hash files change; before release |
 | Static analysis | clang-tidy | Linux, OpenBSD | Before release |
 | Static analysis | cppcheck | Linux, OpenBSD | Before release |
@@ -770,6 +814,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | `test_fault.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_edge.c` | ✓ | ✓ | ✓ | ✓ |
 | `test_integration.c` | ✓ | ✓ | ✓ | ✓ |
+| `test_seccomp.c` | ✓ | skipped (§9.1) | ✓ | no-op (Linux only) |
 
 ### Key Correctness Cases
 
@@ -804,6 +849,7 @@ only when the test passes cleanly with Valgrind and ASan on Linux.
 | Recovery reader accepts exactly the indexes ark accepts, before any write | `test_integration.c` | ARCHITECTURE.md §8.3, §15.2 |
 | Every create sequence step tested with forced failure | `test_fault.c` | ARCHITECTURE.md §16.3 |
 | Every extract sequence step tested with forced failure | `test_fault.c` | ARCHITECTURE.md §14 |
+| seccomp: unlisted call reported, exit 70; every ark thread filtered; read-only profiles cannot open for writing | `test_seccomp.c` | ARCHITECTURE.md §10.4 |
 
 ### Quality Milestone Gate
 

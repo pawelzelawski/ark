@@ -170,6 +170,20 @@ requires
 and also uses
 .Xr pledge 2 .
 .Pp
+On Linux, each subcommand also runs under a seccomp-bpf system call
+filter, the counterpart of its
+.Xr pledge 2
+promises on
+.Ox .
+A system call outside the subcommand's list stops
+.Nm
+with exit status 70 and a message naming the call number.
+The filter exists for x86_64 and ARM64 only; on other Linux
+architectures
+.Nm
+does not build.
+The lists were derived and are tested with glibc.
+.Pp
 The supported architectures are x86_64 and ARM64.
 .Sh FILES
 .Bl -tag -width ARCHITECTURE.md -compact
@@ -199,6 +213,12 @@ Integrity error.
 Security error.
 .It 6
 Source consistency error.
+.It 70
+Sandbox violation (Linux): a system call outside the subcommand's
+seccomp-bpf allowlist.
+This is a bug in
+.Nm ;
+please report it.
 .El
 .Sh EXAMPLES
 Create an archive:
@@ -291,6 +311,11 @@ writes a separate companion C source file that must be kept with long-term
 archives.
 .It
 Hardlink extraction on Linux requires Linux 5.19 or newer.
+.It
+On Linux,
+.Nm
+builds only for x86_64 and ARM64, the architectures with a tested
+seccomp-bpf allowlist, and the allowlists are tested with glibc only.
 .El
 .Sh SEE ALSO
 .Xr pledge 2 ,

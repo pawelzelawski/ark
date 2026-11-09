@@ -169,6 +169,13 @@ int test_deflate_enc_stream_sync_flush(void);
 int test_deflate_enc_stream_window_limit(void);
 int test_deflate_enc_stream_status(void);
 int test_deflate_stream_dictionary(void);
+int test_seccomp_profiles_install(void);
+int test_seccomp_blocks_unlisted_call(void);
+int test_seccomp_read_only_profiles(void);
+int test_seccomp_no_exec_memory_or_ioctl(void);
+int test_seccomp_covers_running_threads(void);
+int test_seccomp_foreign_abi_killed(void);
+int test_seccomp_cli_threads_filtered(void);
 int test_zwrap_adler32_known(void);
 int test_zwrap_decodes_zlib_and_git(void);
 int test_zwrap_oneshot_round_trip(void);
@@ -449,6 +456,15 @@ static const test_case_t g_tests[] = {
      test_deflate_enc_stream_window_limit},
     {"test_deflate_enc_stream_status", test_deflate_enc_stream_status},
     {"test_deflate_stream_dictionary", test_deflate_stream_dictionary},
+    {"test_seccomp_profiles_install", test_seccomp_profiles_install},
+    {"test_seccomp_blocks_unlisted_call", test_seccomp_blocks_unlisted_call},
+    {"test_seccomp_read_only_profiles", test_seccomp_read_only_profiles},
+    {"test_seccomp_no_exec_memory_or_ioctl",
+     test_seccomp_no_exec_memory_or_ioctl},
+    {"test_seccomp_covers_running_threads",
+     test_seccomp_covers_running_threads},
+    {"test_seccomp_foreign_abi_killed", test_seccomp_foreign_abi_killed},
+    {"test_seccomp_cli_threads_filtered", test_seccomp_cli_threads_filtered},
     {"test_zwrap_adler32_known", test_zwrap_adler32_known},
     {"test_zwrap_decodes_zlib_and_git", test_zwrap_decodes_zlib_and_git},
     {"test_zwrap_oneshot_round_trip", test_zwrap_oneshot_round_trip},

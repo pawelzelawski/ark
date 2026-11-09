@@ -56,6 +56,7 @@
 | M31 | clang-format clean | DONE |
 | M32 | All tests pass on OpenBSD x86_64 | DONE |
 | M33 | All tests pass on OpenBSD ARM64 | DONE |
+| M34 | Sandboxing: all subcommands operate correctly under their seccomp-bpf allowlists on Linux x86_64 and ARM64 (glibc); an unlisted call stops ark with exit 70 | DONE |
 
 ---
 
@@ -514,6 +515,12 @@ pipeline passes end-to-end tests.
   before sandbox is applied (Phase 6 task, but the call site is reserved)
 - [x] Verify pledge/unveil strings match ARCHITECTURE.md §10.4 exactly:
   `pthread` promise present for create and extract
+- [x] On Linux: seccomp-bpf allowlist per subcommand in
+  `src/sandbox_linux.c` (promise groups mirroring the pledge strings,
+  derived with `strace`), installed after the thread pool has started with
+  `SECCOMP_FILTER_FLAG_TSYNC`; blocked call reported, exit 70; build stops
+  on Linux architectures other than x86_64 and ARM64 (ARCHITECTURE.md
+  §10.4); quality milestone M34 confirmed
 
 **5.3 - Filesystem traversal (create)** ✓ DONE
 - [x] Implement `traverse_dir(src_path, write_ctx, chev_handle, err)` in

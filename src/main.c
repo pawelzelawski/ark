@@ -30,6 +30,8 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 
+#include "sandbox_linux.h"
+
 extern long syscall(long, ...);
 #endif
 
@@ -1520,6 +1522,9 @@ static int sandbox_apply(ark_cmd_t, const char **, int, const char *,
 #ifdef __OpenBSD__
 static int openbsd_pledge_threads_precreated(const char *, const char *,
                                              ark_error_t *);
+#endif
+#ifdef __linux__
+static int sandbox_seccomp(ark_cmd_t, ark_error_t *);
 #endif
 static int modified_path_list_push(modified_path_list_t *, const char *,
                                    ark_error_t *);
@@ -5414,6 +5419,61 @@ static int sandbox_apply(ark_cmd_t cmd, const char **src_paths, int src_count,
 #endif
 }
 
+#ifdef __linux__
+/*
+ * sandbox_seccomp - Install the subcommand's seccomp-bpf filter (Linux).
+ *
+ * Called after sandbox_apply (Landlock) and after the worker pool has
+ * started; the filter covers every thread (TSYNC). Sanitizer and valgrind
+ * builds (ARK_SECCOMP_SANITIZER) go on with a warning when seccomp is
+ * missing (valgrind does not implement it); release builds fail.
+ *
+ * Returns 0 on success, -1 on error with err populated.
+ *
+ * See ARCHITECTURE.md section 10.4 for the allowlists and their order.
+ */
+static int sandbox_seccomp(ark_cmd_t cmd, ark_error_t *err)
+{
+	ark_seccomp_profile_t profile;
+	int rc;
+
+	switch (cmd) {
+	case ARK_CMD_CREATE:
+		profile = ARK_SECCOMP_CREATE;
+		break;
+	case ARK_CMD_EXTRACT:
+		profile = ARK_SECCOMP_EXTRACT;
+		break;
+	case ARK_CMD_LIST:
+		profile = ARK_SECCOMP_LIST;
+		break;
+	case ARK_CMD_VERIFY:
+		profile = ARK_SECCOMP_VERIFY;
+		break;
+	case ARK_CMD_GENERATE_READER:
+		profile = ARK_SECCOMP_GENERATE_READER;
+		break;
+	default:
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "seccomp policy unavailable for subcommand",
+		                  "", 0);
+	}
+	rc = ark_seccomp_apply(profile);
+#ifdef ARK_SECCOMP_SANITIZER
+	if (rc == ENOSYS) {
+		print_warning("seccomp unavailable (debug build), running "
+		              "without the system call filter",
+		              NULL);
+		return 0;
+	}
+#endif
+	if (rc != 0)
+		return fail_error(err, ARK_ERR_USAGE,
+		                  "seccomp filter installation failed", "", rc);
+	return 0;
+}
+#endif
+
 /*
  * args_init - Initialize parsed-argument defaults.
  *
@@ -6109,6 +6169,9 @@ void ark_test_keep_main_symbols(void)
 	(void)&cmd_verify;
 	(void)&cmd_generate_reader;
 	(void)&sandbox_apply;
+#ifdef __linux__
+	(void)&sandbox_seccomp;
+#endif
 	(void)&exit_code_from_err;
 	(void)&print_error;
 }
@@ -6125,7 +6188,14 @@ int main(int argc, char **argv)
 
 	io_pool = NULL;
 	extract_dest_fd = -1;
-	openlog("ark", LOG_PID, LOG_USER);
+	/*
+	 * Before any sandbox (ARCHITECTURE.md section 10.4): tzset reads the
+	 * time zone that syslog's timestamps need (Landlock hides
+	 * /etc/localtime later), and LOG_NDELAY connects the syslog socket now,
+	 * because the Linux seccomp filter allows no socket or connect.
+	 */
+	tzset();
+	openlog("ark", LOG_PID | LOG_NDELAY, LOG_USER);
 
 	if (parse_args(argc, argv, &args, &err) != 0) {
 		if (err.code == ARK_ERR_USAGE)
@@ -6256,6 +6326,23 @@ int main(int argc, char **argv)
 			closelog();
 			return exit_code_from_err(err.code);
 		}
+	}
+
+	/*
+	 * SAFETY: the seccomp filter goes on after Landlock and after the pool
+	 * has started (no clone/clone3 in any allowlist), before any archive
+	 * or source byte is parsed. TSYNC filters the running workers too.
+	 * See ARCHITECTURE.md sections 6.3 and 10.4.
+	 */
+	if (sandbox_seccomp(args.cmd, &err) != 0) {
+		print_error(&err);
+		args_free(&args);
+		if (io_pool != NULL)
+			pool_shutdown(io_pool);
+		if (extract_dest_fd != -1)
+			(void)ARK_CLOSE(extract_dest_fd);
+		closelog();
+		return 1;
 	}
 #endif
 

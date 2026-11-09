@@ -287,6 +287,29 @@ src/
 │                       #   ARK_CLOSEDIR    → closedir
 │                       #   ARK_REALPATH    → realpath
 │
+│   - Linux system call filter -
+│
+├── sandbox_linux.h     # Internal API of the Linux seccomp-bpf filter.
+│                       #   ark_seccomp_profile_t - one profile per
+│                       #     subcommand
+│                       #   ark_seccomp_apply()   - install a profile on
+│                       #     every thread (TSYNC); returns an errno value
+│                       #   ARK_SECCOMP_EXIT_BLOCKED (70) - exit status
+│                       #     after a blocked call
+│
+├── sandbox_linux.c     # Builds the classic BPF program from promise
+│                       #   groups named after the pledge promises (stdio,
+│                       #   rpath, wpath, cpath, fattr, pthread), with
+│                       #   argument checks (no PROT_EXEC, read-only opens
+│                       #   for list/verify, ioctl TCGETS only, sendto on
+│                       #   a connected socket); SIGSYS handler reports a
+│                       #   blocked call and exits 70.
+│                       # Built on Linux only (Makefile SANDBOX_SRCS);
+│                       #   #error on Linux architectures other than
+│                       #   x86-64 and arm64. ARK_SECCOMP_SANITIZER (dev,
+│                       #   test, TSan, valgrind builds) adds the sanitizer
+│                       #   runtimes' calls. See ARCHITECTURE.md §10.4.
+│
 │   - Application entry point -
 │
 └── main.c              # CLI entry point and application logic.
@@ -349,6 +372,9 @@ src/
                         # Sandboxing:
                         #   sandbox_apply()       - apply pledge/unveil or Landlock
                         #                           policy for the current subcommand
+                        #   sandbox_seccomp()     - Linux: install the subcommand's
+                        #                           seccomp filter after the pool
+                        #                           has started (sandbox_linux.c)
                         #
                         # Output formatting:
                         #   print_error()         - format and emit ark_error_t to stderr
@@ -356,8 +382,9 @@ src/
                         #   print_member()        - one member row for list subcommand
                         #
                         # main.c is the only file that calls pledge/unveil (OpenBSD)
-                        # and Landlock/seccomp-bpf (Linux). No sandboxing code
-                        # exists in any other source file.
+                        # and Landlock (Linux); the Linux seccomp-bpf filter is
+                        # built in sandbox_linux.c and installed from main.c.
+                        # No sandboxing code exists in any other source file.
 ```
 
 ---
@@ -517,16 +544,24 @@ tests/
 │                           # Pre-epoch mtime: stored and restored correctly.
 │                           # See TESTING.md §5.
 │
-└── test_integration.c      # End-to-end integration tests.
-                            # No fault injection. Exercises the full create
-                            #   → extract → verify pipeline on real archives.
-                            # Tests: single regular file, directory tree,
-                            #   mixed member types, hardlinks and symlinks,
-                            #   round-trip hash identity, --overwrite,
-                            #   selective extraction via --member,
-                            #   generate-reader output compiles and runs, and
-                            #   its index checks match ark_read_index.
-                            # See TESTING.md §6.
+├── test_integration.c      # End-to-end integration tests.
+│                           # No fault injection. Exercises the full create
+│                           #   → extract → verify pipeline on real archives.
+│                           # Tests: single regular file, directory tree,
+│                           #   mixed member types, hardlinks and symlinks,
+│                           #   round-trip hash identity, --overwrite,
+│                           #   selective extraction via --member,
+│                           #   generate-reader output compiles and runs, and
+│                           #   its index checks match ark_read_index.
+│                           # See TESTING.md §6.
+│
+└── test_seccomp.c          # Linux seccomp-bpf filter tests: every profile
+                            #   installs, unlisted call reported (exit 70),
+                            #   argument checks, running threads filtered,
+                            #   x32 killed, production binary's threads all
+                            #   filtered (FIFO archive). No-ops on OpenBSD
+                            #   and in the TSan/valgrind builds.
+                            # See TESTING.md §9.1.
 ```
 
 See TESTING.md for the complete test catalogue, fault injection infrastructure
@@ -571,7 +606,8 @@ make clean        # remove build artefacts
 make install      # install ark binary and man page to PREFIX
 ```
 
-Platform detected via `OS != uname -s`; the SHA-256 hardware file and its
+Platform detected via `OS != uname -s` (it also selects `SANDBOX_SRCS`,
+`src/sandbox_linux.c` on Linux only); the SHA-256 hardware file and its
 macro (`SHA256_HW_SRCS`, `SHA256_HW_DEFS`) and the BLAKE3 SIMD file and its
 macro (`BLAKE3_HW_SRCS`, `BLAKE3_HW_DEFS`) via `uname -m`.
 `build/tests/run_tests [prefix]` runs only the tests whose names start with
@@ -582,7 +618,11 @@ targets define `-DARK_DEFLATE_TEST`, which compiles the Deflate encoder's
 test accessors (including a hash-chain check of a streaming encoder) and a
 window-limited test decoder, and `-DARK_BLAKE3_TEST`, which compiles
 `ark_blake3_test_hash_many` (the chunk/parent hashing of one backend, for
-the SIMD lane tests).
+the SIMD lane tests). `make dev`, `make test`, `make valgrind` and
+`make test-tsan` also define `-DARK_SECCOMP_SANITIZER` (the seccomp filter
+admits the sanitizer runtimes' system calls; never in `make release`), and
+the valgrind and TSan builds `-DARK_TEST_NO_SECCOMP` (the in-process seccomp
+tests are skipped there, TESTING.md §9.1).
 
 **Recovery template embedding.** `src/recovery_template.c` is embedded into
 the ark binary as a byte array. The Makefile generates
@@ -737,6 +777,8 @@ Checks: >
 | `cleanup_track` | `src/main.c` | Internal; register created object |
 | `cleanup_run` | `src/main.c` | Internal; remove all tracked objects |
 | `sandbox_apply` | `src/main.c` | Internal; pledge/Landlock per subcommand |
+| `sandbox_seccomp` | `src/main.c` | Internal; Linux seccomp filter per subcommand, after the pool starts |
+| `ark_seccomp_apply` | `src/sandbox_linux.c` | Internal (Linux); build and install a profile's filter on every thread |
 | `print_error` | `src/main.c` | Internal; format ark_error_t to stderr |
 | `print_warning` | `src/main.c` | Internal; yellow warning to stderr |
 | `print_member` | `src/main.c` | Internal; one row for list subcommand |

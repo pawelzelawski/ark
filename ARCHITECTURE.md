@@ -700,8 +700,12 @@ and must not be unified:
   on Linux, Landlock must be applied in the main thread *before* the
   worker thread pool is created. Workers then inherit the Landlock
   ruleset at creation time and operate within the sandbox for their entire
-  lifetime. The sequence is: argument parsing → open destination dirfd →
-  apply Landlock → create thread pool → run operation.
+  lifetime. The seccomp-bpf system call filter goes on after the pool
+  exists, with `SECCOMP_FILTER_FLAG_TSYNC`, which applies it to every
+  thread at once; the allowlists therefore need no `clone`/`clone3`
+  (§10.4). The sequence is: argument parsing → open destination dirfd →
+  apply Landlock → create thread pool → apply seccomp filter → run
+  operation.
 
 - **OpenBSD (pledge):** `pledge()` restricts the entire process and
   does not permit `pthread_create` under the pledges used for create,
@@ -710,7 +714,9 @@ and must not be unified:
   open destination dirfd → create thread pool → apply pledge+unveil →
   run operation.
 
-These two sequences are incompatible and require a platform-conditional
+The two platforms meet in one point: on both, the process-wide system call
+restriction (pledge, seccomp) comes after the thread pool exists. These two
+sequences are incompatible and require a platform-conditional
 initialisation path in `main.c`. The `#ifdef __linux__` / `#ifdef __OpenBSD__`
 guards around this ordering are the one location where the platform
 split is visible at the top level. All other platform-specific code
@@ -1521,7 +1527,9 @@ relative to thread pool creation (see §6.3 for the full rationale):
 - **Linux:** Landlock is applied in the main thread before worker threads
   are created. Workers inherit the Landlock restriction at creation time.
   Pre-sandbox setup (argument parsing, opening the destination dirfd)
-  occurs before Landlock application.
+  occurs before Landlock application. The seccomp-bpf filter follows the
+  pool creation and covers all threads (see "Linux seccomp-bpf filter"
+  below).
 - **OpenBSD:** The thread pool is created before `pledge()` is called,
   because `pledge()` does not permit `pthread_create` under the pledges
   required for create, extract and verify. Pre-sandbox setup and thread pool
@@ -1616,25 +1624,97 @@ policy. The footprint is narrow and fixed.
   output path already exists, it is atomically replaced via libchevron's
   rename mechanism. This is the documented behavior: generate-reader
   always overwrites an existing file at the output path.
-- The Linux seccomp-bpf filter per subcommand must be a concrete syscall
-  whitelist. It cannot be fully specified before the implementation exists
-  because the exact syscall set depends on the implementation's code paths
-  and all library call chains (libchevron, pthreads, libc). The whitelist
-  must be produced as a required pre-launch artifact by running each
-  subcommand under `strace` with realistic inputs to enumerate the minimal
-  required syscall set. This whitelist must be completed and reviewed before
-  the first release; it is a blocking pre-launch security requirement, not
-  an optional enhancement. The pledge strings above are the reference
-  footprint from which the Linux syscall set is derived, but the derivation
-  is not 1:1 and must be explicitly audited. The syscall whitelist is tracked
-  as a separate implementation artifact but is part of the security
-  architecture of this document.
+- The Linux seccomp-bpf filter per subcommand is specified below
+  ("Linux seccomp-bpf filter"). It was derived with `strace` from each
+  subcommand's normal and error paths and is the Linux counterpart of the
+  pledge strings above.
 - For `list` and `verify`, `rpath` is the minimum OpenBSD pledge needed to
   open and read the archive file (`verify` adds the same defensive `pthread`
   token as create and extract, with the same fallback; its pool already
   exists). The `unveil` restriction to the archive
   path alone provides the effective confinement; `rpath` without `unveil`
   would be over-broad.
+
+
+**Linux seccomp-bpf filter.** Landlock limits which paths ark can touch
+(as unveil does); the seccomp-bpf filter limits which system calls it can
+make (as pledge does). `src/sandbox_linux.c` builds one classic BPF
+program per subcommand and `main.c` installs it right after the thread pool
+has started (list and generate-reader have no pool: right after Landlock),
+before any archive or source byte is parsed.
+
+- **Promise groups.** The allowlist is assembled from groups named after
+  the pledge promises, and every subcommand gets the same promises as its
+  pledge string:
+
+  | Group | System calls (Linux names) |
+  |---|---|
+  | `stdio` | `read write readv writev pread64 close lseek fstat brk mmap mprotect munmap mremap madvise futex getpid geteuid getuid getegid getgid getrandom clock_gettime gettimeofday rt_sigprocmask rt_sigreturn exit_group ioctl sendto`; `socket` and `connect` fail with `EACCES` |
+  | `rpath` | `openat` (read-only unless wpath/cpath), `newfstatat statx getdents64 readlinkat` (+ `readlink` on x86-64) |
+  | `wpath` | `openat`, `fsync fdatasync ftruncate pwrite64` |
+  | `cpath` | `openat`, `mkdirat unlinkat symlinkat linkat renameat renameat2` (+ `mkdir unlink rmdir link symlink rename` on x86-64) |
+  | `fattr` | `utimensat fchmod fchmodat fchmodat2 fchown fchownat` (+ `lchown chmod` on x86-64) |
+  | `pthread` | `exit sched_yield set_robust_list rseq` |
+
+  | Subcommand | Groups (= pledge promises) |
+  |---|---|
+  | `create`, `extract` | stdio rpath wpath cpath fattr pthread |
+  | `list` | stdio rpath |
+  | `verify` | stdio rpath pthread |
+  | `generate-reader` | stdio rpath wpath cpath fattr |
+
+- **Argument checks.** `mmap` and `mprotect` never with `PROT_EXEC`;
+  `ioctl` only `TCGETS`/`TCGETS2` (the terminal query of `isatty`);
+  `sendto` only on a connected socket (no destination address); in `list`
+  and `verify`, `openat` only without `O_WRONLY`, `O_RDWR`, `O_CREAT`,
+  `O_TRUNC` and `O_APPEND`. No release-build list has `clone`, `clone3`,
+  `execve`, `prctl`, `seccomp`, `rt_sigaction` or `ptrace`.
+- **Blocked call.** Any other system call raises `SIGSYS`
+  (`SECCOMP_RET_TRAP`). The handler, installed before the filter and not
+  replaceable afterwards in a release build (no `rt_sigaction`), writes "ark: system call N
+  blocked by the seccomp sandbox; please report this as a bug" to stderr
+  and exits with status 70 (§11.1). ark never continues after a blocked
+  call; the report exists so that a C library making a different system
+  call for the same operation produces a usable bug report.
+- **Architectures.** The filter's first instructions compare the
+  architecture of the call (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
+  and kill the process on any other, which includes 32-bit compatibility
+  calls on x86-64; on x86-64 x32 call numbers are killed too. ark builds
+  on Linux only for **x86-64 and arm64**, the Linux architectures in the
+  quality gates: `src/sandbox_linux.c` stops the build with `#error`
+  elsewhere. Porting to another Linux architecture means adding its
+  `AUDIT_ARCH_*` value and deriving and testing its allowlist (below); it
+  is never built without a filter.
+- **C library.** The allowlists are derived and tested against glibc
+  (Fedora and Ubuntu 24.04, glibc 2.39-2.43). Other C libraries (musl)
+  are untested.
+- **Syslog.** glibc's `syslog` connects to `/dev/log` lazily, at the first
+  message, which would be after the filter. ark therefore calls
+  `openlog(..., LOG_PID | LOG_NDELAY, ...)` before any sandbox, so the
+  socket exists; after the filter `socket` and `connect` fail with
+  `EACCES`, so a reconnect (syslog daemon restarted, no `/dev/log`) only
+  loses that syslog line, the message is still on stderr. ark also calls
+  `tzset()` before the sandbox: Landlock hides `/etc/localtime` later, and
+  syslog's timestamps would otherwise be UTC.
+- **Debug builds.** Builds with `ARK_SECCOMP_SANITIZER` (the Makefile's
+  dev, test, TSan and valgrind builds, never `make release`) add the
+  sanitizer runtimes' own calls (`gettid sched_getaffinity sigaltstack
+  sched_yield readlinkat prctl tgkill rt_sigaction getrlimit prlimit64
+  nanosleep clock_nanosleep getrusage uname getppid getdents64`, x86-64
+  `readlink open`) and make process creation fail with `EPERM` (`pipe2
+  clone clone3 execve wait4`, x86-64 `pipe fork vfork`), so an ASan report
+  is printed in full (unsymbolised). Where seccomp itself is missing
+  (`ENOSYS`, e.g. such a build without ASan run under valgrind) these
+  builds warn and run without a filter; release builds fail with `ARK_ERR_USAGE` (exit 1), like a
+  missing Landlock.
+- **Deriving the lists.** Run every subcommand under `strace -f` with
+  realistic input, normal and error paths (conflicts, `--overwrite`,
+  `--member`, corrupted archive, replaced output), and collect the calls
+  made after the `seccomp(SECCOMP_SET_MODE_FILTER, ...)` call (before this
+  filter existed: after `landlock_restrict_self` and the last `clone3`).
+  A new call is assigned to the promise group whose pledge promise would
+  cover it; a call no promise covers is reviewed on its own (as `socket`
+  for syslog was).
 
 ---
 
@@ -1663,6 +1743,7 @@ redirected or piped.
 | 4 | Integrity error (hash mismatch - member or index) |
 | 5 | Security error (path traversal, path exceeds PATH_MAX) |
 | 6 | Consistency error (source modified during archiving) |
+| 70 | Sandbox violation (Linux): a system call outside the subcommand's seccomp allowlist (§10.4); a bug in ark, to be reported |
 
 Exit code 6 is the only retriable failure class. A shell script can branch
 on it specifically to retry once the source filesystem is quiescent.
@@ -3181,3 +3262,11 @@ reader alongside their archives. This is documented in the man page.
 Linux 5.13 (released July 2021). Older kernels are not supported. ark fails
 at startup with a clear error on kernels below this version. Hardlink
 extraction requires Linux 5.19 (see above).
+
+**Linux on x86-64 and arm64 only; tested with glibc.** The seccomp-bpf
+allowlists (§10.4) exist for the two Linux architectures in the quality
+gates; building on any other Linux architecture stops with an error rather
+than producing a binary without a tested filter. The lists were derived and
+are tested with glibc; with another C library (musl) a call outside the
+list stops ark with exit status 70 and a report. OpenBSD is unaffected
+(pledge).
