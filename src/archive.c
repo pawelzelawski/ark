@@ -53,20 +53,61 @@ typedef struct {
 	ark_sha256_backend_t sha256;
 } ark_hash_backends_t;
 
+/*
+ * ark_write_member_t - One write-path member, finished or current.
+ *
+ * The path bytes followed by the link bytes (no NULs) live in ctx->names at
+ * names_off, the chunk sizes in ctx->chunks at chunks_off. Members keep
+ * offsets, so growing either store never invalidates a member. See
+ * ARCHITECTURE.md section 16.2.
+ */
+typedef struct {
+	uint64_t mtime;
+	uint64_t size_original;
+	uint64_t size_compressed;
+	uint64_t data_offset;
+	size_t names_off;
+	size_t chunks_off;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t chunk_count;
+	uint16_t path_len;
+	uint16_t link_len;
+	uint8_t type;
+	uint8_t hash[32];
+} ark_write_member_t;
+
 struct ark_write_ctx {
 	enum ark_write_state state;
 	ark_hash_alg_t hash_alg;
 	int level;
-	ark_member_meta_t *members;
+	ark_write_member_t *members;
 	uint32_t member_count;
 	uint32_t member_cap;
-	ark_member_meta_t current;
-	uint32_t current_chunk_cap;
+	ark_write_member_t current;
+	char *names;
+	size_t names_len;
+	size_t names_cap;
+	uint32_t *chunks;
+	size_t chunks_len;
+	size_t chunks_cap;
 	uint8_t index_hash[32];
 	int index_hash_valid;
 	ark_hash_state_t member_hash;
 	ark_hash_backends_t backends;
 };
+
+/*
+ * ark_meta_store_t - Read-context storage behind ark_member_meta_t.
+ *
+ * names holds every member path and link with its NUL, chunks every chunk
+ * size, each allocated once with the size counted by ark_read_index.
+ */
+typedef struct {
+	char *names;
+	uint32_t *chunks;
+} ark_meta_store_t;
 
 struct ark_read_ctx {
 	enum ark_read_state {
@@ -84,6 +125,7 @@ struct ark_read_ctx {
 	uint32_t member_count;
 	uint8_t index_hash[32];
 	ark_member_meta_t *members;
+	ark_meta_store_t store;
 	struct ark_path_ref *by_path;
 	ark_hash_state_t verify_hash;
 	ark_hash_backends_t backends;
@@ -617,19 +659,53 @@ static void hash_final(ark_hash_state_t *st, uint8_t out[32])
 	ark_sha256_final(&st->u.sha256, out);
 }
 
-static void member_clear(ark_member_meta_t *m)
+/*
+ * store_grow - Reallocate a growable store so that need elements fit.
+ *
+ * Doubles *cap (starting at 8) until need fits. Returns the new block, or
+ * NULL on overflow or allocation failure; *cap changes only on success and
+ * the old block stays valid on failure. Call only when need > *cap.
+ */
+static void *store_grow(void *buf, size_t *cap, size_t need, size_t elem_size)
 {
-	if (m->chunk_sizes != NULL)
-		free(m->chunk_sizes);
-	buf_zero(m, sizeof(*m));
+	size_t new_cap;
+	void *p;
+
+	new_cap = *cap == 0U ? 8U : *cap;
+	while (new_cap < need) {
+		if (new_cap > SIZE_MAX / 2U)
+			return NULL;
+		new_cap *= 2U;
+	}
+	if (new_cap > SIZE_MAX / elem_size)
+		return NULL;
+	p = realloc(buf, new_cap * elem_size);
+	if (p != NULL)
+		*cap = new_cap;
+	return p;
 }
 
 static int members_grow(ark_write_ctx_t *ctx, ark_error_t *err)
 {
-	ark_member_meta_t *new_members;
+	ark_write_member_t *new_members;
 	uint32_t new_cap;
 
-	new_cap = ctx->member_cap == 0U ? 8U : ctx->member_cap * 2U;
+	if (ctx->member_cap == UINT32_MAX)
+		return ark_fail(err, ARK_ERR_USAGE, "too many members", 0);
+	if (ctx->member_cap == 0U)
+		new_cap = 8U;
+	else if (ctx->member_cap > UINT32_MAX / 2U)
+		new_cap = UINT32_MAX;
+	else
+		new_cap = ctx->member_cap * 2U;
+#if SIZE_MAX <= UINT32_MAX
+	/*
+	 * SAFETY: only a 32-bit size_t can overflow new_cap * entry size; on
+	 * LP64 the check is always false and gcc -Wtype-limits rejects it.
+	 */
+	if ((size_t)new_cap > SIZE_MAX / sizeof(ctx->members[0]))
+		return ark_fail(err, ARK_ERR_IO_ALLOC, "grow member array", 0);
+#endif
 	new_members =
 	    realloc(ctx->members, (size_t)new_cap * sizeof(ctx->members[0]));
 	if (new_members == NULL)
@@ -641,77 +717,35 @@ static int members_grow(ark_write_ctx_t *ctx, ark_error_t *err)
 	return 0;
 }
 
-static int current_chunks_grow(ark_write_ctx_t *ctx, ark_error_t *err)
-{
-	uint32_t *new_chunks;
-	uint32_t new_cap;
-
-	new_cap =
-	    ctx->current_chunk_cap == 0U ? 8U : ctx->current_chunk_cap * 2U;
-	new_chunks =
-	    realloc(ctx->current.chunk_sizes,
-	            (size_t)new_cap * sizeof(ctx->current.chunk_sizes[0]));
-	if (new_chunks == NULL)
-		return ark_fail(err, ARK_ERR_IO_ALLOC, "grow chunk size array",
-		                0);
-	/* OWNERSHIP: current chunk_sizes stays context-owned until
-	 * ark_write_free. */
-	ctx->current.chunk_sizes = new_chunks;
-	ctx->current_chunk_cap = new_cap;
-	return 0;
-}
-
 static int member_append(ark_write_ctx_t *ctx, ark_error_t *err)
 {
 	if (ctx->member_count == ctx->member_cap) {
 		if (members_grow(ctx, err) != 0)
 			return -1;
 	}
-	/* OWNERSHIP: chunk_sizes pointer transfers from ctx->current to
-	 * members[]. */
 	ctx->members[ctx->member_count++] = ctx->current;
 	buf_zero(&ctx->current, sizeof(ctx->current));
-	ctx->current_chunk_cap = 0;
 	return 0;
 }
 
-static int member_index_size(const ark_member_meta_t *m, size_t *out,
+/*
+ * Serialized size of one index entry (ARCHITECTURE.md section 5.2). Path and
+ * link lengths were bounded by ark_write_member_begin.
+ */
+static int member_index_size(const ark_write_member_t *m, size_t *out,
                              ark_error_t *err)
 {
 	size_t total;
-	size_t path_len;
 	size_t add;
 
-	path_len = strnlen(m->path, sizeof(m->path));
-	if (path_len == 0U || path_len >= sizeof(m->path))
-		return ark_fail(err, ARK_ERR_USAGE, "invalid member path", 0);
-	if (path_len > UINT16_MAX)
-		return ark_fail(err, ARK_ERR_USAGE, "path too long for u16", 0);
-
-	total = ARK_INDEX_FIXED_META_SIZE;
-	if (size_add_overflow(total, path_len, &total) != 0)
+	total = ARK_INDEX_FIXED_META_SIZE + (size_t)m->path_len;
+	if (m->type == 0x03U || m->type == 0x04U)
+		total += 2U + (size_t)m->link_len;
+	total += 4U;
+#if SIZE_MAX / 4U < UINT32_MAX
+	if ((size_t)m->chunk_count > SIZE_MAX / sizeof(uint32_t))
 		return ark_fail(err, ARK_ERR_USAGE, "index size overflow", 0);
-
-	if (m->type == 0x03U || m->type == 0x04U) {
-		size_t link_len;
-
-		link_len = strnlen(m->link, sizeof(m->link));
-		if (link_len >= sizeof(m->link))
-			return ark_fail(err, ARK_ERR_USAGE,
-			                "invalid link field", 0);
-		if (link_len > UINT16_MAX)
-			return ark_fail(err, ARK_ERR_USAGE,
-			                "link too long for u16", 0);
-		if (size_add_overflow(total, 2U, &total) != 0)
-			return ark_fail(err, ARK_ERR_USAGE,
-			                "index size overflow", 0);
-		if (size_add_overflow(total, link_len, &total) != 0)
-			return ark_fail(err, ARK_ERR_USAGE,
-			                "index size overflow", 0);
-	}
-
-	if (size_add_overflow(total, 4U, &total) != 0)
-		return ark_fail(err, ARK_ERR_USAGE, "index size overflow", 0);
+#endif
 	add = (size_t)m->chunk_count * sizeof(uint32_t);
 	if (size_add_overflow(total, add, &total) != 0)
 		return ark_fail(err, ARK_ERR_USAGE, "index size overflow", 0);
@@ -740,13 +774,13 @@ static int expected_chunk_count(uint64_t size_original, uint32_t *out)
 /*
  * Serialize one index entry as specified by ARCHITECTURE.md section 5.2.
  */
-static int member_write_index(const ark_member_meta_t *m, uint8_t *dst,
+static int member_write_index(const ark_write_ctx_t *ctx,
+                              const ark_write_member_t *m, uint8_t *dst,
                               size_t dst_cap, size_t *written, ark_error_t *err)
 {
+	const char *names;
 	size_t need;
 	size_t off;
-	size_t path_len;
-	size_t link_len;
 	uint32_t i;
 
 	if (member_index_size(m, &need, err) != 0)
@@ -755,9 +789,7 @@ static int member_write_index(const ark_member_meta_t *m, uint8_t *dst,
 		return ark_fail(err, ARK_ERR_IO_ALLOC,
 		                "index destination too small", 0);
 
-	path_len = strnlen(m->path, sizeof(m->path));
-	link_len = strnlen(m->link, sizeof(m->link));
-
+	names = ctx->names + m->names_off;
 	off = 0U;
 	dst[off++] = m->type;
 	le32_put(dst + off, m->mode);
@@ -776,23 +808,23 @@ static int member_write_index(const ark_member_meta_t *m, uint8_t *dst,
 	off += 8U;
 	buf_copy(dst + off, m->hash, sizeof(m->hash));
 	off += sizeof(m->hash);
-	le16_put(dst + off, (uint16_t)path_len);
+	le16_put(dst + off, m->path_len);
 	off += 2U;
 
-	buf_copy(dst + off, m->path, path_len);
-	off += path_len;
+	buf_copy(dst + off, names, m->path_len);
+	off += m->path_len;
 
 	if (m->type == 0x03U || m->type == 0x04U) {
-		le16_put(dst + off, (uint16_t)link_len);
+		le16_put(dst + off, m->link_len);
 		off += 2U;
-		buf_copy(dst + off, m->link, link_len);
-		off += link_len;
+		buf_copy(dst + off, names + m->path_len, m->link_len);
+		off += m->link_len;
 	}
 
 	le32_put(dst + off, m->chunk_count);
 	off += 4U;
 	for (i = 0U; i < m->chunk_count; i++) {
-		le32_put(dst + off, m->chunk_sizes[i]);
+		le32_put(dst + off, ctx->chunks[m->chunks_off + i]);
 		off += 4U;
 	}
 
@@ -853,8 +885,10 @@ ssize_t ark_write_header(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
 int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
                            ark_error_t *err)
 {
+	ark_write_member_t *cur;
 	size_t path_len;
 	size_t link_len;
+	size_t need;
 
 	if (ctx == NULL || meta == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null member argument", 0);
@@ -870,16 +904,20 @@ int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
 		return ark_fail(err, ARK_ERR_USAGE,
 		                "write-path chunk_sizes must be NULL", 0);
 
-	path_len = strnlen(meta->path, sizeof(meta->path));
-	if (path_len == 0U || path_len >= sizeof(meta->path))
+	if (meta->path == NULL)
+		return ark_fail(err, ARK_ERR_USAGE, "invalid member path", 0);
+	path_len = strnlen(meta->path, ARK_MEMBER_PATH_MAX + 1U);
+	if (path_len == 0U || path_len > ARK_MEMBER_PATH_MAX)
 		return ark_fail(err, ARK_ERR_USAGE, "invalid member path", 0);
 	if (validate_member_path_raw((const uint8_t *)meta->path, path_len,
 	                             err) != 0)
 		return -1;
 
-	link_len = strnlen(meta->link, sizeof(meta->link));
+	link_len = meta->link == NULL
+	               ? 0U
+	               : strnlen(meta->link, ARK_MEMBER_PATH_MAX + 1U);
 	if (meta->type == 0x03U || meta->type == 0x04U) {
-		if (link_len == 0U || link_len >= sizeof(meta->link))
+		if (link_len == 0U || link_len > ARK_MEMBER_PATH_MAX)
 			return ark_fail(err, ARK_ERR_USAGE,
 			                "invalid member link", 0);
 		if (meta->type == 0x03U) {
@@ -898,24 +936,50 @@ int ark_write_member_begin(ark_write_ctx_t *ctx, const ark_member_meta_t *meta,
 		                "link field present for non-link member", 0);
 	}
 
-	ctx->current = *meta;
-	ctx->current.chunk_sizes = NULL;
-	ctx->current.chunk_count = 0U;
-	ctx->current.size_compressed = 0U;
-	ctx->current_chunk_cap = 0U;
-
-	if (ctx->current.type == 0x01U && ctx->current.size_original == 0U)
-		ctx->current.data_offset = 0U;
-	else if (ctx->current.type != 0x01U) {
-		ctx->current.size_original = 0U;
-		ctx->current.size_compressed = 0U;
-		ctx->current.data_offset = 0U;
-		ctx->current.chunk_count = 0U;
-	}
-
 	if (hash_init(&ctx->member_hash, ctx->hash_alg, &ctx->backends, err) !=
 	    0)
 		return -1;
+
+	/* path_len + link_len <= 2046: only the store length can overflow. */
+	if (size_add_overflow(ctx->names_len, path_len + link_len, &need) != 0)
+		return ark_fail(err, ARK_ERR_IO_ALLOC, "grow member names", 0);
+	if (need > ctx->names_cap) {
+		char *names;
+
+		names =
+		    (char *)store_grow(ctx->names, &ctx->names_cap, need, 1U);
+		if (names == NULL)
+			return ark_fail(err, ARK_ERR_IO_ALLOC,
+			                "grow member names", 0);
+		/* OWNERSHIP: ctx->names stays owned by ctx and is freed in
+		 * ark_write_free. */
+		ctx->names = names;
+	}
+
+	/* The context keeps its own copy: meta's strings are caller-owned. */
+	cur = &ctx->current;
+	buf_zero(cur, sizeof(*cur));
+	cur->type = meta->type;
+	cur->mode = meta->mode;
+	cur->uid = meta->uid;
+	cur->gid = meta->gid;
+	cur->mtime = meta->mtime;
+	cur->names_off = ctx->names_len;
+	cur->path_len = (uint16_t)path_len;
+	cur->link_len = (uint16_t)link_len;
+	cur->chunks_off = ctx->chunks_len;
+	buf_copy(ctx->names + ctx->names_len, meta->path, path_len);
+	if (link_len > 0U)
+		buf_copy(ctx->names + ctx->names_len + path_len, meta->link,
+		         link_len);
+	ctx->names_len = need;
+
+	/* Non-regular members carry no data fields; size_compressed and
+	 * chunk_count build up through ark_write_chunk. */
+	if (cur->type == 0x01U && meta->size_original != 0U) {
+		cur->size_original = meta->size_original;
+		cur->data_offset = meta->data_offset;
+	}
 
 	ctx->state = ARK_WRITE_STATE_MEMBER;
 	return 0;
@@ -948,15 +1012,27 @@ ssize_t ark_write_chunk(ark_write_ctx_t *ctx, const uint8_t *src,
 	if (src_len > 0U && src == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null chunk source", 0);
 
-	if (ctx->current.chunk_count == ctx->current_chunk_cap) {
-		if (current_chunks_grow(ctx, err) != 0)
-			return -1;
+	if (ctx->chunks_len == ctx->chunks_cap) {
+		uint32_t *chunks;
+
+		if (ctx->chunks_len == SIZE_MAX)
+			return ark_fail(err, ARK_ERR_IO_ALLOC,
+			                "grow chunk size array", 0);
+		chunks = (uint32_t *)store_grow(ctx->chunks, &ctx->chunks_cap,
+		                                ctx->chunks_len + 1U,
+		                                sizeof(ctx->chunks[0]));
+		if (chunks == NULL)
+			return ark_fail(err, ARK_ERR_IO_ALLOC,
+			                "grow chunk size array", 0);
+		/* OWNERSHIP: ctx->chunks stays owned by ctx and is freed in
+		 * ark_write_free. */
+		ctx->chunks = chunks;
 	}
 
 	/* NOTE: src_len is compressed size, not uncompressed input size. */
 	hash_update(&ctx->member_hash, src, src_len);
-	ctx->current.chunk_sizes[ctx->current.chunk_count++] =
-	    (uint32_t)src_len;
+	ctx->chunks[ctx->chunks_len++] = (uint32_t)src_len;
+	ctx->current.chunk_count++;
 	if (u64_add_overflow(ctx->current.size_compressed, (uint64_t)src_len,
 	                     &ctx->current.size_compressed) != 0)
 		return ark_fail(err, ARK_ERR_USAGE, "compressed size overflow",
@@ -1046,7 +1122,7 @@ ssize_t ark_write_index(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
 
 	total = 0U;
 	for (i = 0U; i < ctx->member_count; i++) {
-		if (member_write_index(&ctx->members[i], dst + total,
+		if (member_write_index(ctx, &ctx->members[i], dst + total,
 		                       dst_cap - total, &written, err) != 0)
 			return -1;
 		/* ARCHITECTURE.md section 8.2: index hash is over full
@@ -1090,15 +1166,12 @@ ssize_t ark_write_footer(ark_write_ctx_t *ctx, uint64_t index_offset,
 
 void ark_write_free(ark_write_ctx_t *ctx)
 {
-	uint32_t i;
-
 	if (ctx == NULL)
 		return;
 
-	member_clear(&ctx->current);
-	for (i = 0U; i < ctx->member_count; i++)
-		member_clear(&ctx->members[i]);
 	free(ctx->members);
+	free(ctx->names);
+	free(ctx->chunks);
 	buf_zero(ctx, sizeof(*ctx));
 }
 
@@ -1182,16 +1255,109 @@ int ark_read_init(ark_read_ctx_t *ctx, const uint8_t *footer_buf,
 	return 0;
 }
 
+/*
+ * meta_store_fill - Second index pass: copy strings and chunk sizes.
+ *
+ * Runs only over an index that ark_read_index has fully checked, so the
+ * entries are well formed; the copies are still bounded by the counted sizes
+ * on their own. st->names receives every path and link with its NUL,
+ * st->chunks every chunk size; members point into them. Members without a
+ * link point to an empty string literal. Returns 0, -1 when an allocation
+ * fails, or -2 when an entry would not fit the counted sizes (not reachable
+ * after the first pass).
+ *
+ * OWNERSHIP: st->names and st->chunks belong to the caller, also on error
+ * (NULL when nothing needed storing).
+ */
+static int meta_store_fill(ark_member_meta_t *members, uint32_t member_count,
+                           const uint8_t *index_buf, size_t names_total,
+                           size_t chunks_total, ark_meta_store_t *st)
+{
+	char *name_store;
+	uint32_t *chunk_store;
+	size_t off;
+	size_t npos;
+	size_t cpos;
+	uint32_t i;
+
+	st->names = NULL;
+	st->chunks = NULL;
+	/* Both totals are bounded by index_len, see ark_read_index. */
+	if (names_total > 0U) {
+		st->names = (char *)malloc(names_total);
+		if (st->names == NULL)
+			return -1;
+	}
+	if (chunks_total > 0U) {
+		if (chunks_total > SIZE_MAX / sizeof(uint32_t))
+			return -1;
+		st->chunks =
+		    (uint32_t *)malloc(chunks_total * sizeof(uint32_t));
+		if (st->chunks == NULL)
+			return -1;
+	}
+	name_store = st->names;
+	chunk_store = st->chunks;
+
+	off = 0U;
+	npos = 0U;
+	cpos = 0U;
+	for (i = 0U; i < member_count; i++) {
+		ark_member_meta_t *m;
+		size_t len;
+		uint32_t j;
+
+		m = &members[i];
+		len = (size_t)le16_get(index_buf + off + 77U);
+		off += ARK_INDEX_FIXED_META_SIZE;
+		if (names_total - npos <= len)
+			return -2;
+		buf_copy(name_store + npos, index_buf + off, len);
+		name_store[npos + len] = '\0';
+		m->path = name_store + npos;
+		npos += len + 1U;
+		off += len;
+
+		m->link = "";
+		if (m->type == 0x03U || m->type == 0x04U) {
+			len = (size_t)le16_get(index_buf + off);
+			off += 2U;
+			if (names_total - npos <= len)
+				return -2;
+			buf_copy(name_store + npos, index_buf + off, len);
+			name_store[npos + len] = '\0';
+			m->link = name_store + npos;
+			npos += len + 1U;
+			off += len;
+		}
+
+		off += 4U;
+		if (chunks_total - cpos < (size_t)m->chunk_count)
+			return -2;
+		m->chunk_sizes = NULL;
+		if (m->chunk_count > 0U)
+			m->chunk_sizes = chunk_store + cpos;
+		for (j = 0U; j < m->chunk_count; j++) {
+			chunk_store[cpos++] = le32_get(index_buf + off);
+			off += 4U;
+		}
+	}
+	return 0;
+}
+
 int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
                    size_t index_len, ark_error_t *err)
 {
 	ark_hash_state_t idx_hash;
 	ark_member_meta_t *members;
+	ark_meta_store_t store;
 	ark_path_ref_t *refs;
 	uint8_t empty_hash[32];
 	struct body_range *ranges;
 	uint32_t i;
 	size_t off;
+	size_t names_total;
+	size_t chunks_total;
 
 	if (ctx == NULL || index_buf == NULL)
 		return ark_fail(err, ARK_ERR_USAGE, "null read index argument",
@@ -1225,16 +1391,27 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 		                0);
 
 	members = NULL;
+	store.names = NULL;
+	store.chunks = NULL;
 	refs = NULL;
 	ranges = NULL;
+	names_total = 0U;
+	chunks_total = 0U;
 	if (ctx->member_count > 0U) {
 		members = calloc(ctx->member_count, sizeof(members[0]));
 		if (members == NULL)
 			return ark_fail(err, ARK_ERR_IO_ALLOC,
 			                "allocate index member table", 0);
 	}
-	/* OWNERSHIP: members and nested chunk_sizes transfer to ctx on success
-	 * and are released by ark_read_free. */
+	/* OWNERSHIP: members transfer to ctx on success and are released by
+	 * ark_read_free. */
+
+	/*
+	 * First pass: parse and check every entry and count the bytes its
+	 * strings and chunk sizes need; nothing is copied yet. Each total is
+	 * bounded by index_len (every string and chunk size is preceded in the
+	 * index by at least as many bytes as its copy needs).
+	 */
 
 	off = 0U;
 	for (i = 0U; i < ctx->member_count; i++) {
@@ -1267,7 +1444,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 
 		if (path_len == 0U)
 			goto fmt_index;
-		if (path_len >= sizeof(m->path)) {
+		if (path_len > ARK_MEMBER_PATH_MAX) {
 			ark_fail(err, ARK_ERR_PATH_TOO_LONG,
 			         "path exceeds 1023 bytes", 0);
 			goto fail;
@@ -1277,11 +1454,9 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 		if (validate_member_path_raw(index_buf + off, path_len, err) !=
 		    0)
 			goto fail;
-		buf_copy(m->path, index_buf + off, path_len);
-		m->path[path_len] = '\0';
+		names_total += path_len + 1U;
 		off += path_len;
 
-		m->link[0] = '\0';
 		if (m->type == 0x03U || m->type == 0x04U) {
 			size_t link_len;
 
@@ -1289,7 +1464,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 				goto fmt_index;
 			link_len = (size_t)le16_get(index_buf + off);
 			off += 2U;
-			if (link_len == 0U || link_len >= sizeof(m->link))
+			if (link_len == 0U || link_len > ARK_MEMBER_PATH_MAX)
 				goto fmt_index;
 			if (off > index_len || index_len - off < link_len)
 				goto fmt_index;
@@ -1301,8 +1476,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			               index_buf + off, link_len, err) != 0) {
 				goto fail;
 			}
-			buf_copy(m->link, index_buf + off, link_len);
-			m->link[link_len] = '\0';
+			names_total += link_len + 1U;
 			off += link_len;
 		}
 
@@ -1341,24 +1515,18 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 			goto fmt_index;
 #endif
 		chunk_bytes = (size_t)m->chunk_count * sizeof(uint32_t);
-		if (m->chunk_count > 0U) {
-			if (off > index_len || index_len - off < chunk_bytes)
-				goto fmt_index;
-			m->chunk_sizes = malloc(chunk_bytes);
-			if (m->chunk_sizes == NULL)
-				goto oom;
-			/* OWNERSHIP: m->chunk_sizes is context-owned until
-			 * ark_read_free. */
-		}
+		if (off > index_len || index_len - off < chunk_bytes)
+			goto fmt_index;
 		chunk_sum = 0U;
 		for (j = 0U; j < m->chunk_count; j++) {
-			m->chunk_sizes[j] =
-			    le32_get(index_buf + off + (size_t)j * 4U);
 			if (u64_add_overflow(chunk_sum,
-			                     (uint64_t)m->chunk_sizes[j],
+			                     (uint64_t)le32_get(index_buf +
+			                                        off +
+			                                        (size_t)j * 4U),
 			                     &chunk_sum) != 0)
 				goto fmt_index;
 		}
+		chunks_total += (size_t)m->chunk_count;
 		off += chunk_bytes;
 
 		if (m->type == 0x01U && m->size_original > 0U) {
@@ -1382,6 +1550,19 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 
 	if (off != index_len)
 		goto fmt_index;
+
+	{
+		int frc;
+
+		frc = meta_store_fill(members, ctx->member_count, index_buf,
+		                      names_total, chunks_total, &store);
+		if (frc == -1)
+			goto oom;
+		if (frc != 0)
+			goto fmt_index;
+	}
+	/* OWNERSHIP: store transfers to ctx->store on success and is
+	 * released by ark_read_free. */
 
 	/*
 	 * Sorted path references for checks 7-10 and 14 and for
@@ -1531,6 +1712,7 @@ int ark_read_index(ark_read_ctx_t *ctx, const uint8_t *index_buf,
 	}
 
 	ctx->members = members;
+	ctx->store = store;
 	ctx->by_path = refs;
 	ctx->state = ARK_READ_STATE_INDEX_DONE;
 	free(ranges);
@@ -1545,11 +1727,9 @@ fmt_index:
 oom:
 	ark_fail(err, ARK_ERR_IO_ALLOC, "allocate index parse structures", 0);
 fail:
-	if (members != NULL) {
-		for (i = 0U; i < ctx->member_count; i++)
-			member_clear(&members[i]);
-		free(members);
-	}
+	free(members);
+	free(store.names);
+	free(store.chunks);
 	free(refs);
 	free(ranges);
 	return -1;
@@ -1728,13 +1908,9 @@ void ark_read_free(ark_read_ctx_t *ctx)
 {
 	if (ctx == NULL)
 		return;
-	if (ctx->members != NULL) {
-		uint32_t i;
-
-		for (i = 0U; i < ctx->member_count; i++)
-			member_clear(&ctx->members[i]);
-	}
 	free(ctx->members);
+	free(ctx->store.names);
+	free(ctx->store.chunks);
 	free(ctx->by_path);
 	buf_zero(ctx, sizeof(*ctx));
 }

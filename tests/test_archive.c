@@ -64,7 +64,7 @@ static void meta_init(ark_member_meta_t *meta, uint8_t type, const char *path)
 	meta->uid = 1000U;
 	meta->gid = 1000U;
 	meta->mtime = 1U;
-	(void)snprintf(meta->path, sizeof(meta->path), "%s", path);
+	meta->path = path;
 }
 
 int test_write_valid_sequence_zero_members(void)
@@ -159,9 +159,9 @@ int test_write_valid_sequence_multi_member(void)
 	file.data_offset = 16U;
 	meta_init(&dir, 0x02U, "d");
 	meta_init(&sym, 0x03U, "s");
-	(void)snprintf(sym.link, sizeof(sym.link), "%s", "t");
+	sym.link = "t";
 	meta_init(&hard, 0x04U, "h");
-	(void)snprintf(hard.link, sizeof(hard.link), "%s", "f");
+	hard.link = "f";
 
 	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
 	                   &err) != 0)
@@ -735,9 +735,9 @@ int test_write_member_hash_non_file_types(void)
 	ctx = ctx_from_storage(&storage);
 	meta_init(&dir, 0x02U, "d");
 	meta_init(&sym, 0x03U, "s");
-	(void)snprintf(sym.link, sizeof(sym.link), "%s", "t");
+	sym.link = "t";
 	meta_init(&hard, 0x04U, "h");
-	(void)snprintf(hard.link, sizeof(hard.link), "%s", "d");
+	hard.link = "d";
 
 	if (ark_write_init(ctx, ARK_HASH_SHA256, ARK_DEFLATE_LEVEL_DEFAULT,
 	                   &err) != 0)
@@ -903,7 +903,7 @@ int test_write_member_begin_rejects_bad_link(void)
 
 	ctx = ctx_from_storage(&storage);
 	meta_init(&meta, 0x03U, "s");
-	(void)snprintf(meta.link, sizeof(meta.link), "%s", "/target");
+	meta.link = "/target";
 	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
 	                   &err) != 0)
 		return 1;
@@ -972,6 +972,88 @@ int test_write_size_compressed_owned_by_context(void)
 	if (idx_len <= 0)
 		return 1;
 	return le64_get(index + 29U) == (uint64_t)sizeof(chunk) ? 0 : 1;
+}
+
+/*
+ * begin_once - Run ark_write_member_begin on a fresh context; *code receives
+ * the error code (ARK_OK on success).
+ */
+static int begin_once(const ark_member_meta_t *meta, ark_err_t *code)
+{
+	write_ctx_storage_t storage;
+	ark_write_ctx_t *ctx;
+	ark_error_t err;
+	uint8_t header[16];
+	int rc;
+
+	ctx = ctx_from_storage(&storage);
+	err = (ark_error_t){0};
+	if (ark_write_init(ctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0 ||
+	    ark_write_header(ctx, header, sizeof(header), &err) != 16) {
+		ark_write_free(ctx);
+		return -2;
+	}
+	rc = ark_write_member_begin(ctx, meta, &err);
+	*code = rc == 0 ? ARK_OK : err.code;
+	ark_write_free(ctx);
+	return rc;
+}
+
+/*
+ * test_write_member_begin_string_limits - Caller strings are pointers, so
+ * ark_write_member_begin bounds them itself: NULL or over-long paths and
+ * links are usage errors; a NULL link means none for files and directories.
+ * See ARCHITECTURE.md section 16.2.
+ */
+int test_write_member_begin_string_limits(void)
+{
+	static char max_str[ARK_MEMBER_PATH_MAX + 1U];
+	static char over_str[ARK_MEMBER_PATH_MAX + 2U];
+	ark_member_meta_t meta;
+	ark_err_t code;
+
+	memset(max_str, 'a', ARK_MEMBER_PATH_MAX);
+	max_str[ARK_MEMBER_PATH_MAX] = '\0';
+	memset(over_str, 'a', ARK_MEMBER_PATH_MAX + 1U);
+	over_str[ARK_MEMBER_PATH_MAX + 1U] = '\0';
+
+	meta_init(&meta, 0x02U, "d");
+	meta.path = NULL;
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+	meta.path = over_str;
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+	meta.path = max_str;
+	if (begin_once(&meta, &code) != 0)
+		return 1;
+	meta.path = "d";
+	meta.link = NULL;
+	if (begin_once(&meta, &code) != 0)
+		return 1;
+	meta.link = "";
+	if (begin_once(&meta, &code) != 0)
+		return 1;
+	meta.link = "x";
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+
+	meta_init(&meta, 0x03U, "s");
+	meta.link = NULL;
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+	meta.link = over_str;
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+	meta.link = max_str;
+	if (begin_once(&meta, &code) != 0)
+		return 1;
+	meta_init(&meta, 0x04U, "h");
+	meta.link = over_str;
+	if (begin_once(&meta, &code) != -1 || code != ARK_ERR_USAGE)
+		return 1;
+	return 0;
 }
 
 typedef ark_read_ctx_storage_t read_ctx_storage_t;
@@ -2630,6 +2712,143 @@ int test_read_find_member(void)
 	    ark_read_find_member(ctx, "a", NULL) != -1)
 		rc = 1;
 	ark_read_free(ctx);
+	return rc;
+}
+
+/*
+ * strings_write_member - Begin a member from scratch copies of path and link,
+ * overwrite the copies, write its chunks and end it. The context must have
+ * kept its own copies.
+ */
+static int strings_write_member(ark_write_ctx_t *ctx,
+                                const ark_member_meta_t *meta, const char *path,
+                                const char *link, const uint32_t *chunk_lens,
+                                uint32_t n)
+{
+	ark_member_meta_t m;
+	char pbuf[64];
+	char lbuf[64];
+	uint8_t data[8];
+	uint8_t out[8];
+	ark_error_t err;
+	uint32_t i;
+
+	(void)snprintf(pbuf, sizeof(pbuf), "%s", path);
+	(void)snprintf(lbuf, sizeof(lbuf), "%s", link);
+	m = *meta;
+	m.path = pbuf;
+	m.link = lbuf;
+	if (ark_write_member_begin(ctx, &m, &err) != 0)
+		return 1;
+	memset(pbuf, 'X', sizeof(pbuf) - 1U);
+	memset(lbuf, 'Y', sizeof(lbuf) - 1U);
+	memset(data, 0x5a, sizeof(data));
+	for (i = 0U; i < n; i++) {
+		if (ark_write_chunk(ctx, data, chunk_lens[i], out, sizeof(out),
+		                    &err) != (ssize_t)chunk_lens[i])
+			return 1;
+	}
+	return ark_write_member_end(ctx, &err) != 0 ? 1 : 0;
+}
+
+/*
+ * test_member_strings_owned_by_context - The write context copies member
+ * strings at member_begin (the caller's buffers are overwritten right
+ * after), and the read context keeps paths, links and chunk sizes in its own
+ * store (the raw index is freed right after ark_read_index, as ark does).
+ * See ARCHITECTURE.md section 16.2.
+ */
+int test_member_strings_owned_by_context(void)
+{
+	static const char *const paths[] = {"d", "d/s", "d/big", "d/one",
+	                                    "d/h"};
+	static const char *const links[] = {"", "t", "", "", "d/one"};
+	static const uint32_t big_chunks[] = {3U, 5U};
+	static const uint32_t one_chunks[] = {2U};
+	write_ctx_storage_t wstorage;
+	read_ctx_storage_t rstorage;
+	ark_write_ctx_t *wctx;
+	ark_read_ctx_t *rctx;
+	ark_member_meta_t meta;
+	const ark_member_meta_t *m;
+	ark_error_t err;
+	uint8_t header[16];
+	uint8_t footer[64];
+	uint8_t index[1024];
+	uint8_t *copy;
+	ssize_t idx_len;
+	uint32_t pos;
+	uint32_t i;
+	int rc;
+
+	wctx = ctx_from_storage(&wstorage);
+	if (ark_write_init(wctx, ARK_HASH_BLAKE3, ARK_DEFLATE_LEVEL_DEFAULT,
+	                   &err) != 0 ||
+	    ark_write_header(wctx, header, sizeof(header), &err) != 16)
+		return 1;
+	rc = 0;
+	meta_init(&meta, 0x02U, paths[0]);
+	rc |= strings_write_member(wctx, &meta, paths[0], links[0], NULL, 0U);
+	meta_init(&meta, 0x03U, paths[1]);
+	rc |= strings_write_member(wctx, &meta, paths[1], links[1], NULL, 0U);
+	meta_init(&meta, 0x01U, paths[2]);
+	meta.size_original = (uint64_t)ARK_CHUNK_SIZE + 1U;
+	meta.data_offset = 16U;
+	rc |= strings_write_member(wctx, &meta, paths[2], links[2], big_chunks,
+	                           2U);
+	meta_init(&meta, 0x01U, paths[3]);
+	meta.size_original = 1U;
+	meta.data_offset = 24U;
+	rc |= strings_write_member(wctx, &meta, paths[3], links[3], one_chunks,
+	                           1U);
+	meta_init(&meta, 0x04U, paths[4]);
+	rc |= strings_write_member(wctx, &meta, paths[4], links[4], NULL, 0U);
+	idx_len =
+	    rc != 0 ? -1 : ark_write_index(wctx, index, sizeof(index), &err);
+	if (idx_len <= 0 ||
+	    ark_write_footer(wctx, 26U, (uint64_t)idx_len, footer,
+	                     sizeof(footer), &err) != 64) {
+		ark_write_free(wctx);
+		return 1;
+	}
+	ark_write_free(wctx);
+
+	copy = (uint8_t *)malloc((size_t)idx_len);
+	if (copy == NULL)
+		return 1;
+	memcpy(copy, index, (size_t)idx_len);
+	rctx = read_ctx_from_storage(&rstorage);
+	if (ark_read_header(rctx, header, 16U, &err) != 0 ||
+	    ark_read_init(rctx, footer, 64U, &err) != 0 ||
+	    ark_read_index(rctx, copy, (size_t)idx_len, &err) != 0) {
+		free(copy);
+		ark_read_free(rctx);
+		return 1;
+	}
+	/* Under ASan, any later use of the raw index is a use after free. */
+	free(copy);
+
+	for (i = 0U; i < 5U; i++) {
+		m = ark_read_member_meta(rctx, i);
+		if (m == NULL || m->path == NULL || m->link == NULL ||
+		    strcmp(m->path, paths[i]) != 0 ||
+		    strcmp(m->link, links[i]) != 0)
+			rc = 1;
+		if (ark_read_find_member(rctx, paths[i], &pos) != 0 || pos != i)
+			rc = 1;
+	}
+	m = ark_read_member_meta(rctx, 2U);
+	if (m == NULL || m->chunk_count != 2U || m->chunk_sizes == NULL ||
+	    m->chunk_sizes[0] != 3U || m->chunk_sizes[1] != 5U)
+		rc = 1;
+	m = ark_read_member_meta(rctx, 3U);
+	if (m == NULL || m->chunk_count != 1U || m->chunk_sizes == NULL ||
+	    m->chunk_sizes[0] != 2U)
+		rc = 1;
+	m = ark_read_member_meta(rctx, 0U);
+	if (m == NULL || m->chunk_count != 0U || m->chunk_sizes != NULL)
+		rc = 1;
+	ark_read_free(rctx);
 	return rc;
 }
 

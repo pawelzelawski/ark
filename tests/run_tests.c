@@ -40,6 +40,7 @@ int test_write_member_begin_rejects_bad_path(void);
 int test_write_member_begin_rejects_bad_link(void);
 int test_write_member_begin_rejects_chunk_sizes(void);
 int test_write_size_compressed_owned_by_context(void);
+int test_write_member_begin_string_limits(void);
 int test_read_header_bad_magic(void);
 int test_read_header_bad_version(void);
 int test_read_header_unknown_comp_alg(void);
@@ -63,6 +64,7 @@ int test_read_check6_hardlink_missing_target(void);
 int test_read_check6_hardlink_forward_reference(void);
 int test_read_check7_duplicate_path(void);
 int test_read_find_member(void);
+int test_member_strings_owned_by_context(void);
 int test_read_index_many_members(void);
 int test_read_index_many_members_duplicate(void);
 int test_read_check8_missing_ancestor(void);
@@ -236,6 +238,7 @@ int test_fault_extract_unlink_overwrite(void);
 int test_fault_extract_cleanup_track_alloc(void);
 int test_fault_extract_cleanup_unlink(void);
 int test_fault_extract_cleanup_rmdir(void);
+int test_fault_extract_cleanup_implicit_parents(void);
 int test_integration_single_file(void);
 int test_integration_directory_tree(void);
 int test_integration_all_member_types(void);
@@ -498,6 +501,8 @@ static const test_case_t g_tests[] = {
      test_write_member_begin_rejects_chunk_sizes},
     {"test_write_size_compressed_owned_by_context",
      test_write_size_compressed_owned_by_context},
+    {"test_write_member_begin_string_limits",
+     test_write_member_begin_string_limits},
     {"test_read_header_bad_magic", test_read_header_bad_magic},
     {"test_read_header_bad_version", test_read_header_bad_version},
     {"test_read_header_unknown_comp_alg", test_read_header_unknown_comp_alg},
@@ -526,6 +531,8 @@ static const test_case_t g_tests[] = {
      test_read_check6_hardlink_forward_reference},
     {"test_read_check7_duplicate_path", test_read_check7_duplicate_path},
     {"test_read_find_member", test_read_find_member},
+    {"test_member_strings_owned_by_context",
+     test_member_strings_owned_by_context},
     {"test_read_index_many_members", test_read_index_many_members},
     {"test_read_index_many_members_duplicate",
      test_read_index_many_members_duplicate},
@@ -621,6 +628,8 @@ static const test_case_t g_tests[] = {
      test_fault_extract_cleanup_track_alloc},
     {"test_fault_extract_cleanup_unlink", test_fault_extract_cleanup_unlink},
     {"test_fault_extract_cleanup_rmdir", test_fault_extract_cleanup_rmdir},
+    {"test_fault_extract_cleanup_implicit_parents",
+     test_fault_extract_cleanup_implicit_parents},
     {"test_edge_empty_archive", test_edge_empty_archive},
     {"test_edge_single_member", test_edge_single_member},
     {"test_edge_max_path_length", test_edge_max_path_length},

@@ -94,17 +94,32 @@ typedef enum {
 } ark_hash_alg_t;
 
 /*
+ * ARK_MEMBER_PATH_MAX - Longest member path or link target in bytes, without
+ * the terminating NUL. See ARCHITECTURE.md section 5.2.
+ */
+#define ARK_MEMBER_PATH_MAX 1023U
+
+/*
  * ark_member_meta_t - Parsed or caller-supplied member metadata.
  *
- * path and link are stored as null-terminated relative UTF-8 strings.
- * link is empty for regular files and directories.
+ * path and link are null-terminated relative UTF-8 strings of at most
+ * ARK_MEMBER_PATH_MAX bytes. link is empty for regular files and
+ * directories.
+ *
+ * On the read path, path and link are never NULL; link points to an empty
+ * string for regular files and directories.
+ *
+ * On the write path, path and link are caller-owned and read only during
+ * ark_write_member_begin, which copies them into the write context. link may
+ * be NULL (same as empty) for regular files and directories.
  *
  * NOTE: chunk_sizes is an output field on the read path. On the write path,
  * callers keep chunk_sizes NULL; chunk sizes are accumulated internally by
  * the write context.
  *
- * OWNERSHIP: chunk_sizes is owned by the enclosing context and remains valid
- * only until ark_read_free() or ark_write_free(). Callers must not free it.
+ * OWNERSHIP: on the read path, path, link and chunk_sizes point into storage
+ * owned by the read context and remain valid only until ark_read_free().
+ * Callers must not free or modify them.
  *
  * See ARCHITECTURE.md section 5.2 and 16.2.
  */
@@ -118,8 +133,8 @@ typedef struct {
 	uint64_t size_compressed;
 	uint64_t data_offset;
 	uint8_t hash[32];
-	char path[1024];
-	char link[1024];
+	const char *path;
+	const char *link;
 	uint32_t chunk_count;
 	uint32_t *chunk_sizes;
 } ark_member_meta_t;
@@ -180,10 +195,13 @@ ssize_t ark_write_header(ark_write_ctx_t *ctx, uint8_t *dst, size_t dst_cap,
 /*
  * ark_write_member_begin - Begin a new member in the write state machine.
  *
- * meta supplies member metadata for the next member.
+ * meta supplies member metadata for the next member. The context copies
+ * meta->path and meta->link; the caller's strings need not outlive the call.
  *
  * Returns 0 on success, -1 on failure.
- * Failure contract: returns ARK_ERR_USAGE on invalid state transitions.
+ * Failure contract: returns ARK_ERR_USAGE on invalid state transitions and
+ * on a NULL, empty or over-long path or link; returns ARK_ERR_IO_ALLOC when
+ * the context cannot grow its member storage.
  * Preconditions: ctx in IDLE state; meta non-NULL; write-path callers keep
  * meta->chunk_sizes NULL.
  *
@@ -283,6 +301,10 @@ int ark_read_init(ark_read_ctx_t *ctx, const uint8_t *footer_buf,
 
 /*
  * ark_read_index - Verify hash and parse index buffer.
+ *
+ * The context copies every path, link and chunk size it keeps into storage
+ * sized exactly for them; the caller may free index_buf as soon as
+ * the call returns.
  *
  * Returns 0 on success, -1 on failure.
  * Failure contract: reports ARK_ERR_HASH_INDEX/ARK_ERR_FMT_* via err.

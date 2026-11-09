@@ -323,6 +323,7 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_write_member_begin_rejects_bad_link` | Writer rejects unsafe link target |
 | `test_write_member_begin_rejects_chunk_sizes` | Writer rejects non-NULL `chunk_sizes` on write path |
 | `test_write_size_compressed_owned_by_context` | Writer ignores caller `size_compressed` and records compressed byte total |
+| `test_write_member_begin_string_limits` | `path`/`link` are pointers, so the writer bounds them: NULL or 1024-byte path, 1024-byte link, NULL symlink link, link on a directory rejected (`ARK_ERR_USAGE`); 1023 bytes and a NULL or empty link on a directory accepted |
 
 ### 3.5 Archive Read Path (`test_archive.c`)
 
@@ -388,6 +389,7 @@ which runs a fresh window-15 encoder and returns the size or -1.
 | `test_extract_chunk_over_bound` | One chunk of `ark_deflate_bound(ARK_CHUNK_SIZE) + 1` bytes (the index accepts it): verify and extract fail with `ARK_ERR_FMT_INDEX` before reading it into the bound-sized chunk buffer, no file left |
 | `test_read_empty_file_chunk_count_zero` | Regular file with chunk_count=0; `ark_read_member_meta` reports correctly |
 | `test_read_find_member` | Path lookup returns each member's position (out-of-order members); near-miss paths and prefixes not found; -1 before `ark_read_index` and for NULL arguments |
+| `test_member_strings_owned_by_context` | Five members (directory, symlink, two regular files with 2 and 1 chunks, hardlink) written from caller buffers that are overwritten right after `ark_write_member_begin`; the index is read from a heap copy freed right after `ark_read_index` (ASan reports any later use); paths, links (empty for non-links), chunk sizes and `ark_read_find_member` are intact |
 | `test_read_index_many_members` | 20,000 members in reverse name order parse; lookups return the right positions |
 | `test_read_index_many_members_duplicate` | 20,000 members plus one duplicate path; `ARK_ERR_FMT_INDEX` |
 
@@ -592,6 +594,7 @@ extract sequences. Each test verifies:
 | `test_fault_extract_cleanup_track_alloc` | Cleanup tracker allocation fails (full extraction and implicit parent in selective extraction); nothing created is left behind | `ARK_ERR_IO_ALLOC` |
 | `test_fault_extract_cleanup_unlink` | `ARK_UNLINK` fails during cleanup; continues | best-effort only |
 | `test_fault_extract_cleanup_rmdir` | `ARK_RMDIR` fails during cleanup; continues | best-effort only |
+| `test_fault_extract_cleanup_implicit_parents` | Selective extraction of `a/b/deep.txt` creates implicit parents `a` and `a/b` (tracked as prefixes of the member path); `futimens` fails after the write; member and both parents removed | `ARK_ERR_IO_UTIMES` |
 
 ---
 

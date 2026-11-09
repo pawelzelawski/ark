@@ -107,9 +107,20 @@ typedef struct {
 	size_t capacity;
 } modified_path_list_t;
 
+/*
+ * cleanup_entry_t - One object created by extract, for reverse-order cleanup.
+ *
+ * The object's path is the first len bytes of path, a member path in the read
+ * context's store (an implicit parent directory is a prefix of its member's
+ * path), so tracking copies nothing.
+ *
+ * OWNERSHIP: path is owned by the read context, which outlives the tracker:
+ * cleanup_run runs before ark_read_free.
+ */
 typedef struct {
-	char path[1024];
-	int is_dir;
+	const char *path;
+	uint16_t len;
+	uint8_t is_dir;
 } cleanup_entry_t;
 
 typedef struct {
@@ -131,10 +142,13 @@ typedef struct ark_worker_arg ark_worker_arg_t;
  * create_pending_t - One member waiting for its place in the archive.
  *
  * chunks_left counts the member's chunks not yet written; begun is set once
- * ark_write_member_begin has run for it.
+ * ark_write_member_begin has run for it. meta.path and meta.link point to the
+ * slot's own path and link copies (the pending queue never moves).
  */
 typedef struct {
 	ark_member_meta_t meta;
+	char path[ARK_MEMBER_PATH_MAX + 1U];
+	char link[ARK_MEMBER_PATH_MAX + 1U];
 	uint32_t chunks_left;
 	int begun;
 } create_pending_t;
@@ -1531,8 +1545,8 @@ static int decode_pipe_take(decode_pipe_t *, const ark_member_meta_t *,
 static void decode_pipe_release(decode_pipe_t *);
 static int decode_pipe_member_end(decode_pipe_t *, uint32_t, ark_error_t *);
 static uint64_t le64_decode(const uint8_t *);
-static int read_archive_index(int, const char *, ark_read_ctx_t *, uint8_t **,
-                              size_t *, ark_error_t *);
+static int read_archive_index(int, const char *, ark_read_ctx_t *,
+                              ark_error_t *);
 static size_t read_member_count(const ark_read_ctx_t *);
 static int find_member_pos(const ark_read_ctx_t *, const char *, uint32_t *);
 static int build_extract_selection(const ark_args_t *, const ark_read_ctx_t *,
@@ -1541,7 +1555,7 @@ static int preflight_conflicts(const ark_args_t *, const ark_read_ctx_t *,
                                size_t, const unsigned char *, int,
                                ark_error_t *);
 static int cleanup_reserve(cleanup_tracker_t *, ark_error_t *);
-static void cleanup_track(cleanup_tracker_t *, const char *, int);
+static void cleanup_track(cleanup_tracker_t *, const char *, size_t, int);
 static void cleanup_run(cleanup_tracker_t *, int);
 static void cleanup_free(cleanup_tracker_t *);
 static int dir_deferred_push(dir_deferred_meta_t *, const ark_member_meta_t *,
@@ -2144,11 +2158,11 @@ static uint64_t le64_decode(const uint8_t *p)
  * ARCHITECTURE.md section 16.4 defines call order. ARCHITECTURE.md section
  * 5.1 requires footer-bound checks in main.c before ark_read_init.
  *
- * OWNERSHIP: *index_buf is caller-owned on success and freed by caller.
+ * The raw index is freed as soon as ark_read_index has parsed it: the read
+ * context keeps its own copy of everything it needs (see archive.h).
  */
 static int read_archive_index(int fd, const char *archive_path,
-                              ark_read_ctx_t *rctx, uint8_t **index_buf,
-                              size_t *index_len, ark_error_t *err)
+                              ark_read_ctx_t *rctx, ark_error_t *err)
 {
 	struct stat sb;
 	uint8_t header[16];
@@ -2158,6 +2172,8 @@ static int read_archive_index(int fd, const char *archive_path,
 	uint64_t idx_size_u64;
 	uint64_t body_end;
 	uint8_t *idx;
+	size_t index_len;
+	int rc;
 
 	if (ARK_FSTAT(fd, &sb) != 0)
 		return fail_error(err, ARK_ERR_IO_READ, "archive fstat failed",
@@ -2211,30 +2227,28 @@ static int read_archive_index(int fd, const char *archive_path,
 	if (idx_size_u64 > (uint64_t)SIZE_MAX)
 		return fail_error(err, ARK_ERR_IO_ALLOC,
 		                  "index buffer too large", archive_path, 0);
-	*index_len = (size_t)idx_size_u64;
-	/* OWNERSHIP: caller frees this buffer in command cleanup. */
-	idx = (uint8_t *)malloc(*index_len == 0U ? 1U : *index_len);
+	index_len = (size_t)idx_size_u64;
+	/* OWNERSHIP: freed below once ark_read_index has returned. */
+	idx = (uint8_t *)malloc(index_len == 0U ? 1U : index_len);
 	if (idx == NULL)
 		return fail_error(err, ARK_ERR_IO_ALLOC,
 		                  "index buffer allocation failed",
 		                  archive_path, 0);
 
+	rc = -1;
 	if (ARK_LSEEK(fd, (off_t)index_offset, SEEK_SET) == (off_t)-1) {
-		free(idx);
-		return fail_error(err, ARK_ERR_IO_SEEK, "archive seek failed",
-		                  archive_path, errno);
+		(void)fail_error(err, ARK_ERR_IO_SEEK, "archive seek failed",
+		                 archive_path, errno);
+		goto done;
 	}
-	if (*index_len > 0U &&
-	    read_full(fd, idx, *index_len, archive_path, err) != 0) {
-		free(idx);
-		return -1;
-	}
-	if (ark_read_index(rctx, idx, *index_len, err) != 0) {
-		free(idx);
-		return -1;
-	}
-	*index_buf = idx;
-	return 0;
+	if (index_len > 0U &&
+	    read_full(fd, idx, index_len, archive_path, err) != 0)
+		goto done;
+	rc = ark_read_index(rctx, idx, index_len, err);
+
+done:
+	free(idx);
+	return rc;
 }
 
 /*
@@ -2480,15 +2494,17 @@ static int cleanup_reserve(cleanup_tracker_t *tracker, ark_error_t *err)
 /*
  * cleanup_track - Record one created path for reverse-order fatal cleanup.
  *
- * Cannot fail: the caller must have called cleanup_reserve before creating
- * the object, and must not track anything else in between.
+ * The created path is the first len bytes of path (len <=
+ * ARK_MEMBER_PATH_MAX); path must stay valid until cleanup_run (see
+ * cleanup_entry_t). Cannot fail: the caller must have called cleanup_reserve
+ * before creating the object, and must not track anything else in between.
  */
 static void cleanup_track(cleanup_tracker_t *tracker, const char *path,
-                          int is_dir)
+                          size_t len, int is_dir)
 {
-	copy_msg(tracker->entries[tracker->count].path,
-	         sizeof(tracker->entries[tracker->count].path), path);
-	tracker->entries[tracker->count].is_dir = is_dir;
+	tracker->entries[tracker->count].path = path;
+	tracker->entries[tracker->count].len = (uint16_t)len;
+	tracker->entries[tracker->count].is_dir = (uint8_t)(is_dir != 0);
 	tracker->count++;
 }
 
@@ -2503,14 +2519,18 @@ static void cleanup_run(cleanup_tracker_t *tracker, int dest_fd)
 	ssize_t i;
 
 	for (i = (ssize_t)tracker->count - 1; i >= 0; i--) {
+		const cleanup_entry_t *e;
+		char path[ARK_MEMBER_PATH_MAX + 1U];
+		size_t j;
 		int flags;
 
-		flags = tracker->entries[i].is_dir ? AT_REMOVEDIR : 0;
-		if (ARK_UNLINKAT(dest_fd, tracker->entries[i].path, flags) !=
-		        0 &&
-		    errno != ENOENT)
-			print_warning("cleanup failed",
-			              tracker->entries[i].path);
+		e = &tracker->entries[i];
+		for (j = 0U; j < e->len; j++)
+			path[j] = e->path[j];
+		path[e->len] = '\0';
+		flags = e->is_dir ? AT_REMOVEDIR : 0;
+		if (ARK_UNLINKAT(dest_fd, path, flags) != 0 && errno != ENOENT)
+			print_warning("cleanup failed", path);
 	}
 }
 
@@ -2641,7 +2661,7 @@ static int ensure_parent_dirs(const ark_member_meta_t *meta, int dest_fd,
 		 * before any subsequent fallible operation. See ARCHITECTURE.md
 		 * section 14.3.
 		 */
-		cleanup_track(tracker, path, 1);
+		cleanup_track(tracker, meta->path, (size_t)(slash - path), 1);
 		*slash = '/';
 	}
 	slash = strrchr(path, '/');
@@ -2957,19 +2977,16 @@ static int cmd_list(const ark_args_t *args, ark_error_t *err)
 {
 	ark_read_ctx_storage_t rstorage = {0};
 	ark_read_ctx_t *rctx;
-	uint8_t *index_buf;
 	int fd;
 	int rc;
 
 	rctx = (ark_read_ctx_t *)rstorage.bytes;
-	index_buf = NULL;
 	rc = -1;
 	fd = ARK_OPEN(args->archive_path, O_RDONLY | O_CLOEXEC, 0);
 	if (fd == -1)
 		return fail_error(err, ARK_ERR_IO_OPEN, "archive open failed",
 		                  args->archive_path, errno);
-	if (read_archive_index(fd, args->archive_path, rctx, &index_buf,
-	                       &(size_t){0}, err) != 0)
+	if (read_archive_index(fd, args->archive_path, rctx, err) != 0)
 		goto cleanup;
 
 	if (args->human && !args->verbose)
@@ -3023,7 +3040,6 @@ cleanup:
 	if (ARK_CLOSE(fd) != 0 && rc == 0)
 		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
 		                args->archive_path, errno);
-	free(index_buf);
 	ark_read_free(rctx);
 	return rc;
 }
@@ -3041,16 +3057,13 @@ static int cmd_verify(const ark_args_t *args, ark_pool_t *pool,
 	ark_read_ctx_storage_t rstorage = {0};
 	ark_read_ctx_t *rctx;
 	decode_pipe_t pipe = {0};
-	uint8_t *index_buf;
 	unsigned char *selected;
-	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
 	int archive_fd;
 	int rc;
 
 	rctx = (ark_read_ctx_t *)rstorage.bytes;
-	index_buf = NULL;
 	selected = NULL;
 	rc = -1;
 	if (pool == NULL)
@@ -3063,8 +3076,7 @@ static int cmd_verify(const ark_args_t *args, ark_pool_t *pool,
 		                 args->archive_path, errno);
 		goto cleanup;
 	}
-	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
-	                       &index_len, err) != 0)
+	if (read_archive_index(archive_fd, args->archive_path, rctx, err) != 0)
 		goto cleanup;
 
 	member_count = read_member_count(rctx);
@@ -3144,11 +3156,9 @@ cleanup:
 	pool_shutdown(pool);
 	free(pipe.comp_buf);
 	free(selected);
-	free(index_buf);
 	if (archive_fd != -1 && ARK_CLOSE(archive_fd) != 0 && rc == 0)
 		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
 		                args->archive_path, errno);
-	(void)index_len;
 	ark_read_free(rctx);
 	return rc;
 }
@@ -3400,9 +3410,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	dir_deferred_meta_t deferred_dirs = {0};
 	decode_pipe_t pipe = {0};
 	char known_dir[1024];
-	uint8_t *index_buf;
 	unsigned char *selected;
-	size_t index_len;
 	size_t member_count;
 	size_t comp_cap;
 	int archive_fd;
@@ -3410,7 +3418,6 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 	int rc;
 
 	rctx = (ark_read_ctx_t *)rstorage.bytes;
-	index_buf = NULL;
 	selected = NULL;
 	archive_fd = -1;
 	out_fd = -1;
@@ -3431,8 +3438,7 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 		                 args->archive_path, errno);
 		goto cleanup;
 	}
-	if (read_archive_index(archive_fd, args->archive_path, rctx, &index_buf,
-	                       &index_len, err) != 0)
+	if (read_archive_index(archive_fd, args->archive_path, rctx, err) != 0)
 		goto cleanup;
 
 	member_count = read_member_count(rctx);
@@ -3523,7 +3529,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 					    meta->path, errno);
 					goto cleanup;
 				}
-				cleanup_track(&tracker, meta->path, 1);
+				cleanup_track(&tracker, meta->path,
+				              strlen(meta->path), 1);
 			}
 			if (dir_deferred_push(&deferred_dirs, meta, err) != 0)
 				goto cleanup;
@@ -3561,7 +3568,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			cleanup_track(&tracker, meta->path, 0);
+			cleanup_track(&tracker, meta->path, strlen(meta->path),
+			              0);
 			restore_symlink_meta(dest_fd, meta);
 			break;
 		case 0x04:
@@ -3595,7 +3603,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			cleanup_track(&tracker, meta->path, 0);
+			cleanup_track(&tracker, meta->path, strlen(meta->path),
+			              0);
 			break;
 		case 0x01: {
 			uint32_t chunk;
@@ -3639,7 +3648,8 @@ static int cmd_extract(const ark_args_t *args, int dest_fd, ark_pool_t *pool,
 				                 meta->path, errno);
 				goto cleanup;
 			}
-			cleanup_track(&tracker, meta->path, 0);
+			cleanup_track(&tracker, meta->path, strlen(meta->path),
+			              0);
 
 			/*
 			 * SAFETY: chunks are written in index order; the reader
@@ -3705,11 +3715,9 @@ cleanup:
 	dir_deferred_free(&deferred_dirs);
 	free(pipe.comp_buf);
 	free(selected);
-	free(index_buf);
 	if (archive_fd != -1 && ARK_CLOSE(archive_fd) != 0 && rc == 0)
 		rc = fail_error(err, ARK_ERR_IO_OPEN, "archive close failed",
 		                args->archive_path, errno);
-	(void)index_len;
 	ark_read_free(rctx);
 	return rc;
 }
@@ -4207,7 +4215,8 @@ static int member_meta_init(ark_member_meta_t *meta, uint8_t type,
 	meta->gid = (uint32_t)sb->st_gid;
 	if (stat_mtime_nsec(sb, member_path, &meta->mtime, err) != 0)
 		return -1;
-	copy_msg(meta->path, sizeof(meta->path), member_path);
+	/* Borrowed: create_pipe_add copies it before member_path is reused. */
+	meta->path = member_path;
 	return 0;
 }
 
@@ -4380,7 +4389,14 @@ static int create_pipe_add(create_pipe_t *pipe, const ark_member_meta_t *meta,
 	}
 	slot = &pipe->pending[(pipe->pending_head + pipe->pending_count) %
 	                      pipe->pending_cap];
+	/* The traversal's path and link buffers are reused for the next
+	 * member, so the slot keeps copies. */
 	slot->meta = *meta;
+	copy_msg(slot->path, sizeof(slot->path), meta->path);
+	copy_msg(slot->link, sizeof(slot->link),
+	         meta->link != NULL ? meta->link : "");
+	slot->meta.path = slot->path;
+	slot->meta.link = slot->link;
 	slot->chunks_left = chunks;
 	slot->begun = 0;
 	pipe->pending_count++;
@@ -4588,7 +4604,7 @@ static int emit_hardlink_member(traverse_ctx_t *ctx, const char *member_path,
 
 	if (member_meta_init(&meta, 0x04U, member_path, sb, err) != 0)
 		return -1;
-	copy_msg(meta.link, sizeof(meta.link), target_path);
+	meta.link = target_path;
 	return emit_nonfile_member(ctx, &meta, err);
 }
 
@@ -4603,18 +4619,20 @@ static int emit_symlink_member(traverse_ctx_t *ctx, const char *abs_path,
                                ark_error_t *err)
 {
 	ark_member_meta_t meta;
+	char link[ARK_MEMBER_PATH_MAX + 1U];
 	ssize_t n;
 
 	if (member_meta_init(&meta, 0x03U, member_path, sb, err) != 0)
 		return -1;
-	n = ARK_READLINK(abs_path, meta.link, sizeof(meta.link));
+	n = ARK_READLINK(abs_path, link, sizeof(link));
 	if (n < 0)
 		return fail_error(err, ARK_ERR_IO_READ, "symlink read failed",
 		                  abs_path, errno);
-	if ((size_t)n >= sizeof(meta.link))
+	if ((size_t)n >= sizeof(link))
 		return fail_error(err, ARK_ERR_PATH_TOO_LONG,
 		                  "symlink target too long", abs_path, 0);
-	meta.link[n] = '\0';
+	link[n] = '\0';
+	meta.link = link;
 	return emit_nonfile_member(ctx, &meta, err);
 }
 

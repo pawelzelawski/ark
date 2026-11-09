@@ -195,7 +195,9 @@ src/
 │                       # Types:
 │                       #   ark_write_ctx_t    - write context
 │                       #   ark_read_ctx_t     - read context
-│                       #   ark_member_meta_t  - member metadata
+│                       #   ark_member_meta_t  - member metadata (path and
+│                       #                        link are pointers; read:
+│                       #                        context-owned, write: copied)
 │                       #   ark_error_t        - error detail struct
 │                       #   ark_err_t          - error code enum
 │                       #   ark_hash_alg_t     - BLAKE3 or SHA-256
@@ -336,9 +338,12 @@ src/
                         #   ring_buf_read()       - I/O thread: read next slot in order
                         #   ring_buf_free()       - release ring buffer
                         #
-                        # Extraction cleanup tracker:
+                        # Extraction cleanup tracker (entries point at member
+                        # paths in the read context, 16 bytes each):
+                        #   cleanup_reserve()     - grow before creating an object
                         #   cleanup_track()       - register created filesystem object
-                        #   cleanup_created()     - remove all tracked objects
+                        #   cleanup_run()         - remove tracked objects, reverse order
+                        #   cleanup_free()        - release tracker storage
                         #
                         # Sandboxing:
                         #   sandbox_apply()       - apply pledge/unveil or Landlock
@@ -726,8 +731,9 @@ Checks: >
 | `decode_pipe_read_one` | `src/main.c` | Internal; read, hash and submit the next extract or verify chunk |
 | `decode_pipe_take` | `src/main.c` | Internal; wait for the chunk being consumed, in order |
 | `decode_pipe_member_end` | `src/main.c` | Internal; report a held member hash failure |
+| `read_archive_index` | `src/main.c` | Internal; read header, footer and index; frees the raw index once parsed |
 | `cleanup_track` | `src/main.c` | Internal; register created object |
-| `cleanup_created` | `src/main.c` | Internal; remove all tracked objects |
+| `cleanup_run` | `src/main.c` | Internal; remove all tracked objects |
 | `sandbox_apply` | `src/main.c` | Internal; pledge/Landlock per subcommand |
 | `print_error` | `src/main.c` | Internal; format ark_error_t to stderr |
 | `print_warning` | `src/main.c` | Internal; yellow warning to stderr |

@@ -580,6 +580,49 @@ int test_fault_extract_cleanup_unlink(void)
 	                            ARK_ERR_IO_OPEN);
 }
 
+/*
+ * test_fault_extract_cleanup_implicit_parents - Selective extraction of
+ * a/b/deep.txt creates its missing parents a and a/b as implicit
+ * directories, each tracked as a prefix of the member path. A failure after
+ * the member is written must remove the member and both parents.
+ * See ARCHITECTURE.md sections 14.3 and 14.4.
+ */
+int test_fault_extract_cleanup_implicit_parents(void)
+{
+	char root[PATH_MAX];
+	char src[PATH_MAX];
+	char archive[PATH_MAX];
+	char out[PATH_MAX];
+	char path[PATH_MAX];
+	ark_error_t err;
+	int rc;
+
+	err = (ark_error_t){0};
+	if (make_tree_fixture(root, src, archive, out) != 0)
+		return 1;
+	if (path_join(path, sizeof(path), src, "a") != 0 ||
+	    mkdir(path, 0700) != 0 ||
+	    path_join(path, sizeof(path), src, "a/b") != 0 ||
+	    mkdir(path, 0700) != 0 ||
+	    path_join(path, sizeof(path), src, "a/b/deep.txt") != 0 ||
+	    write_file(path, "deep fixture data\n") != 0 ||
+	    create_archive(archive, src) != 0) {
+		rm_rf(root);
+		return 1;
+	}
+	fault_reset();
+	ark_test_cli_fault_reset();
+	fault_inject(ARK_FAULT_FUTIMENS, 1, EIO);
+	rc = ark_test_extract_archive(archive, out, 0, "a/b/deep.txt", 1, &err);
+	fault_reset();
+	if (rc == 0 || err.code != ARK_ERR_IO_UTIMES || !dir_is_empty(out)) {
+		rm_rf(root);
+		return 1;
+	}
+	rm_rf(root);
+	return 0;
+}
+
 int test_fault_extract_cleanup_rmdir(void)
 {
 	return expect_extract_fault(ARK_FAULT_RMDIR, 1, 1, 0,

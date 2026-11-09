@@ -394,3 +394,26 @@ median of 0.81 -> 0.77 s, 256 MiB text 0.61 -> 0.61 s, random 0.80 -> 0.75 s,
 empty files 0.41 -> 0.41 s). Verify's peak RSS at 16 workers: 2.8 -> 57 MB on
 the text file, 3.7 -> 83 MB on the random file, 16 -> 41 MB on the
 `/usr/include` copy.
+
+**Compact member metadata** (ark only; Improvements 25). `ark_member_meta_t`
+held a path and a link as fixed 1024-byte arrays (2,144 bytes per member,
+also in the write context and in every cleanup-tracker entry of extract).
+Paths and links are now pointers: the read context keeps all strings and
+chunk sizes in two blocks sized exactly for them (112 bytes of
+metadata per member plus the strings), the write context keeps 104 bytes
+per member with offsets into growing stores, extract's cleanup entries
+point at member paths (16 instead of 1,028 bytes), and the raw index block
+is freed as soon as it is parsed. Archive bytes are unchanged. Peak RSS,
+release builds, minimum of 3 runs, i7-7500U (4 workers):
+
+| Command | 40,000 empty files before | after | `/usr/include` copy before | after |
+|---|---|---|---|---|
+| create | 91.4 MB | 11.6 MB | 31.7 MB | 15.6 MB |
+| list | 90.9 MB | 11.2 MB | 19.6 MB | 3.8 MB |
+| verify | 91.2 MB | 11.5 MB | 32.2 MB | 15.8 MB |
+| extract | 132.0 MB | 11.5 MB | 40.6 MB | 15.7 MB |
+
+Wall times did not get worse (best of 5, interleaved, next to other load,
+so indicative): list of the 40,000 empty files 0.09 -> 0.03 s and verify
+0.10 -> 0.04 s (less memory to clear and touch), extract 0.60 -> 0.51 s;
+the `/usr/include` copy unchanged.

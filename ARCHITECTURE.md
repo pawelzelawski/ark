@@ -278,6 +278,9 @@ footer values from causing unbounded allocation or invalid seeks.
 The reader loads the entire index block into memory in one read operation,
 verifies its hash against `index_hash` in the footer, then parses it
 in-memory. The index is never parsed partially or incrementally.
+`ark_read_index` checks every entry first, then copies all paths, links and
+chunk sizes into storage sized exactly for them; `main.c` frees the
+raw index block as soon as `ark_read_index` returns (§16.2, §16.4).
 
 Before allocating the member entry array, the reader must verify that
 `member_count` is plausible given `index_size`. The fixed metadata block
@@ -2702,8 +2705,9 @@ typedef struct {
     uint64_t   size_compressed;
     uint64_t   data_offset;
     uint8_t    hash[32];
-    char       path[1024];       /* null-terminated relative path */
-    char       link[1024];       /* null-terminated; empty for type 0x01 and 0x02 */
+    const char *path;            /* null-terminated relative path, <= 1023 bytes */
+    const char *link;            /* null-terminated, <= 1023 bytes; empty for
+                                    type 0x01 and 0x02 */
     uint32_t   chunk_count;
     uint32_t  *chunk_sizes;      /* owned by the enclosing read or write context;
                                     caller must not free directly;
@@ -2726,6 +2730,24 @@ typedef union {
     uint8_t     bytes[ARK_READ_CTX_STORAGE_SIZE];
 } ark_read_ctx_storage_t;
 ```
+
+`ARK_MEMBER_PATH_MAX` (1023) is the longest path or link in bytes, without
+the NUL. **String ownership.** On the read path `path`, `link` and
+`chunk_sizes` point into the read context (valid until `ark_read_free`);
+`path` and `link` are never NULL, and `link` is an empty string for regular
+files and directories. On the write path the strings are the caller's:
+`ark_write_member_begin` bounds them (NULL, empty or over-long is
+`ARK_ERR_USAGE`; a NULL `link` means none for files and directories) and
+copies them, so the caller may reuse its buffers once the call returns.
+
+**Member memory.** `ark_member_meta_t` is 112 bytes on LP64. The read
+context holds one per member plus one block with every path and link
+(each with its NUL) and one with every chunk size (4 bytes per MiB of data);
+there is no allocation per member. The write context keeps its own 104-byte entry per
+member with offsets into one growing name store and one growing chunk-size
+store. Earlier versions carried two fixed 1024-byte arrays in the struct
+(2,144 bytes per member): `ark list` of 40,000 empty files peaked at 91 MB,
+now 11 MB (PERFORMANCE_IMPROVEMENTS.md).
 
 `ark_write_ctx_t` and `ark_read_ctx_t` are semantically opaque: callers must
 not inspect or depend on their private fields. Callers allocate the matching
@@ -2785,6 +2807,8 @@ ssize_t ark_write_header(ark_write_ctx_t *ctx,
 
 /* Begin a new member. Caller provides fully populated metadata.
    Prepares internal state for subsequent ark_write_chunk calls.
+   meta->path and meta->link are copied into the context (see 16.2);
+   NULL, empty or over-long strings return -1 with ARK_ERR_USAGE.
    chunk_sizes in meta must be NULL on the write path; the write context
    accumulates chunk sizes internally as ark_write_chunk is called.
    chunk_sizes is an output field on the read path only (populated by
@@ -2911,7 +2935,10 @@ int ark_read_init(ark_read_ctx_t  *ctx,
    loaded by main.c from index_offset. Verifies the index hash using the
    hash_alg from the context before parsing any entry. Validates
    member_count against index_size (see §5.1 pre-allocation bound) before
-   allocating the entry array. Returns -1 on integrity or format error. */
+   allocating the entry array. Checks every entry, then copies paths, links
+   and chunk sizes into one context-owned store sized exactly for them; the
+   context keeps no pointer into index_buf, which the caller may free once
+   the call returns. Returns -1 on integrity or format error. */
 int ark_read_index(ark_read_ctx_t *ctx,
                    const uint8_t  *index_buf,
                    size_t          index_len,
@@ -3027,15 +3054,19 @@ containing tens of millions of small files the index may reach several
 hundred megabytes. There is no streaming or paged index fallback. Systems
 with severe memory constraints may be unable to extract pathological
 archives. Normal archives (large files, moderate member counts) are not
-affected.
+affected. The parsed index costs about 112 bytes per member plus its path
+and link bytes (§16.2); the raw block is freed once parsed, and extract's
+cleanup tracker costs 16 bytes per created object (it points at the member
+paths rather than copying them).
 
 **Writer index buffered entirely in memory.** The writer accumulates
 metadata, paths, and chunk size tables for every member in memory across
 the entire traversal, as the index is serialised and written only after all
 member data is written. This imposes the same memory constraint on archive
 creation as on extraction: for archives containing tens of millions of small
-files the in-memory index accumulation may reach several hundred megabytes.
-There is no incremental index flush mechanism. This is a symmetric
+files the in-memory index accumulation may reach several hundred megabytes
+(about 104 bytes per member plus its path and link bytes and 4 bytes per
+chunk, §16.2). There is no incremental index flush mechanism. This is a symmetric
 consequence of writing the index last, which is required by the format
 structure.
 
